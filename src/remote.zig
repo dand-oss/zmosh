@@ -59,21 +59,41 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
 /// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
 /// Prepends common user bin dirs to PATH since SSH non-interactive sessions
 /// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
-pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8) !RemoteSession {
+fn appendShellQuoted(out: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
+    try out.append(alloc, '\'');
+    for (arg) |ch| {
+        if (ch == '\'') try out.appendSlice(alloc, "'\\''") else try out.append(alloc, ch);
+    }
+    try out.append(alloc, '\'');
+}
+
+pub fn connectRemote(
+    alloc: std.mem.Allocator,
+    host: []const u8,
+    session: []const u8,
+    command: ?[][]const u8,
+) !RemoteSession {
     const term = posix.getenv("TERM") orelse "xterm-256color";
     const colorterm = posix.getenv("COLORTERM");
-    const remote_cmd = if (colorterm) |ct|
-        try std.fmt.allocPrint(
-            alloc,
-            "TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ term, ct, session },
-        )
-    else
-        try std.fmt.allocPrint(
-            alloc,
-            "TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ term, session },
-        );
+    var remote_cmd_buf: std.ArrayList(u8) = .empty;
+    defer remote_cmd_buf.deinit(alloc);
+    try remote_cmd_buf.appendSlice(alloc, "TERM=");
+    try remote_cmd_buf.appendSlice(alloc, term);
+    try remote_cmd_buf.append(alloc, ' ');
+    if (colorterm) |ct| {
+        try remote_cmd_buf.appendSlice(alloc, "COLORTERM=");
+        try remote_cmd_buf.appendSlice(alloc, ct);
+        try remote_cmd_buf.append(alloc, ' ');
+    }
+    try remote_cmd_buf.appendSlice(alloc, "PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve ");
+    try appendShellQuoted(&remote_cmd_buf, alloc, session);
+    if (command) |args| {
+        for (args) |arg| {
+            try remote_cmd_buf.append(alloc, ' ');
+            try appendShellQuoted(&remote_cmd_buf, alloc, arg);
+        }
+    }
+    const remote_cmd = try remote_cmd_buf.toOwnedSlice(alloc);
     defer alloc.free(remote_cmd);
     const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
     var child = std.process.Child.init(&argv, alloc);
