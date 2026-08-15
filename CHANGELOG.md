@@ -13,6 +13,7 @@ Use spec: https://common-changelog.org/
 
 - `zmx version` now returns the socket and log directory locations
 - `zmx run` now inserts a `ZMX_TASK_COMPLETED` marker after every run command to indicate when the task is completed and then returns the aggregate exit status
+- `zmx attach -r` now reports remote connect failures on stderr with the log file location and exits 2 instead of silently exiting 0, and exits 3 when an established connection is lost permanently
 
 ### Fixed
 

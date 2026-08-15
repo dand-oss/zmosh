@@ -367,7 +367,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         const state = peer.updateState(now, config);
         if (state == .dead) {
             _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: connection lost permanently\r\n") catch {};
-            return;
+            return error.ConnectionLost;
         }
         if (state == .disconnected and !was_disconnected) {
             _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b[7mzmx: connection lost — waiting to reconnect...\x1b[27m\x1b8") catch {};

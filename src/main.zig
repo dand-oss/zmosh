@@ -424,9 +424,24 @@ pub fn main() !void {
             const command = if (command_args.items.len > 0) command_args.items else null;
             const session = remote.connectRemote(alloc, host, sesh, command) catch |err| {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
-                return;
+                // std.log goes to the log file; a kitty --hold tab or a
+                // scripted caller needs the failure on stderr and a
+                // non-zero exit, distinct from a normal detach.
+                var msg_buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &msg_buf,
+                    "zmx: remote connect to {s} failed: {s} (see {s}/zmx.log)\n",
+                    .{ host, @errorName(err), cfg.log_dir },
+                ) catch "zmx: remote connect failed\n";
+                _ = posix.write(posix.STDERR_FILENO, msg) catch {};
+                std.process.exit(2);
             };
-            return remote.remoteAttach(alloc, session);
+            remote.remoteAttach(alloc, session) catch |err| switch (err) {
+                // Message already written to the terminal by remoteAttach.
+                error.ConnectionLost => std.process.exit(3),
+                else => return err,
+            };
+            return;
         }
 
         // Local attach (existing behavior)
