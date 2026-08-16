@@ -1,129 +1,202 @@
 <h1>
 <p align="center">
-  <img src="./logo.png" alt="Logo" width="128">
-  <br>zmx
+  <img src="./docs/logo.png" alt="Logo" width="128">
+  <br>zmosh
 </h1>
 <p align="center">
-  Session attach/detach for the terminal.
+  Session persistence with auto-reconnect for terminal processes.
   <br />
-  <a href="https://zmx.sh">Docs</a>
-  ·
-  <a href="https://bower.sh/you-might-not-need-tmux">You might not need tmux</a>
-  ·
-  Sponsored by <a href="https://pico.sh">pico.sh</a>
+  CLI + C library (macOS, iOS, Linux)
+  <br />
+  Built on <a href="https://github.com/neurosnap/zmx">zmx</a> · Powered by <a href="https://github.com/ghostty-org/ghostty">libghostty-vt</a>
 </p>
+
+## what is zmosh
+
+zmosh is a fork of [zmx](https://github.com/neurosnap/zmx) that adds **encrypted UDP auto-reconnect** for remote sessions — the best idea from [mosh](https://mosh.org), applied to zmx's session persistence model.
+
+Locally, zmosh **is** zmx. Every local feature works identically. The new capabilities only activate when you use `zmosh attach -r <host> <session>` to connect to a remote machine.
+
+**How remote mode works:** zmosh bootstraps an SSH connection to start a UDP gateway on the remote host, negotiates a one-time XChaCha20-Poly1305 session key, then switches to encrypted UDP datagrams. If your IP changes (Wi-Fi → cellular, VPN toggle, laptop sleep/wake), the session stays alive. No reconnect. No lost state.
 
 ## features
 
-- Persist terminal shell sessions
-- Ability to attach and detach from a shell session without it being killed
+**Local sessions** (inherited from zmx):
+- Persist terminal shell sessions (pty processes)
+- Attach and detach without killing the session
 - Native terminal scrollback
 - Multiple clients can connect to the same session
-- Re-attaching to a session restores previous terminal state and output
-- Send commands to a session without attaching to it
-- Print scrollback history of a terminal session in plain text
+- Re-attaching restores previous terminal state and output
+- Send commands to a session without attaching
+- Print scrollback history in plain text, VT escape codes, or HTML
 - Works on mac and linux
-- This project does **NOT** provide windows, tabs, or splits
+- Does **NOT** provide windows, tabs, or splits — that's your window manager's job
 
-## demos
+**Remote sessions** (zmosh additions):
+- Encrypted UDP transport with XChaCha20-Poly1305 (Zig stdlib, zero external crypto deps)
+- Auto-reconnect through IP changes, network switches, and sleep/wake cycles
+- IP roaming — authenticated packets from a new address automatically update the peer
+- Anti-replay protection via monotonic sequence numbers
+- Heartbeat-based connection state detection with configurable timeouts
+- MTU-safe chunking to avoid UDP fragmentation
+- Gateway architecture — network layer is separate from the daemon; local sessions are untouched
+- Status bar notification when connection is temporarily lost
 
-- [zmx - intro](https://youtu.be/UIXj0_rhPgI)
-- [zmx - ai portal](https://youtu.be/CV3skPYHP4Q)
+## comparison with remote terminal tools
+
+| Feature | zmosh | mosh | Eternal Terminal | tssh |
+| --- | --- | --- | --- | --- |
+| Encrypted transport | ✓ (XChaCha20-Poly1305) | ✓ (AES-128-OCB) | ✓ (AES) | ✓ (SSH) |
+| UDP auto-reconnect | ✓ | ✓ | ✗ (TCP) | ✗ (TCP) |
+| IP roaming | ✓ | ✓ | ✗ | ✗ |
+| Session persistence (detach/reattach) | ✓ | ✗ | ✓ | ✗ |
+| Terminal state restore | ✓ (libghostty-vt) | ✓ (own VT) | ✓ | ✗ |
+| Native terminal scrollback | ✓ | ✗ | ✓ | ✓ |
+| Multiple clients per session | ✓ | ✗ | ✗ | ✗ |
+| Local sessions (no network) | ✓ | ✗ | ✗ | ✗ |
+| Anti-replay protection | ✓ | ✓ | ✓ | ✓ |
+| Predictive local echo | ✗ | ✓ | ✗ | ✗ |
+| Window management | ✗ | ✗ | ✗ | ✗ |
 
 ## install
-
-### binaries
-
-- https://zmx.sh/a/zmx-0.7.0-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-macos-x86_64.tar.gz
 
 ### homebrew
 
 ```bash
-brew install neurosnap/tap/zmx
+brew tap mmonad/zmosh
+brew install zmosh
 ```
 
-### mise-en-place
+### arch linux (aur)
 
 ```bash
-mise use zmx
+yay -S zmosh-git
+# or
+paru -S zmosh-git
 ```
-
-### NixOS / nixpkgs
-
-Run immediately without installation:
-
-```sh
-nix run github:NixOS/nixpkgs/nixpkgs-unstable#zmx
-# or build main yourself
-nix run github:neurosnap/zmx
-```
-
-Start a shell with zmx available while it runs:
-
-```sh
-nix shell github:NixOS/nixpkgs/nixpkgs-unstable#zmx
-# or built main yourself
-nix run github:neurosnap/zmx
-```
-
-### packages (unofficial)
-
-- [Alpine Linux](https://pkgs.alpinelinux.org/package/edge/testing/x86_64/zmx)
-- [Arch AUR tracking releases](https://aur.archlinux.org/packages/zmx)
-- [Arch AUR tracking git](https://aur.archlinux.org/packages/zmx-git)
-- [openSUSE Tumbleweed](https://software.opensuse.org/package/zmx)
-- [Gentoo (overlay)](https://codeberg.org/samuelhautamaki/samuelhautamaki-gentoo)
-- [zmx-rpm packaging](https://github.com/engie/zmx-rpm/)
 
 ### src
 
-- Requires zig `v0.16`
+- Requires zig `v0.15`
 - Clone the repo
 - Run build cmd
 
-Be sure to add `~/.local/bin` to your `PATH`:
-
 ```bash
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
+# be sure to add ~/.local/bin to your PATH
+```
+
+### build targets
+
+| Command | Output | Description |
+| --- | --- | --- |
+| `zig build` | `zmosh` binary | Build for host platform |
+| `zig build test` | — | Run unit tests |
+| `zig build check` | — | Type-check only (used by ZLS build-on-save) |
+| `zig build release` | `zig-out/dist/*.tar.gz` | Release tarballs (macOS builds all platforms, Linux builds Linux only) |
+| `zig build lib` | `libzmosh.a` + headers | Static C library for host platform |
+| `zig build macos-lib` | `libzmosh-macos.a` | Static library for macOS aarch64 (requires macOS) |
+| `zig build ios-lib` | `zmosh-ios.xcframework` | XCFramework for iOS device + simulator (requires macOS) |
+| `zig build xcframework` | `zmosh.xcframework` | XCFramework with all Apple slices: macOS + iOS + iOS simulator (requires macOS) |
+
+### libzmosh (C library)
+
+zmosh exposes a C API (`include/zmosh.h`) for embedding the remote session client into native apps. The API is callback-driven and designed for event loop integration:
+
+```c
+// Connect to a remote zmosh gateway
+zmosh_session_t *session = zmosh_connect(
+    host, port, key_base64,
+    rows, cols,
+    output_cb,   // called with terminal output bytes
+    state_cb,    // called on connection state changes (may be NULL)
+    end_cb,      // called when session ends (may be NULL)
+    ctx, &status
+);
+
+// Integrate with your event loop (GCD, kqueue, poll, etc.)
+int fd = zmosh_get_fd(session);
+
+// Call when fd is readable, or periodically for heartbeats
+zmosh_poll(session);
+
+// Send terminal input and resize events
+zmosh_send_input(session, data, len);
+zmosh_resize(session, rows, cols);
+
+// Cleanup
+zmosh_disconnect(session);
+```
+
+To build the XCFramework for an iOS/macOS app (must be run on macOS):
+
+```bash
+zig build xcframework
+# produces zig-out/zmosh.xcframework — drag into Xcode
 ```
 
 ## usage
 
 > [!IMPORTANT]
-> We recommend closing the terminal window to detach from the session but you can also press `ctrl+\` or run `zmx detach`. If you need `ctrl+\` for something else (e.g. vim's `ctrl+\ ctrl+n` to escape its own `:terminal`), set `ZMX_NO_DETACH_KEY` to disable the shortcut and rely on `zmx detach` or closing the window instead.
-
-Run `zmx help` for more information on usage, with examples.
+> We recommend closing the terminal window to detach from the session but you can also press `ctrl+\` or run `zmosh detach`.
 
 ```
-Usage: zmx <command> [args...]
+Usage: zmosh <command> [args]
 
 Commands:
-  [a]ttach <name> [command...]             Attach to session, creating if needed
-  [r]un <name> [-d] [command...]           Send command without attaching
-  [s]end <name> <text...>                  Send raw input to session PTY
-  [p]rint <name> <text...>                 Inject text into session display
-  [wr]ite <name> <file_path>               Write stdin to file_path through the session
-  [d]etach                                 Detach all clients (ctrl+\\ for current client)
-  [l]ist|ls [--short|--where k=v]          List active sessions
-  [g]et <name>                             Get session labels
-  set <name> k=v ...                       Set session labels
-  [un]set <name> key ...                   Remove session labels
-  [cl]ear <name>                           Clear all session labels
-  [k]ill <name>... [--force]               Kill session and all attached clients
-  [hi]story <name> [--vt|--html]           Output session scrollback
-  [w]ait <name>...                         Wait for session tasks to complete
-  [t]ail <name>...                         Follow session output
-  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
-  [v]ersion                                Show version and metadata (socket dir, log dir)
-  [h]elp                                   Show this help
+  [a]ttach <name> [command...]   Attach to session, creating session if needed
+  [a]ttach -r <host> <name>      Attach to remote session via UDP
+  [r]un <name> [command...]      Send command without attaching, creating session if needed
+  [s]erve <name>                 Start UDP gateway for remote access
+  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
+  [l]ist [--short]               List active sessions
+  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
+  [k]ill <name>                  Kill a session and all attached clients
+  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
+  [w]ait <name>...               Wait for session tasks to complete
+  [v]ersion                      Show version information
+  [h]elp                         Show this help message
 ```
+
+### local examples
+
+```bash
+zmosh attach dev              # start a shell session
+zmosh a dev nvim .            # start nvim in a persistent session
+zmosh attach build make -j8   # run a build, reattach to check progress
+zmosh attach mux dvtm         # run a multiplexer inside zmosh
+
+zmosh run dev cat README.md   # run the command without attaching to the session
+zmosh r dev cat CHANGELOG.md  # alias
+echo "ls -lah" | zmosh r dev # use stdin to run the command
+
+zmosh r tests go test ./...   # run your tests in the background
+zmosh wait tests              # waits for tests to complete
+```
+
+### remote examples
+
+```bash
+# attach to a remote session over encrypted UDP
+# (bootstraps via SSH, then switches to UDP)
+zmosh attach -r myserver dev
+
+# short form
+zmosh a -r myserver dev
+
+# run a build on a remote machine, come back later to check
+zmosh a -r build-box build make -j16
+```
+
+The remote workflow:
+1. zmosh SSHs into `<host>` and runs `zmosh serve <session>`
+2. The remote gateway binds a UDP port and prints a connect line with the session key
+3. zmosh reads the key, closes the SSH pipes, and switches to encrypted UDP
+4. If your network drops, the client shows a status bar and reconnects automatically when connectivity returns
 
 ## shell prompt
 
-When you attach to a `zmx` session, we don't provide any indication that you are inside `zmx`. We do provide an environment variable `ZMX_SESSION` which contains the session name.
+When you attach to a session, we provide an environment variable `ZMX_SESSION` which contains the session name.
 
 We recommend checking for that env var inside your prompt and displaying some indication there.
 
@@ -169,52 +242,32 @@ POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS+=my_zmx_session
 
 ### oh-my-posh
 
-[oh-my-posh](https://ohmyposh.dev) is a popular shell themeing and prompt engine. This code will display an icon and session name as part of the prompt if (and only if) you have zmx active:
+[oh-my-posh](https://ohmyposh.dev) is a popular shell themeing and prompt engine. This code will display an icon and session name as part of the prompt if (and only if) you have a session active:
 
-```toml
+```
 [[blocks.segments]]
-   template = '{{ if .Env.ZMX_SESSION }} {{ .Env.ZMX_SESSION }}{{ end }}'
+   template = '{{ if .Env.ZMX_SESSION }} {{ .Env.ZMX_SESSION }}{{ end }}'
    foreground = 'p:orange'
    background = 'p:black'
    type = 'text'
    style = 'plain'
 ```
 
-### Starship
-
-[Starship](https://starship.rs) is a popular shell themeing and prompt engine. This code will display an icon and session name as part of the prompt if (and only if) you have zmx active:
-
-```toml
-format = """
-${env_var.ZMX_SESSION}\
-...
-"""
-
-[env_var.ZMX_SESSION]
-symbol = " "
-format = "[$symbol$env_value]($style) "
-description = "zmx session name"
-style = "bold magenta"
-```
-
 ## shell completion
 
-Shell auto-completion for `zmx` commands and session names can be enabled using the `completions` subcommand. Once configured, you'll get auto-complete for both local `zmx` commands and sessions:
+Shell auto-completion for commands and session names can be enabled using the `completions` subcommand. Once configured, you'll get auto-complete for both local commands and sessions:
 
 ```bash
-ssh remote-server zmx attach session-na<TAB>
-# <- auto-complete suggestions appear here
+zmosh completions bash  # or zsh, fish
 ```
-
-> NOTICE: when installing `zmx` with `homebrew` completions are automatically installed.
 
 ### bash
 
 Add this to your `.bashrc` file:
 
 ```bash
-if command -v zmx &> /dev/null; then
-  eval "$(zmx completions bash)"
+if command -v zmosh &> /dev/null; then
+  eval "$(zmosh completions bash)"
 fi
 ```
 
@@ -223,100 +276,20 @@ fi
 Add this to your `.zshrc` file:
 
 ```zsh
-if command -v zmx &> /dev/null; then
-  eval "$(zmx completions zsh)"
+if command -v zmosh &> /dev/null; then
+  eval "$(zmosh completions zsh)"
 fi
 ```
 
 ### fish
 
-Add this to `~/.config/fish/completions/zmx.fish`:
+Add this to your `.config/fish/config.fish` file:
 
 ```fish
-if type -q zmx
-  zmx completions fish | source
+if type -q zmosh
+  zmosh completions fish | source
 end
 ```
-
-## session picker
-
-You can add an interactive session picker to your shell that lets you fuzzy-find existing sessions, preview their scrollback history, or create new ones -- all from a single prompt. This is especially useful for remote SSH workflows: add it to your shell startup so that connecting to a machine immediately presents the picker.
-
-Requires [fzf](https://github.com/junegunn/fzf).
-
-- **Enter** selects a matched session (or creates one if no sessions exist)
-- **Ctrl-N** creates a new session using the typed query, even when a fuzzy match is highlighted
-
-<details>
-<summary>bash and zsh</summary>
-
-```bash
-zmx-select() {
-  local display
-  display=$(zmx list 2>/dev/null | while IFS=$'\t' read -r name pid clients created dir; do
-    name=${name#*name=}
-    pid=${pid#*pid=}
-    clients=${clients#*clients=}
-    dir=${dir#*start_dir=}
-    printf "%-20s  pid:%-8s  clients:%-2s  %s\n" "$name" "$pid" "$clients" "$dir"
-  done)
-
-  local output query key selected session_name
-  output=$({ [[ -n "$display" ]] && echo "$display"; } | fzf \
-    --print-query \
-    --expect=ctrl-n \
-    --height=80% \
-    --reverse \
-    --prompt="zmx> " \
-    --header="Enter: select | Ctrl-N: create new" \
-    --preview='zmx history {1}' \
-    --preview-window=right:60%:follow \
-  )
-  local rc=$?
-
-  query=$(echo "$output" | sed -n '1p')
-  key=$(echo "$output" | sed -n '2p')
-  selected=$(echo "$output" | sed -n '3p')
-
-  if [[ "$key" == "ctrl-n" && -n "$query" ]]; then
-    session_name="$query"
-  elif [[ $rc -eq 0 && -n "$selected" ]]; then
-    session_name=$(echo "$selected" | awk '{print $1}')
-  elif [[ -n "$query" ]]; then
-    session_name="$query"
-  else
-    return 130
-  fi
-
-  zmx attach "$session_name"
-}
-```
-
-You can call `zmx-select` manually, bind it to a key, or auto-launch it on shell startup when outside a zmx session. With `&& exit`, the normal flow becomes: connect via SSH → pick a session → work → detach or exit the session → SSH disconnects automatically. Cancelling the picker with **Ctrl-C** drops you into a regular shell as an escape hatch.
-
-```bash
-if command -v zmx &> /dev/null && command -v fzf &> /dev/null && [[ -z "$ZMX_SESSION" ]]; then
-  zmx-select && exit
-fi
-```
-
-#### Alternative: gentle hint (server use)
-
-If you use zmx on a shared server and SSH in frequently for quick operations, auto-launching the picker on every connection may be too aggressive. Instead, show a one-line reminder when active sessions exist:
-
-```bash
-if command -v zmx &> /dev/null && [[ -z "$ZMX_SESSION" ]]; then
-  local count
-  count=$(zmx ls --short 2>/dev/null | wc -l)
-  if [[ "$count" -gt 0 ]]; then
-    echo "zmx: $count session(s) active — \`zmx-select\` to attach" >&2
-  fi
-fi
-```
-
-Choose the auto-launch pattern for dedicated dev machines, and the hint pattern for shared servers where you frequently run quick commands.
-
-</details>
 
 ## session prefix
 
@@ -324,35 +297,21 @@ We allow users to set an environment variable `ZMX_SESSION_PREFIX` which will pr
 
 ```bash
 export ZMX_SESSION_PREFIX="d."
-zmx a runner # ZMX_SESSION=d.runner
-zmx a tests  # ZMX_SESSION=d.tests
-zmx k tests  # kills d.tests
-zmx wait     # suspends until all tasks prefixed with "d." are complete
+zmosh a runner # ZMX_SESSION=d.runner
+zmosh a tests  # ZMX_SESSION=d.tests
+zmosh k tests  # kills d.tests
+zmosh wait     # suspends until all tasks prefixed with "d." are complete
 ```
 
 ## philosophy
 
-The entire argument for `zmx` instead of something like `tmux` that has windows, panes, splits, etc. is that job should be handled by your os window manager. By using something like `tmux` you now have redundant functionality in your dev stack: a window manager for your os and a window manager for your terminal. Further, in order to use modern terminal features, your terminal emulator **and** `tmux` need to have support for them. This holds back the terminal enthusiast community and feature development.
+The entire argument for session persistence tools instead of something like `tmux` that has windows, panes, splits, etc. is that window management should be handled by your OS window manager. By using something like `tmux` you now have redundant functionality in your dev stack: a window manager for your OS and a window manager for your terminal. Further, in order to use modern terminal features, your terminal emulator **and** `tmux` need to have support for them. This holds back the terminal enthusiast community and feature development.
 
-Instead, this tool specifically focuses on session persistence and defers window management to your os wm.
+zmosh focuses on two things: **session persistence** and **network resilience**. Window management is your OS's job.
 
 ## ssh workflow
 
-### Try it out quickly
-
-If you'd like to try out `zmx` and `ssh` without fiddling your `ssh` config, make sure to pass the `-t` option to `ssh`. Here's an example:
-
-```bash
-ssh -t dev-box zmx attach default
-```
-
-Without `-t`, the remote shell will not know it's talking to a terminal, and the display will likely get messed up.
-
-This option isn't needed if you follow the configuration steps below, because `RequestTTY yes` does the same thing.
-
-### Configure it for regular use
-
-Using `zmx` with `ssh` is a first-class citizen. Instead of using `ssh` to remote into your system with a single terminal and `n` tmux panes, you open `n` terminals and run `ssh` for all of them. This might sound tedious, but there are tools to make this a delightful workflow.
+Using zmosh with `ssh` is a first-class citizen. Instead of using `ssh` to remote into your system with a single terminal and `n` tmux panes, you open `n` terminals and run `ssh` for all of them. This might sound tedious, but there are tools to make this a delightful workflow.
 
 First, create an `ssh` config entry for your remote dev server:
 
@@ -360,14 +319,12 @@ First, create an `ssh` config entry for your remote dev server:
 Host = d.*
     HostName 192.168.1.xxx
 
-    RemoteCommand zmx attach %k
+    RemoteCommand zmosh attach %k
     RequestTTY yes
     ControlPath ~/.ssh/cm-%r@%h:%p
     ControlMaster auto
     ControlPersist 10m
 ```
-
-Architecturally, `ssh` supports multiplexing multiple channels of communication within a single connection to a server. `ControlMaster` is the setting that tells `ssh` to multiplex multiple PTY sessions to a single server over one tcp connection. Neat!
 
 Now you can spawn as many terminal sessions as you'd like:
 
@@ -378,9 +335,9 @@ ssh d.pico
 ssh d.dotfiles
 ```
 
-Because the `attach` command is essentially an "upsert", this will create or attach to each session.
+This will create or attach to each session and since we are using `ControlMaster` the same `ssh` connection is reused for every call to `ssh` for near-instant connection times.
 
-Now you can use the [`autossh`](https://linux.die.net/man/1/autossh) tool to make your ssh connections auto-reconnect. For example, if you have a laptop and close/open your lid it will automatically reconnect all your ssh connections:
+Now you can use the [`autossh`](https://linux.die.net/man/1/autossh) tool to make your ssh connections auto-reconnect. For example, if you have a laptop and close/open your laptop lid it will automatically reconnect all your ssh connections:
 
 ```bash
 autossh -M 0 -q d.term
@@ -396,12 +353,11 @@ abbr -a ash "autossh -M 0 -q"
 ash d.term
 ash d.irc
 ash d.pico
-ash d.dotifles
+ash d.dotfiles
 ```
 
-Wow! Now you can setup all your os tiling windows how you like them for your project and have as many windows as you'd like, almost replicating exactly what `tmux` does but with native windows, tabs, splits, and scrollback! It also has the added benefit of supporting all the terminal features your emulator supports, no longer restricted by what `tmux` supports.
-
-The end-game here would be to leverage your window manager's ability to automatically arrange your windows for each project with a single command.
+> [!TIP]
+> For remote sessions that need to survive network changes without SSH reconnecting, use `zmosh attach -r <host> <session>` instead. The UDP transport handles roaming natively — no `autossh` needed.
 
 ## socket file location
 
@@ -412,25 +368,53 @@ Each session gets its own unix socket file. The default location depends on your
 1. `TMPDIR` => uses `{TMPDIR}/zmx-{uid}` (appends uid for multi-user safety)
 1. `/tmp` => uses `/tmp/zmx-{uid}` (default fallback, appends uid for multi-user safety)
 
-## permissions
-
-You can configure the permissions for the socket directory and log files using the following environment variables:
-
-- `ZMX_DIR_MODE` => sets the mode for the socket and log directories (octal, defaults to `0750`)
-- `ZMX_LOG_MODE` => sets the mode for the log files (octal, defaults to `0640`)
-
-This is particularly useful when running `zmx` as a system service with a shared group. For example, setting `ZMX_DIR_MODE=0770` and `ZMX_LOG_MODE=0660` allows group members to attach to the session.
-
 ## debugging
 
-We store global logs for cli commands in `{log_dir}/zmx.log`. We store session-specific logs in `{log_dir}/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
+We store global logs for cli commands in `{socket_dir}/logs/zmx.log`. We store session-specific logs in `{socket_dir}/logs/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
 
-The log directory is resolved in this order:
+## impl
 
-1. `ZMX_DIR/logs` if `ZMX_DIR` is set
-1. `XDG_STATE_HOME/zmx/logs` if `XDG_STATE_HOME` is set
-1. `HOME/.local/state/zmx/logs`
-1. `TMPDIR/zmx-$UID` (or `/tmp/zmx-$UID`) as a last resort
+### local mode
+
+- The `daemon` and client processes communicate via a unix socket
+- Both `daemon` and `client` loops leverage `poll()`
+- Each session creates its own unix socket file
+- We restore terminal state and output using `libghostty-vt`
+
+### libghostty-vt
+
+We use [libghostty-vt](https://github.com/ghostty-org/ghostty) to restore the previous state of the terminal when a client re-attaches to a session.
+
+How it works:
+
+- user creates session `zmosh attach term`
+- user interacts with terminal stdin
+- stdin gets sent to pty via daemon
+- daemon sends pty output to client *and* `ghostty-vt`
+- `ghostty-vt` holds terminal state and scrollback
+- user disconnects
+- user re-attaches to session
+- `ghostty-vt` sends terminal snapshot to client stdout
+
+In this way, `ghostty-vt` doesn't sit in the middle of an active terminal session, it simply receives all the same data the client receives so it can re-hydrate clients that connect to the session. This enables users to pick up where they left off as if they didn't disconnect from the terminal session at all. It also has the added benefit of being very fast, the only thing sitting in-between you and your PTY is a unix socket.
+
+### remote mode (gateway architecture)
+
+Remote sessions use a **gateway** pattern that bridges encrypted UDP to the existing local IPC, leaving the daemon completely untouched:
+
+```
+┌────────────┐  encrypted UDP  ┌────────────────┐ unix socket  ┌────────┐
+│   client   │ ◄─────────────► │    gateway     │ ◄──────────► │ daemon │
+│  (local)   │ XChaCha20-P1305 │ (zmosh serve)  │     IPC      │ (pty)  │
+└────────────┘                 └────────────────┘              └────────┘
+```
+
+- `zmosh serve <session>` binds a UDP port, generates a session key, and connects to the daemon's unix socket as a regular client
+- The client reads the key over SSH, then communicates directly via UDP
+- Heartbeats (1s interval) detect connectivity loss; the client shows a status bar during disconnection
+- If no packets arrive for 24h, the gateway shuts down (configurable `alive_timeout_ms`)
+- Anti-replay: sequence numbers are monotonically increasing; packets with `seq <= max_recv_seq` don't update peer state
+- Roaming: when an authenticated packet arrives from a new IP, the peer address is updated — no handshake needed
 
 ## a smol contract
 
@@ -442,71 +426,46 @@ The log directory is resolved in this order:
 
 ## known issues
 
-- When upgrading versions of `zmx` where we make changes to the underlying IPC communication, it will kill all your sessions because it cannot communicate through the daemon socket properly
-- Terminal state restoration with nested `zmx` sessions through SSH: host A `zmx` -> SSH -> host B `zmx`
+- Terminal state rehydration with nested sessions through SSH: host A `zmosh` -> SSH -> host B `zmosh`
   - Specifically cursor position gets corrupted
-  - Essentially this is unspecified and unsupported behavior
-- When re-attaching and kitty keyboard mode was previously enable, we try to re-send that CSI query to re-enable it
+- When re-attaching and kitty keyboard mode was previously enabled, we try to re-send that CSI query to re-enable it
   - Some programs don't know how to handle that CSI query (e.g. `psql`) so when you type it echos kitty escape sequences erroneously
 
-## impl
+## prior art and acknowledgements
 
-- The `daemon` and client processes communicate via a unix socket
-- Both `daemon` and `client` loops leverage `poll(2)`
-- Each session creates its own unix socket file
-- We restore terminal state and output using `libghostty-vt`
+zmosh is built on top of [zmx](https://github.com/neurosnap/zmx) by [neurosnap](https://github.com/neurosnap). The local session persistence model, daemon architecture, and IPC protocol are all zmx's work. zmosh adds the network transport layer.
 
-### libghostty-vt
+Terminal state restoration is powered by [libghostty-vt](https://github.com/ghostty-org/ghostty) from the [Ghostty](https://ghostty.org) project.
 
-We use `libghostty-vt` to restore the previous state of the terminal when a client re-attaches to a session.
+The UDP auto-reconnect design draws from:
 
-How it works:
+- **[mosh](https://mosh.org)** — The original UDP-based remote terminal. Proved that roaming + encrypted datagrams is the right model for unreliable networks. zmosh borrows the core idea of authenticated datagrams with IP roaming.
+- **[Eternal Terminal](https://eternalterminal.dev)** — Showed that session persistence and network resilience can coexist. Uses TCP with reconnect rather than UDP.
+- **[tssh](https://github.com/trzsz/trzsz-ssh)** — SSH client with trzsz file transfer support and other enhancements.
 
-- user creates session `zmx attach term`
-- user interacts with terminal stdin
-- stdin gets sent to pty via daemon
-- daemon sends pty output to client *and* `ghostty-vt`
-- `ghostty-vt` holds terminal state and scrollback
-- user disconnects
-- user re-attaches to session
-- `ghostty-vt` sends terminal snapshot to client stdout
+### other session persistence tools
 
-In this way, `ghostty-vt` doesn't sit in the middle of an active terminal session, it simply receives all the same data the client receives so it can re-hydrate clients that connect to the session. This enables users to pick up where they left off as if they didn't disconnect from the terminal session at all. It also has the added benefit of being very fast, the only thing sitting in-between you and your PTY is a unix socket.
+- **[shpool](https://github.com/shell-pool/shpool)** — Lighter weight alternative to tmux. Provides persistent sessions with native scrollback.
+- **[abduco](https://github.com/martanne/abduco)** — Session management that pairs with dvtm for a simpler alternative to tmux.
+- **[dtach](https://github.com/crigler/dtach)** — Minimal detach feature emulation from screen.
 
-## prior art
+## comparison with session persistence tools
 
-Below is a list of projects that inspired me to build this project. Architecturally, `zmx` uses aspects of both projects. For example, `shpool` inspired the idea of having libghostty restore the terminal state on reattach. Abduco inspired the idea of one daemon (and unix socket) per session.
-
-### shpool
-
-https://github.com/shell-pool/shpool
-
-`shpool` is a service that enables session persistence by allowing the creation of named shell sessions owned by `shpool` so that the session is not lost if the connection drops.
-
-### abduco
-
-https://github.com/martanne/abduco
-
-abduco provides session management (i.e. it allows programs to be run independently from its controlling terminal). Together with dvtm it provides a simpler alternative to tmux or screen.
-
-## comparison
-
-| Feature                        | zmx | shpool | abduco | dtach | tmux |
-| ------------------------------ | --- | ------ | ------ | ----- | ---- |
-| 1:1 Terminal emulator features | ✓   | ✓      | ✓      | ✓     | ✗    |
-| Terminal state restore         | ✓   | ✓      | ✗      | ✗     | ✓    |
-| Window management              | ✗   | ✗      | ✗      | ✗     | ✓    |
-| Multiple clients per session   | ✓   | ✗      | ✓      | ✓     | ✓    |
-| Native scrollback              | ✓   | ✓      | ✓      | ✓     | ✗    |
-| Configurable detach key        | ✗   | ✓      | ✓      | ✓     | ✓    |
-| Auto-daemonize                 | ✓   | ✓      | ✓      | ✓     | ✓    |
-| Daemon per session             | ✓   | ✗      | ✓      | ✓     | ✗    |
-| Session listing                | ✓   | ✓      | ✓      | ✗     | ✓    |
+| Feature | zmosh | zmx | shpool | abduco | dtach | tmux |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1:1 Terminal emulator features | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| Terminal state restore | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ |
+| Window management | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Multiple clients per session | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| Native scrollback | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| Auto-daemonize | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Daemon per session | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ |
+| Session listing | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| Encrypted remote sessions | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| UDP auto-reconnect | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| IP roaming | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 
 ## community tools
 
-- [emacs-term-sessions](https://github.com/ArthurHeymans/emacs-term-sessions) Persistent terminal sessions in Emacs, both local and remote.
-- [pi-zmx](https://github.com/deevus/pi-zmx) -- [pi](https://pi.dev) extension for zmx.
-- [zsm](https://github.com/mdsakalu/zmx-session-manager) -- TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
-- [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).
-- [zmx-picker](https://github.com/EarthmanMuons/zmx-picker) -- fzf-based session picker and project launcher. Jump to a running zmx session or start one inside any of your git/jj repos.
+- [zsm](https://github.com/mdsakalu/zmx-session-manager) — TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
+- [zig-skills](https://github.com/rudedogg/zig-skills) — Claude Code skill for up-to-date Zig 0.15.x patterns. Powers this project's AI-assisted development, avoiding outdated patterns from training data.

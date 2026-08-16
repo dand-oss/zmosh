@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     {
         const run_step = b.step("run", "Run the app");
         const exe = b.addExecutable(.{
-            .name = "zmx",
+            .name = "zmosh",
             // .use_llvm = true,
             // .use_lld = !is_macos,
             .root_module = exe_mod,
@@ -95,9 +95,9 @@ pub fn build(b: *std.Build) void {
 
     // Check for LSP integration
     {
-        const check = b.step("check", "Check if zmx compiles");
+        const check = b.step("check", "Check if zmosh compiles");
         const exe_check = b.addExecutable(.{
-            .name = "zmx",
+            .name = "zmosh",
             // .use_llvm = true,
             // .use_lld = !is_macos,
             .root_module = exe_mod,
@@ -138,7 +138,7 @@ pub fn build(b: *std.Build) void {
 
             // const is_local_macos = resolved.result.os.tag == .macos;
             const release_exe = b.addExecutable(.{
-                .name = "zmx",
+                .name = "zmosh",
                 // .use_llvm = true,
                 // .use_lld = !is_local_macos,
                 .root_module = release_mod,
@@ -146,14 +146,14 @@ pub fn build(b: *std.Build) void {
 
             const os_name = @tagName(release_target.os_tag orelse .linux);
             const arch_name = @tagName(release_target.cpu_arch orelse .x86_64);
-            const tarball_name = b.fmt("zmx-{s}-{s}-{s}.tar.gz", .{ version, os_name, arch_name });
+            const tarball_name = b.fmt("zmosh-{s}-{s}-{s}.tar.gz", .{ version, os_name, arch_name });
 
             const tar = b.addSystemCommand(&.{ "tar", "-czf" });
 
             const tarball = tar.addOutputFileArg(tarball_name);
             tar.addArg("-C");
             tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
-            tar.addArg("zmx");
+            tar.addArg("zmosh");
 
             const shasum = b.addSystemCommand(&.{"sha256sum"});
             shasum.addFileArg(tarball);

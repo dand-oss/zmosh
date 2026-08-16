@@ -185,7 +185,7 @@ pub fn main(init: std.process.Init) !void {
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
         return run(gpa, io, &daemon, detached, cmd_args_raw.items);
-    } else if (std.mem.eql(u8, cmd, "send") or std.mem.eql(u8, cmd, "s")) {
+    } else if (std.mem.eql(u8, cmd, "send") or std.mem.eql(u8, cmd, "se")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
             return help(io);
@@ -406,14 +406,14 @@ pub fn main(init: std.process.Init) !void {
 
 fn help(io: std.Io) !void {
     const help_text =
-        \\zmx - session persistence for terminal processes
+        \\zmosh - session persistence for terminal processes
         \\
-        \\Usage: zmx <command> [args...]
+        \\Usage: zmosh <command> [args...]
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]             Attach to session, creating if needed
         \\  [r]un <name> [-d] [command...]           Send command without attaching
-        \\  [s]end <name> <text...>                  Send raw input to session PTY
+        \\  [se]nd <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
@@ -434,41 +434,41 @@ fn help(io: std.Io) !void {
         \\  command instead of creating a shell.
         \\
         \\  Examples:
-        \\    zmx attach dev
-        \\    zmx attach dev vim
+        \\    zmosh attach dev
+        \\    zmosh attach dev vim
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines
         \\  of the session's scrollback history.
         \\
         \\  Examples:
-        \\    zmx history <session> | tail -100
+        \\    zmosh history <session> | tail -100
         \\
         \\Run:
         \\  Commands run inside a PTY using bash
         \\  Commands are passed as-is: do not wrap in quotes.
         \\  Commands run sequentially: do not send multiple in parallel.
         \\  Stdin is redirected from /dev/null to prevent interactive programs
-        \\  (pagers, editors, prompts) from blocking. Use `zmx send` for
+        \\  (pagers, editors, prompts) from blocking. Use `zmosh send` for
         \\  commands that need user input, or pipe data directly:
-        \\    echo "data" | zmx run dev cat
+        \\    echo "data" | zmosh run dev cat
         \\
         \\  `-d` will detach from the calling terminal. Use `wait` to track
         \\  its status.
         \\
         \\  Examples:
-        \\    zmx run dev ls
-        \\    zmx run dev zig build
-        \\    zmx run dev grep -r TODO src
-        \\    zmx run dev git log --oneline          # pager won't block
-        \\    echo "hello" | zmx run dev cat         # piped stdin still works
+        \\    zmosh run dev ls
+        \\    zmosh run dev zig build
+        \\    zmosh run dev grep -r TODO src
+        \\    zmosh run dev git log --oneline          # pager won't block
+        \\    echo "hello" | zmosh run dev cat         # piped stdin still works
         \\
         \\    # heredoc
-        \\    printf "cat << 'EOF'\r\nHello $USER\r\nToday is $(date).\r\nEOF" | zmx run dev
+        \\    printf "cat << 'EOF'\r\nHello $USER\r\nToday is $(date).\r\nEOF" | zmosh run dev
         \\
         \\    # non-blocking
-        \\    zmx run dev -d sleep 10
-        \\    zmx wait dev
+        \\    zmosh run dev -d sleep 10
+        \\    zmosh wait dev
         \\
         \\Send:
         \\  Sends raw text to the session's PTY input (fire-and-forget).
@@ -480,12 +480,12 @@ fn help(io: std.Io) !void {
         \\  Append \r yourself when you want the shell to execute a command.
         \\
         \\  Text can also be piped via stdin:
-        \\    printf 'ls -la\r' | zmx send dev
+        \\    printf 'ls -la\r' | zmosh send dev
         \\
         \\  Examples:
-        \\    printf 'echo hello\r' | zmx send dev
-        \\    zmx send dev $(printf '\x03')
-        \\    zmx send dev /compact
+        \\    printf 'echo hello\r' | zmosh send dev
+        \\    zmosh send dev $(printf '\x03')
+        \\    zmosh send dev /compact
         \\
         \\Print:
         \\  Injects text directly into the session display and scrollback.
@@ -493,8 +493,8 @@ fn help(io: std.Io) !void {
         \\  Caller is responsible for newlines (\\r\\n).
         \\
         \\  Examples:
-        \\    printf '\\r\\nhello\\r\\n' | zmx print dev
-        \\    zmx print dev "$(printf '\\r\\nalert\\r\\n')"
+        \\    printf '\\r\\nhello\\r\\n' | zmosh print dev
+        \\    zmosh print dev "$(printf '\\r\\nalert\\r\\n')"
         \\
         \\Write:
         \\  Writes stdin to file_path inside the session. Works over SSH.
@@ -504,31 +504,31 @@ fn help(io: std.Io) !void {
         \\  File path must not contain single quotes.
         \\
         \\  Examples:
-        \\    echo "hello" | zmx write dev /tmp/hello.txt
-        \\    cat main.zig | zmx write dev src/main.zig
+        \\    echo "hello" | zmosh write dev /tmp/hello.txt
+        \\    cat main.zig | zmosh write dev src/main.zig
         \\
         \\Wait:
         \\  Used with a detached run task to track its status.  Multiple
         \\  sessions can be provided.
         \\
         \\  Examples:
-        \\    zmx run -d dev sleep 10
-        \\    zmx wait dev
-        \\    zmx wait dev other
+        \\    zmosh run -d dev sleep 10
+        \\    zmosh wait dev
+        \\    zmosh wait dev other
         \\
         \\Labels:
         \\  Attach key=value labels to live sessions for discovery and
         \\  filtering. Labels are in-memory and scoped to session lifetime.
         \\
         \\  Examples:
-        \\    zmx set dev project=zmx env=dev
-        \\    zmx set dev project=            # unset a label
-        \\    zmx set . status=fail           # "." resolves to current session
-        \\    zmx get dev
-        \\    zmx get dev project
-        \\    zmx set next "$(zmx get prev)"  # set labels from other session
-        \\    zmx list | grep project=zmx
-        \\    zmx clear dev
+        \\    zmosh set dev project=zmosh env=dev
+        \\    zmosh set dev project=            # unset a label
+        \\    zmosh set . status=fail           # "." resolves to current session
+        \\    zmosh get dev
+        \\    zmosh get dev project
+        \\    zmosh set next "$(zmosh get prev)"  # set labels from other session
+        \\    zmosh list | grep project=zmosh
+        \\    zmosh clear dev
         \\
         \\Environment variables:
         \\  SHELL                Default shell for new sessions
@@ -552,7 +552,7 @@ fn printVersion(io: std.Io, cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
     try w.interface.print(
-        "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
+        "zmosh\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
         .{ version, ghostty_version, cfg.socket_dir, cfg.log_dir },
     );
     try w.interface.flush();
@@ -829,7 +829,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
         }
 
         if (max_seen == 0) {
-            // `zmx run foo && zmx wait foo` is essentially sequential, so
+            // `zmosh run foo && zmosh wait foo` is essentially sequential, so
             // matching sessions should be visible from the first poll. If
             // nothing appears after a few iterations it's almost certainly a
             // typo, not a slow start.
@@ -944,7 +944,7 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
 fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
     const session_name = socket.getSeshNameFromEnv();
     if (session_name.len == 0) {
-        std.log.err("ZMX_SESSION env var not found: are you inside a zmx session?", .{});
+        std.log.err("ZMX_SESSION env var not found: are you inside a zmosh session?", .{});
         return;
     }
     std.log.info("detach all session={s}", .{session_name});
@@ -1014,7 +1014,7 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
     // Block until the daemon hangs up. The daemon's shutdown defer closes
     // and unlinks the listen socket before it closes client connections,
     // so by the time we read EOF here the session name is free for reuse
-    // and a subsequent `zmx run <name>` can't land in the dying daemon's
+    // and a subsequent `zmosh run <name>` can't land in the dying daemon's
     // accept backlog.
     var drain: [256]u8 = undefined;
     while (true) {
@@ -1252,7 +1252,7 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
 }
 
 fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh: []const u8) !void {
-    // we want daemon.session_name because that's the session name the user provided during zmx attach
+    // we want daemon.session_name because that's the session name the user provided during zmosh attach
     // instead of the name of the session they are currently inside of.
     const next_session = daemon.session_name;
     std.log.info("switch session cur={s} next={s}", .{ current_sesh, next_session });

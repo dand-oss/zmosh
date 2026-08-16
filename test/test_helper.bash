@@ -4,10 +4,10 @@ REPO_DIR="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 
 setup() {
   # Build once per test suite (skips if already built)
-  if [[ ! -x "$REPO_DIR/zig-out/bin/zmx" ]]; then
+  if [[ ! -x "$REPO_DIR/zig-out/bin/zmosh" ]]; then
     cd "$REPO_DIR" && zig build
   fi
-  ZMX="$REPO_DIR/zig-out/bin/zmx"
+  ZMX="$REPO_DIR/zig-out/bin/zmosh"
 
   # Isolate socket dir so tests don't interfere with real sessions or each other
   export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
