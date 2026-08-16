@@ -13,7 +13,7 @@ Dispositions: **ported** (carried in this branch), **port-pending** (scheduled s
 | 4 | `113ddc0` | remote attach via encrypted UDP | ported | `src/remote.zig` + `src/serve.zig` preserved; dispatch wiring in Stage 2 |
 | 5 | `10d946a` | rename binary zmx→zmosh | obsolete | redone by Stage 1 rebrand on the new base |
 | 6 | `d20ac1e` | local project setup | ported | `AGENTS.md`, `CLAUDE.md`, `.claude/skills/zig`, `docs/` preserved |
-| 7 | `a6f65f4` | SSH steals stdin during remote attach | ported | inside preserved `remote.zig`; re-verify in Stage 2.6 (0.16 `std.process` rewrite) |
+| 7 | `a6f65f4` | SSH steals stdin during remote attach | ported | stdin `.ignore` in the 0.16 spawn (`85ec2a2`) |
 | 8 | `5d16850` | propagate session end to remote client | ported | `SessionEnd` tag moves 11→**19** (zmx took 11 for `Switch`), Stage 2.2 |
 | 9 | `c8518e7` | forward TERM/COLORTERM via SSH | ported | inside `remote.zig`; covered by Stage 2.6 quoting rules |
 | 10 | `b47f2e0` | chunk large output vs UDP fragmentation | ported | inside `serve.zig`; Stage 3 flow control (16-packet window) builds on it |
@@ -32,8 +32,8 @@ Dispositions: **ported** (carried in this branch), **port-pending** (scheduled s
 | 23 | `6c314ea` | preserve scrollback on ESC[2J | port-pending | same split — Stage 7 audit |
 | 24 | `b87bef0` | version 0.5.2 | obsolete | `0.6.0-dev` |
 | 25 | `71eba23` | SSH PATH fix (prefer $PATH, Homebrew) | ported | inside preserved `remote.zig` |
-| 26 | `79da8df` | remote attach: forward command arguments | port-pending | Stage 2.8 hand-reapply |
-| 27 | `b4c3055` | remote attach: visible connect/loss failures | port-pending | Stage 2.8 hand-reapply |
+| 26 | `79da8df` | remote attach: forward command arguments | ported | carried through stage 2e dispatch (`43deeeb`) |
+| 27 | `b4c3055` | remote attach: visible connect/loss failures | ported | reapplied in stage 2e (`43deeeb`) |
 | 28 | `6f39fe1` | regression: session persists after last client | port-pending | Stage 8 rehome into new test structure |
 
 ## Stage-1 rebrand decisions (this checkpoint)
