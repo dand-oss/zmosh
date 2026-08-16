@@ -40,10 +40,10 @@ pub const RemoteSession = struct {
     ssh: std.process.Child,
 };
 
-/// Terminate and reap the SSH bootstrap child.
+/// Terminate and reap the SSH bootstrap child. Child.kill blocks until the
+/// child exits and reaps it (idempotent); wait() after kill would assert.
 fn reapSsh(session: *RemoteSession, io: std.Io) void {
     session.ssh.kill(io);
-    _ = session.ssh.wait(io) catch {};
 }
 
 /// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp <port> <base64_key>\n"
@@ -119,10 +119,7 @@ pub fn connectRemote(
         log.err("failed to spawn SSH: {s}", .{@errorName(err)});
         return error.SshSpawnFailed;
     };
-    errdefer {
-        child.kill(io);
-        _ = child.wait(io) catch {};
-    }
+    errdefer child.kill(io);
 
     // Read the bootstrap line from SSH stdout with a bounded 10s wait.
     const stdout_fd = child.stdout.?.handle;
