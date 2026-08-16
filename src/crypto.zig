@@ -22,9 +22,9 @@ pub const overhead = 8 + tag_length;
 
 // -- Key management ----------------------------------------------------------
 
-pub fn generateKey() Key {
+pub fn generateKey(io: std.Io) !Key {
     var key: Key = undefined;
-    std.crypto.random.bytes(&key);
+    try io.randomSecure(&key);
     return key;
 }
 
@@ -129,7 +129,7 @@ pub fn decodeDatagram(key: Key, expected_direction: Direction, datagram: []const
 // -- Tests -------------------------------------------------------------------
 
 test "round-trip encrypt/decrypt" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const nonce = buildNonce(.to_server, 1);
     const plaintext = "hello, zmx!";
     var ct_buf: [plaintext.len + tag_length]u8 = undefined;
@@ -141,7 +141,7 @@ test "round-trip encrypt/decrypt" {
 }
 
 test "tampered ciphertext fails authentication" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const nonce = buildNonce(.to_client, 42);
     const plaintext = "secret";
     var ct_buf: [plaintext.len + tag_length]u8 = undefined;
@@ -153,8 +153,8 @@ test "tampered ciphertext fails authentication" {
 }
 
 test "wrong key fails" {
-    const key = generateKey();
-    const wrong_key = generateKey();
+    const key = try generateKey(std.testing.io);
+    const wrong_key = try generateKey(std.testing.io);
     const nonce = buildNonce(.to_server, 0);
     const plaintext = "data";
     var ct_buf: [plaintext.len + tag_length]u8 = undefined;
@@ -176,14 +176,14 @@ test "nonce direction bit" {
 }
 
 test "base64 key round-trip" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const encoded = keyToBase64(key);
     const decoded = try keyFromBase64(&encoded);
     try std.testing.expectEqual(key, decoded);
 }
 
 test "datagram round-trip" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const plaintext = "payload data";
     var enc_buf: [overhead + plaintext.len]u8 = undefined;
     var dec_buf: [plaintext.len]u8 = undefined;
@@ -195,7 +195,7 @@ test "datagram round-trip" {
 }
 
 test "datagram direction mismatch" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const plaintext = "x";
     var enc_buf: [overhead + plaintext.len]u8 = undefined;
     var dec_buf: [plaintext.len]u8 = undefined;
@@ -205,7 +205,7 @@ test "datagram direction mismatch" {
 }
 
 test "datagram tamper fails" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const plaintext = "abc";
     var enc_buf: [overhead + plaintext.len]u8 = undefined;
     var dec_buf: [plaintext.len]u8 = undefined;

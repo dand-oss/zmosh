@@ -1,12 +1,12 @@
 const std = @import("std");
-const posix = std.posix;
+const lib_posix = @import("posix.zig");
 const crypto = @import("crypto.zig");
 
 const log = std.log.scoped(.udp);
 
-/// Truncate nanoTimestamp (i128) to i64 for storage. Sufficient for ~292 years.
+/// Monotonic nanoseconds (see lib_posix.nowNs).
 fn nanoNow() i64 {
-    return @intCast(std.time.nanoTimestamp());
+    return lib_posix.nowNs();
 }
 
 pub const Config = struct {
@@ -30,41 +30,41 @@ pub const UdpSocket = struct {
     /// Bind a non-blocking UDP socket to the first available port in [port_start, port_end).
     /// Uses AF.INET6 with dual-stack when possible, falling back to AF.INET.
     pub fn bind(port_start: u16, port_end: u16) !UdpSocket {
-        if (bindFamily(posix.AF.INET6, port_start, port_end, true)) |sock| return sock;
-        if (bindFamily(posix.AF.INET, port_start, port_end, false)) |sock| return sock;
+        if (bindFamily(lib_posix.AF.INET6, port_start, port_end, true)) |sock| return sock;
+        if (bindFamily(lib_posix.AF.INET, port_start, port_end, false)) |sock| return sock;
         return error.AddressInUse;
     }
 
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {
-        const fd = posix.socket(
+        const fd = lib_posix.socket(
             family,
-            posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+            lib_posix.SOCK.DGRAM | lib_posix.SOCK.NONBLOCK | lib_posix.SOCK.CLOEXEC,
             0,
         ) catch return null;
 
         if (set_v6only) {
             const v6only: i32 = 0;
-            posix.setsockopt(fd, posix.IPPROTO.IPV6, std.os.linux.IPV6.V6ONLY, std.mem.asBytes(&v6only)) catch {
-                posix.close(fd);
+            lib_posix.setsockopt(fd, lib_posix.IPPROTO.IPV6, lib_posix.IPV6_V6ONLY, std.mem.asBytes(&v6only)) catch {
+                lib_posix.close(fd);
                 return null;
             };
         }
 
         var port = port_start;
         while (port < port_end) : (port += 1) {
-            const addr = if (family == posix.AF.INET6)
-                std.net.Address.initIp6(.{0} ** 16, port, 0, 0)
+            const addr = if (family == lib_posix.AF.INET6)
+                lib_posix.Address.initIp6(.{0} ** 16, port, 0, 0)
             else
-                std.net.Address.initIp4(.{0} ** 4, port);
-            posix.bind(fd, &addr.any, addr.getOsSockLen()) catch continue;
+                lib_posix.Address.initIp4(.{0} ** 4, port);
+            lib_posix.bind(fd, &addr.any, addr.getOsSockLen()) catch continue;
             log.info("bound udp port={d} family={s}", .{
                 port,
-                if (family == posix.AF.INET6) "inet6" else "inet",
+                if (family == lib_posix.AF.INET6) "inet6" else "inet",
             });
             return .{ .fd = fd, .bound_port = port };
         }
 
-        posix.close(fd);
+        lib_posix.close(fd);
         return null;
     }
 
@@ -72,24 +72,24 @@ pub const UdpSocket = struct {
         return self.fd;
     }
 
-    pub fn sendTo(self: *UdpSocket, data: []const u8, addr: std.net.Address) !void {
-        _ = posix.sendto(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+    pub fn sendTo(self: *UdpSocket, data: []const u8, addr: lib_posix.Address) !void {
+        _ = lib_posix.sendto(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             else => return err,
         };
     }
 
-    pub fn recvFrom(self: *UdpSocket, buf: []u8) !struct { len: usize, addr: std.net.Address } {
-        var src_addr: posix.sockaddr.storage = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        const n = posix.recvfrom(self.fd, buf, 0, @ptrCast(&src_addr), &addr_len) catch |err| switch (err) {
+    pub fn recvFrom(self: *UdpSocket, buf: []u8) !struct { len: usize, addr: lib_posix.Address } {
+        var src_addr: lib_posix.Address = undefined;
+        var addr_len: lib_posix.socklen_t = @sizeOf(lib_posix.Address);
+        const n = lib_posix.recvfrom(self.fd, buf, 0, @ptrCast(&src_addr), &addr_len) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             else => return err,
         };
         // Copy the full address returned by the kernel — not just the first
         // sizeof(sockaddr) bytes — so IPv6 addresses (28 bytes) aren't truncated.
-        var addr: std.net.Address = std.mem.zeroes(std.net.Address);
-        const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
+        var addr: lib_posix.Address = std.mem.zeroes(lib_posix.Address);
+        const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(lib_posix.Address));
         @memcpy(
             std.mem.asBytes(&addr)[0..len],
             std.mem.asBytes(&src_addr)[0..len],
@@ -101,12 +101,12 @@ pub const UdpSocket = struct {
     }
 
     pub fn close(self: *UdpSocket) void {
-        posix.close(self.fd);
+        lib_posix.close(self.fd);
     }
 };
 
 pub const Peer = struct {
-    addr: ?std.net.Address,
+    addr: ?lib_posix.Address,
     key: crypto.Key,
 
     // Sequence numbers
@@ -168,7 +168,7 @@ pub const Peer = struct {
 
     /// Try to receive and decrypt a datagram. Updates peer address on success (roaming).
     /// Returns null if no data available (EAGAIN) or decryption fails.
-    pub fn recv(self: *Peer, sock: *UdpSocket, buf: []u8) !?struct { data: []u8, from: std.net.Address } {
+    pub fn recv(self: *Peer, sock: *UdpSocket, buf: []u8) !?struct { data: []u8, from: lib_posix.Address } {
         var raw: [9000]u8 = undefined;
         const result = sock.recvFrom(&raw) catch |err| switch (err) {
             error.WouldBlock => return null,
@@ -280,21 +280,22 @@ pub const Peer = struct {
 
 /// Bind a non-blocking IPv4-only UDP socket on loopback for testing.
 fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
+    const fd = try lib_posix.socket(lib_posix.AF.INET, lib_posix.SOCK.DGRAM | lib_posix.SOCK.NONBLOCK | lib_posix.SOCK.CLOEXEC, 0);
+    errdefer lib_posix.close(fd);
     var port = port_start;
     while (port < port_end) : (port += 1) {
-        const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-        posix.bind(fd, &addr.any, addr.getOsSockLen()) catch continue;
+        const addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        lib_posix.bind(fd, &addr.any, addr.getOsSockLen()) catch continue;
         return .{ .fd = fd, .bound_port = port };
     }
-    posix.close(fd);
+    // errdefer closes the fd; an explicit close here would double-close and
+    // 0.16's Threaded.closeFd panics on EBADF (use-after-free detection).
     return error.AddressInUse;
 }
 
 fn testPollReady(fd: i32) !void {
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    _ = try posix.poll(&poll_fds, 1000);
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    _ = try lib_posix.poll(&poll_fds, 1000);
 }
 
 test "UdpSocket bind in port range" {
@@ -311,7 +312,7 @@ test "UdpSocket bind fails on empty range" {
 }
 
 test "Peer send/recv round-trip (loopback)" {
-    const key = crypto.generateKey();
+    const key = try crypto.generateKey(std.testing.io);
     var server_peer = Peer.init(key, .to_client);
 
     var server_sock = try testBindIp4(60910, 60920);
@@ -322,7 +323,7 @@ test "Peer send/recv round-trip (loopback)" {
     const msg = "hello, server!";
     var enc_buf: [crypto.overhead + msg.len]u8 = undefined;
     const datagram = try crypto.encodeDatagram(key, .to_server, 0, msg, &enc_buf);
-    try client_sock.sendTo(datagram, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, server_sock.bound_port));
+    try client_sock.sendTo(datagram, lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, server_sock.bound_port));
 
     try testPollReady(server_sock.fd);
     var peer_buf: [4096]u8 = undefined;
@@ -332,7 +333,7 @@ test "Peer send/recv round-trip (loopback)" {
 }
 
 test "Anti-replay: reject datagram with seq <= max_recv_seq" {
-    const key = crypto.generateKey();
+    const key = try crypto.generateKey(std.testing.io);
     var peer = Peer.init(key, .to_client);
 
     var sock_recv = try testBindIp4(60930, 60940);
@@ -340,7 +341,7 @@ test "Anti-replay: reject datagram with seq <= max_recv_seq" {
     var sock_send = try testBindIp4(60940, 60950);
     defer sock_send.close();
 
-    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+    const target = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
 
     var buf_lo: [128]u8 = undefined;
     const pkt_lo = try crypto.encodeDatagram(key, .to_server, 5, "first", &buf_lo);
@@ -369,7 +370,7 @@ test "Anti-replay: reject datagram with seq <= max_recv_seq" {
 }
 
 test "Roaming: verify addr updates on authentic packet" {
-    const key = crypto.generateKey();
+    const key = try crypto.generateKey(std.testing.io);
     var peer = Peer.init(key, .to_client);
 
     var sock_recv = try testBindIp4(60950, 60960);
@@ -379,7 +380,7 @@ test "Roaming: verify addr updates on authentic packet" {
     var sock_b = try testBindIp4(60970, 60980);
     defer sock_b.close();
 
-    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+    const target = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
 
     var buf1: [128]u8 = undefined;
     try sock_a.sendTo(try crypto.encodeDatagram(key, .to_server, 1, "from_a", &buf1), target);
@@ -401,7 +402,7 @@ test "Roaming: verify addr updates on authentic packet" {
 }
 
 test "Heartbeat timing logic" {
-    var peer = Peer.init(crypto.generateKey(), .to_server);
+    var peer = Peer.init(try crypto.generateKey(std.testing.io), .to_server);
     const config = Config{};
     const now = nanoNow();
 
@@ -413,7 +414,7 @@ test "Heartbeat timing logic" {
 }
 
 test "Peer state transitions" {
-    var peer = Peer.init(crypto.generateKey(), .to_server);
+    var peer = Peer.init(try crypto.generateKey(std.testing.io), .to_server);
     const config = Config{};
     const now = nanoNow();
     peer.last_recv_time = now;
@@ -430,7 +431,7 @@ test "Peer state transitions" {
 }
 
 test "RTT estimation basic sanity" {
-    var peer = Peer.init(crypto.generateKey(), .to_server);
+    var peer = Peer.init(try crypto.generateKey(std.testing.io), .to_server);
 
     // First measurement: 100ms
     peer.updateRtt(100_000);

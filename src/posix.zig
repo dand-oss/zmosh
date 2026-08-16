@@ -1284,34 +1284,35 @@ pub const Address = extern union {
             else => @as(socklen_t, @intCast(@sizeOf(sockaddr.un))),
         };
     }
+    pub fn initIp4(bytes: [4]u8, port: u16) Address {
+        var addr: Address = std.mem.zeroes(Address);
+        addr.in.family = AF.INET;
+        addr.in.port = mem.nativeToBig(u16, port);
+        // sin_addr is the 4 IP bytes verbatim in memory; bitCast preserves
+        // them where an endian-swapped integer read would reverse them.
+        addr.in.addr = @bitCast(bytes);
+        return addr;
+    }
+
+    pub fn initIp6(bytes: [16]u8, port: u16, flowinfo: u32, scope_id: u32) Address {
+        var addr: Address = std.mem.zeroes(Address);
+        addr.in6.family = AF.INET6;
+        addr.in6.port = mem.nativeToBig(u16, port);
+        addr.in6.flowinfo = flowinfo;
+        addr.in6.addr = bytes;
+        addr.in6.scope_id = scope_id;
+        return addr;
+    }
+
+    /// Host-byte-order port of an IP address, 0 for non-IP families.
+    pub fn getPort(addr: Address) u16 {
+        return switch (addr.any.family) {
+            AF.INET => mem.bigToNative(u16, addr.in.port),
+            AF.INET6 => mem.bigToNative(u16, addr.in6.port),
+            else => 0,
+        };
+    }
 };
-
-pub fn initIp4(bytes: [4]u8, port: u16) Address {
-    var addr: Address = std.mem.zeroes(Address);
-    addr.in.family = AF.INET;
-    addr.in.port = mem.nativeToBig(u16, port);
-    addr.in.addr = mem.readInt(u32, &bytes, .big);
-    return addr;
-}
-
-pub fn initIp6(bytes: [16]u8, port: u16, flowinfo: u32, scope_id: u32) Address {
-    var addr: Address = std.mem.zeroes(Address);
-    addr.in6.family = AF.INET6;
-    addr.in6.port = mem.nativeToBig(u16, port);
-    addr.in6.flowinfo = flowinfo;
-    addr.in6.addr = bytes;
-    addr.in6.scope_id = scope_id;
-    return addr;
-}
-
-/// Host-byte-order port of an IP address, 0 for non-IP families.
-pub fn ipPort(addr: Address) u16 {
-    return switch (addr.any.family) {
-        AF.INET => mem.bigToNative(u16, addr.in.port),
-        AF.INET6 => mem.bigToNative(u16, addr.in6.port),
-        else => 0,
-    };
-}
 
 pub fn initUnix(path: []const u8) !Address {
     var sock_addr = sockaddr.un{
@@ -1405,7 +1406,7 @@ pub const SetSockOptError = error{
 } || UnexpectedError;
 
 pub fn setsockopt(fd: fd_t, level: u32, optname: u32, opt: []const u8) SetSockOptError!void {
-    switch (errno(system.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len)))) {
+    switch (errno(system.setsockopt(fd, @intCast(level), @intCast(optname), opt.ptr, @intCast(opt.len)))) {
         .SUCCESS => return,
         .INVAL => return error.InvalidSocketOption,
         .NOMEM => return error.SystemResources,
