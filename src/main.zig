@@ -10,6 +10,8 @@ const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
+const remote = @import("remote.zig");
+const serve_mod = @import("serve.zig");
 const Cfg = @import("cfg.zig");
 const loop = @import("loop.zig");
 const Client = loop.Client;
@@ -119,15 +121,25 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(sesh);
         return history(gpa, io, &cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
-        const session_name = args.next() orelse "";
-        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
-            return help(io);
-        }
+        var session_name: []const u8 = "";
+        var remote_host: ?[]const u8 = null;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
         while (args.next()) |arg| {
-            try command_args.append(gpa, arg);
+            if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
+                remote_host = args.next() orelse {
+                    _ = lib_posix.write(lib_posix.STDERR_FILENO, "zmosh: -r requires a host\n") catch {};
+                    return error.MissingRemoteHost;
+                };
+            } else if (session_name.len == 0) {
+                session_name = arg;
+            } else {
+                try command_args.append(gpa, arg);
+            }
+        }
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help(io);
         }
 
         var command: ?[][]const u8 = null;
@@ -135,12 +147,37 @@ pub fn main(init: std.process.Init) !void {
             command = command_args.items;
         }
 
+        const sesh = try socket.getSeshName(gpa, session_name);
+        defer gpa.free(sesh);
+
+        // Remote attach via encrypted UDP (SSH bootstrap, then datagrams).
+        if (remote_host) |host| {
+            const session = remote.connectRemote(gpa, io, host, sesh, command) catch |err| {
+                std.log.err("remote connect failed: {s}", .{@errorName(err)});
+                // std.log goes to the log file; a kitty --hold tab or a
+                // scripted caller needs the failure on stderr and a
+                // non-zero exit, distinct from a normal detach.
+                var msg_buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &msg_buf,
+                    "zmosh: remote connect to {s} failed: {s} (see {s}/zmx.log)\n",
+                    .{ host, @errorName(err), cfg.log_dir },
+                ) catch "zmosh: remote connect failed\n";
+                _ = lib_posix.write(lib_posix.STDERR_FILENO, msg) catch {};
+                std.process.exit(2);
+            };
+            remote.remoteAttach(gpa, io, session) catch |err| switch (err) {
+                // Message already written to the terminal by remoteAttach.
+                error.ConnectionLost => std.process.exit(3),
+                else => return err,
+            };
+            return;
+        }
+
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd_len = std.process.currentPath(io, &cwd_buf) catch 0;
         const cwd = cwd_buf[0..cwd_len];
 
-        const sesh = try socket.getSeshName(gpa, session_name);
-        defer gpa.free(sesh);
         const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
             error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
@@ -151,6 +188,22 @@ pub fn main(init: std.process.Init) !void {
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(gpa, io, &daemon);
+    } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help(io);
+        }
+
+        const sesh = try socket.getSeshName(gpa, session_name);
+        defer gpa.free(sesh);
+        const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        var daemon = Daemon.init(io, &cfg, sesh, socket_path);
+        const is_daemon_proc = try daemon.ensureSession(io);
+        if (is_daemon_proc) return;
+        return serve_mod.serveMain(gpa, io, &cfg, sesh);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -412,7 +465,9 @@ fn help(io: std.Io) !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]             Attach to session, creating if needed
+        \\  [a]ttach -r <host> <name> [command...]   Attach to remote session via encrypted UDP
         \\  [r]un <name> [-d] [command...]           Send command without attaching
+        \\  [s]erve <name>                           Start UDP gateway for remote access
         \\  [se]nd <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session

@@ -106,6 +106,8 @@ pub fn connectRemote(
     }
     const remote_cmd = try remote_cmd_buf.toOwnedSlice(alloc);
     defer alloc.free(remote_cmd);
+    // ZMX_SSH overrides the SSH executable (tests use a local shim).
+    const ssh_exe = lib_posix.getenv("ZMX_SSH") orelse "ssh";
     const argv = [_][]const u8{ ssh_exe, host, "--", remote_cmd };
     // stdin is .ignore so SSH can never steal the terminal's stdin.
     var child = std.process.spawn(io, .{
@@ -152,7 +154,7 @@ pub fn connectRemote(
 
     // We have the connect info; close our end of the pipe. The child is
     // kept in RemoteSession and reaped by the attach/command caller.
-    if (child.stdout) |*f| f.close();
+    if (child.stdout) |f| f.close(io);
     child.stdout = null;
 
     return .{
@@ -163,8 +165,7 @@ pub fn connectRemote(
     };
 }
 
-/// SSH executable override for tests and unusual installs.
-const ssh_exe = "ssh";
+/// Bootstrap read deadline on the SSH stdout pipe.
 const ssh_bootstrap_timeout_ms: i32 = 10_000;
 
 fn getTerminalSize() ipc.Resize {
