@@ -1,9 +1,14 @@
 const std = @import("std");
-const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
+const cfg_mod = @import("cfg.zig");
+const socket = @import("socket.zig");
+const signal = @import("signal.zig");
+const lib_posix = @import("posix.zig");
+
+const Cfg = cfg_mod.Cfg;
 
 const log = std.log.scoped(.serve);
 
@@ -12,44 +17,6 @@ const max_unix_write_buf = 1024 * 1024;
 const max_output_coalesce = 256 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
-
-var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    sigterm_received.store(true, .release);
-}
-
-fn setupSigtermHandler() void {
-    const act: posix.Sigaction = .{
-        .handler = .{ .sigaction = handleSigterm },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.SIGINFO,
-    };
-    posix.sigaction(posix.SIG.TERM, &act, null);
-}
-
-/// Resolve the zmx socket directory, following the same logic as main.zig's Cfg.init.
-fn resolveSocketDir(alloc: std.mem.Allocator) ![]const u8 {
-    if (posix.getenv("ZMX_DIR")) |zmxdir|
-        return try alloc.dupe(u8, zmxdir);
-    const tmpdir = std.mem.trimRight(u8, posix.getenv("TMPDIR") orelse "/tmp", "/");
-    const uid = posix.getuid();
-    if (posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime|
-        return try std.fmt.allocPrint(alloc, "{s}/zmx", .{xdg_runtime});
-    return try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir, uid });
-}
-
-/// Connect to the daemon's Unix socket (same as sessionConnect in main.zig).
-fn connectUnix(path: []const u8) !i32 {
-    var unix_addr = try std.net.Address.initUnix(path);
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &unix_addr.any, unix_addr.getOsSockLen());
-    // Make non-blocking for poll loop
-    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-    _ = try posix.fcntl(fd, posix.F.SETFL, flags | posix.SOCK.NONBLOCK);
-    return fd;
-}
 
 pub const Gateway = struct {
     alloc: std.mem.Allocator,
@@ -77,39 +44,41 @@ pub const Gateway = struct {
 
     pub fn init(
         alloc: std.mem.Allocator,
+        io: std.Io,
+        cfg: *const Cfg,
         session_name: []const u8,
         config: udp.Config,
     ) !Gateway {
-        const socket_dir = try resolveSocketDir(alloc);
-        defer alloc.free(socket_dir);
-
-        const socket_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ socket_dir, session_name });
+        // Connect to the daemon's Unix socket via the shared socket module.
+        const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, session_name);
         defer alloc.free(socket_path);
 
-        // Connect to the daemon's Unix socket
-        const unix_fd = connectUnix(socket_path) catch |err| {
+        const unix_fd = socket.sessionConnect(socket_path) catch |err| {
             log.err("failed to connect to daemon socket={s} err={s}", .{ socket_path, @errorName(err) });
             return err;
         };
-        errdefer posix.close(unix_fd);
+        errdefer lib_posix.close(unix_fd);
+        // Non-blocking for the poll loop (sessionConnect returns blocking).
+        const flags = try lib_posix.fcntl(unix_fd, lib_posix.F.GETFL, 0);
+        _ = try lib_posix.fcntl(unix_fd, lib_posix.F.SETFL, flags | lib_posix.O_NONBLOCK);
 
         // Bind a UDP socket in the configured port range
         var udp_sock = try udp.UdpSocket.bind(config.port_range_start, config.port_range_end);
         errdefer udp_sock.close();
 
         // Generate session key
-        const key = crypto.generateKey();
+        const key = try crypto.generateKey(io);
         const encoded_key = crypto.keyToBase64(key);
 
         // Print bootstrap line for SSH capture
         {
             var out_buf: [256]u8 = undefined;
             const line = std.fmt.bufPrint(&out_buf, "ZMX_CONNECT udp {d} {s}\n", .{ udp_sock.bound_port, encoded_key }) catch unreachable;
-            _ = try posix.write(posix.STDOUT_FILENO, line);
+            _ = try lib_posix.write(lib_posix.STDOUT_FILENO, line);
         }
 
         // Close stdout so SSH session can terminate
-        posix.close(posix.STDOUT_FILENO);
+        lib_posix.close(lib_posix.STDOUT_FILENO);
 
         // Initialize peer (we send to_client, recv to_server from remote client)
         const peer = udp.Peer.init(key, .to_client);
@@ -119,7 +88,7 @@ pub const Gateway = struct {
         const output_coalesce_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
         const reliable_send = try transport.ReliableSend.init(alloc);
 
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const now: i64 = lib_posix.nowNs();
 
         log.info("gateway started session={s} udp_port={d}", .{ session_name, udp_sock.bound_port });
 
@@ -146,15 +115,13 @@ pub const Gateway = struct {
     }
 
     pub fn run(self: *Gateway) !void {
-        setupSigtermHandler();
+        // SIGTERM wakes poll() through the shared self-pipe (lib_posix.poll
+        // retries EINTR internally, so a flag alone would sleep through it).
+        try signal.openSignalPipe();
+        signal.installWakeHandler(@intFromEnum(lib_posix.SIG.TERM));
 
         while (self.running) {
-            if (sigterm_received.swap(false, .acq_rel)) {
-                log.info("SIGTERM received, shutting down gateway", .{});
-                break;
-            }
-
-            const now: i64 = @intCast(std.time.nanoTimestamp());
+            const now: i64 = lib_posix.nowNs();
 
             // Check peer state
             const state = self.peer.updateState(now, self.config);
@@ -178,24 +145,28 @@ pub const Gateway = struct {
                 }
             }
 
-            // Build poll fds
-            var poll_fds: [2]posix.pollfd = undefined;
-            poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
+            // Build poll fds: UDP socket, signal pipe, daemon socket.
+            var poll_fds: [3]lib_posix.pollfd = undefined;
+            poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = lib_posix.POLL.IN, .revents = 0 };
+            poll_fds[1] = .{ .fd = signal.sig_pipe[0], .events = lib_posix.POLL.IN, .revents = 0 };
 
-            var unix_events: i16 = posix.POLL.IN;
+            var unix_events: i16 = lib_posix.POLL.IN;
             if (self.unix_write_buf.items.len > 0) {
-                unix_events |= posix.POLL.OUT;
+                unix_events |= lib_posix.POLL.OUT;
             }
-            poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
+            poll_fds[2] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
 
             const poll_timeout = self.computePollTimeoutMs(now);
-            _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
-                if (err == error.Interrupted) continue;
-                return err;
-            };
+            _ = try lib_posix.poll(&poll_fds, poll_timeout);
+
+            if (poll_fds[1].revents & lib_posix.POLL.IN != 0) {
+                signal.drainSignalPipe();
+                log.info("SIGTERM received, shutting down gateway", .{});
+                break;
+            }
 
             // Handle incoming UDP datagrams → decrypt → decode transport packet
-            if (poll_fds[0].revents & posix.POLL.IN != 0) {
+            if (poll_fds[0].revents & lib_posix.POLL.IN != 0) {
                 while (true) {
                     var decrypt_buf: [9000]u8 = undefined;
                     const recv_result = try self.peer.recv(&self.udp_sock, &decrypt_buf);
@@ -205,7 +176,7 @@ pub const Gateway = struct {
             }
 
             // Handle Unix socket read → forward to UDP transport
-            if (poll_fds[1].revents & posix.POLL.IN != 0) {
+            if (poll_fds[2].revents & lib_posix.POLL.IN != 0) {
                 while (true) {
                     const n = self.unix_read_buf.read(self.unix_fd) catch |err| {
                         if (err == error.WouldBlock) break;
@@ -227,9 +198,9 @@ pub const Gateway = struct {
             }
 
             // Flush buffered writes to Unix socket
-            if (poll_fds[1].revents & posix.POLL.OUT != 0) {
+            if (poll_fds[2].revents & lib_posix.POLL.OUT != 0) {
                 if (self.unix_write_buf.items.len > 0) {
-                    const written = posix.write(self.unix_fd, self.unix_write_buf.items) catch |err| blk: {
+                    const written = lib_posix.write(self.unix_fd, self.unix_write_buf.items) catch |err| blk: {
                         if (err == error.WouldBlock) break :blk @as(usize, 0);
                         log.warn("unix write error: {s}", .{@errorName(err)});
                         self.running = false;
@@ -241,7 +212,7 @@ pub const Gateway = struct {
                 }
             }
 
-            if (poll_fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            if (poll_fds[2].revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
                 log.info("unix socket closed/error", .{});
                 break;
             }
@@ -249,7 +220,7 @@ pub const Gateway = struct {
 
         // Notify client that the session has ended.
         if (self.peer.addr != null) {
-            self.sendIpcReliable(.SessionEnd, "", @intCast(std.time.nanoTimestamp())) catch |err| {
+            self.sendIpcReliable(.SessionEnd, "", lib_posix.nowNs()) catch |err| {
                 log.debug("failed to send SessionEnd: {s}", .{@errorName(err)});
             };
         }
@@ -487,7 +458,7 @@ pub const Gateway = struct {
     }
 
     pub fn deinit(self: *Gateway) void {
-        posix.close(self.unix_fd);
+        lib_posix.close(self.unix_fd);
         self.udp_sock.close();
         self.unix_read_buf.deinit();
         self.unix_write_buf.deinit(self.alloc);
@@ -496,9 +467,10 @@ pub const Gateway = struct {
     }
 };
 
-/// Entry point for `zmx serve <session>`.
-pub fn serveMain(alloc: std.mem.Allocator, session_name: []const u8) !void {
-    var gw = try Gateway.init(alloc, session_name, .{});
+/// Entry point for `zmx serve <session>`. Uses the Cfg and std.Io already
+/// initialized by main; the gateway never builds its own socket paths.
+pub fn serveMain(alloc: std.mem.Allocator, io: std.Io, cfg: *const Cfg, session_name: []const u8) !void {
+    var gw = try Gateway.init(alloc, io, cfg, session_name, .{});
     defer gw.deinit();
     try gw.run();
 }
@@ -508,7 +480,7 @@ pub fn serveMain(alloc: std.mem.Allocator, session_name: []const u8) !void {
 // ---------------------------------------------------------------------------
 
 test "bootstrap output format" {
-    const key = crypto.generateKey();
+    const key = try crypto.generateKey(std.testing.io);
     const encoded = crypto.keyToBase64(key);
     const port: u16 = 60042;
 
@@ -519,7 +491,7 @@ test "bootstrap output format" {
     try std.testing.expect(std.mem.startsWith(u8, line, "ZMX_CONNECT udp "));
 
     // Parse back
-    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, line, "\n"), ' ');
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, line, "\n"), ' ');
     try std.testing.expectEqualStrings("ZMX_CONNECT", it.next().?);
     try std.testing.expectEqualStrings("udp", it.next().?);
     const port_str = it.next().?;
@@ -528,15 +500,4 @@ test "bootstrap output format" {
     const key_str = it.next().?;
     const decoded_key = try crypto.keyFromBase64(key_str);
     try std.testing.expectEqual(key, decoded_key);
-}
-
-test "resolveSocketDir returns valid path" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-
-    const dir = try resolveSocketDir(alloc);
-    defer alloc.free(dir);
-    try std.testing.expect(dir.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, dir, "zmx") != null);
 }
