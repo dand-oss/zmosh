@@ -1464,7 +1464,7 @@ pub fn resolveHost(host: []const u8, port: u16) ResolveError!Address {
     if (ai.addr == null) return error.UnknownHostName;
 
     var addr: Address = std.mem.zeroes(Address);
-    const n = @min(@as(usize, ai.addr_len), @sizeOf(Address));
+    const n = @min(@as(usize, ai.addrlen), @sizeOf(Address));
     @memcpy(std.mem.asBytes(&addr)[0..n], @as([*]const u8, @ptrCast(ai.addr.?))[0..n]);
     return addr;
 }

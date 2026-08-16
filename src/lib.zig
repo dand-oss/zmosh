@@ -1,5 +1,5 @@
 const std = @import("std");
-const posix = std.posix;
+const lib_posix = @import("posix.zig");
 const crypto = @import("crypto.zig");
 const udp_mod = @import("udp.zig");
 const ipc = @import("ipc.zig");
@@ -176,24 +176,16 @@ export fn zmosh_connect(
         return null;
     };
 
-    // Resolve address
-    const addr = std.net.Address.resolveIp(std.mem.span(host_str), port) catch blk: {
-        const list = std.net.getAddressList(std.heap.page_allocator, std.mem.span(host_str), port) catch {
-            set_status(status, .err_resolve);
-            return null;
-        };
-        defer list.deinit();
-        if (list.addrs.len == 0) {
-            set_status(status, .err_resolve);
-            return null;
-        }
-        break :blk list.addrs[0];
+    // Resolve address (numeric IP or DNS via getaddrinfo)
+    const addr = lib_posix.resolveHost(std.mem.span(host_str), port) catch {
+        set_status(status, .err_resolve);
+        return null;
     };
 
     // Create UDP socket — ephemeral port
-    const sock_fd = posix.socket(
+    const sock_fd = lib_posix.socket(
         addr.any.family,
-        posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+        lib_posix.SOCK.DGRAM | lib_posix.SOCK.NONBLOCK | lib_posix.SOCK.CLOEXEC,
         0,
     ) catch {
         set_status(status, .err_socket);
@@ -205,7 +197,7 @@ export fn zmosh_connect(
     var peer = udp_mod.Peer.init(key, .to_server);
     peer.addr = addr;
 
-    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const now: i64 = lib_posix.nowNs();
     var reliable_send = transport.ReliableSend.init(std.heap.page_allocator) catch {
         udp_sock.close();
         set_status(status, .err_socket);
@@ -266,7 +258,7 @@ export fn zmosh_poll(session: ?*Session) Status {
     const s = session orelse return .err_null;
     if (s.session_ended) return .ok;
 
-    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const now: i64 = lib_posix.nowNs();
 
     // Retransmit reliable packets.
     var retransmits = s.reliable_send.collectRetransmits(std.heap.page_allocator, now, s.peer.rto_us()) catch return .err_poll;
@@ -362,7 +354,7 @@ export fn zmosh_send_input(session: ?*Session, data: ?[*]const u8, len: u32) Sta
     if (len == 0) return .ok;
     if (len > max_input_len) return .err_too_large;
 
-    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const now: i64 = lib_posix.nowNs();
     const payload = d[0..len];
     var off: usize = 0;
     while (off < payload.len) {
@@ -377,7 +369,7 @@ export fn zmosh_resize(session: ?*Session, rows: u16, cols: u16) Status {
     const s = session orelse return .err_null;
 
     const size = ipc.Resize{ .rows = rows, .cols = cols };
-    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const now: i64 = lib_posix.nowNs();
     sendIpcReliable(s, .Resize, std.mem.asBytes(&size), now) catch return .err_send;
     return .ok;
 }
@@ -385,7 +377,7 @@ export fn zmosh_resize(session: ?*Session, rows: u16, cols: u16) Status {
 export fn zmosh_disconnect(session: ?*Session) void {
     const s = session orelse return;
 
-    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const now: i64 = lib_posix.nowNs();
     sendIpcReliable(s, .Detach, "", now) catch {};
 
     s.reliable_send.deinit();
