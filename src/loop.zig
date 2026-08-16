@@ -477,6 +477,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Ack, .TaskComplete, .LabelData => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
+                        // Gateway-only tag: a client must never send it. Named
+                        // explicitly because `_` only covers unnamed tags.
+                        .SessionEnd => std.log.warn(
+                            "ignoring SessionEnd tag from client",
+                            .{},
+                        ),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
