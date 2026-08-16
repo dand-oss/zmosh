@@ -1271,22 +1271,47 @@ pub fn toPosixPath(file_path: []const u8) error{NameTooLong}![PATH_MAX - 1:0]u8 
     return path_with_null;
 }
 
-const Address = extern union {
+pub const Address = extern union {
     any: sockaddr,
     un: sockaddr.un,
+    in: sockaddr.in,
+    in6: sockaddr.in6,
 
-    pub fn getOsSockLen(_: Address) socklen_t {
-        // Using the full length of the structure here is more portable than returning
-        // the number of bytes actually used by the currently stored path.
-        // This also is correct regardless if we are passing a socket address to the kernel
-        // (e.g. in bind, connect, sendto) since we ensure the path is 0 terminated in
-        // initUnix() or if we are receiving a socket address from the kernel and must
-        // provide the full buffer size (e.g. getsockname, getpeername, recvfrom, accept).
-        //
-        // To access the path, std.mem.sliceTo(&address.un.path, 0) should be used.
-        return @as(socklen_t, @intCast(@sizeOf(sockaddr.un)));
+    pub fn getOsSockLen(self: Address) socklen_t {
+        return switch (self.any.family) {
+            AF.INET => @as(socklen_t, @intCast(@sizeOf(sockaddr.in))),
+            AF.INET6 => @as(socklen_t, @intCast(@sizeOf(sockaddr.in6))),
+            else => @as(socklen_t, @intCast(@sizeOf(sockaddr.un))),
+        };
     }
 };
+
+pub fn initIp4(bytes: [4]u8, port: u16) Address {
+    var addr: Address = std.mem.zeroes(Address);
+    addr.in.family = AF.INET;
+    addr.in.port = mem.nativeToBig(u16, port);
+    addr.in.addr = mem.readInt(u32, &bytes, .big);
+    return addr;
+}
+
+pub fn initIp6(bytes: [16]u8, port: u16, flowinfo: u32, scope_id: u32) Address {
+    var addr: Address = std.mem.zeroes(Address);
+    addr.in6.family = AF.INET6;
+    addr.in6.port = mem.nativeToBig(u16, port);
+    addr.in6.flowinfo = flowinfo;
+    addr.in6.addr = bytes;
+    addr.in6.scope_id = scope_id;
+    return addr;
+}
+
+/// Host-byte-order port of an IP address, 0 for non-IP families.
+pub fn ipPort(addr: Address) u16 {
+    return switch (addr.any.family) {
+        AF.INET => mem.bigToNative(u16, addr.in.port),
+        AF.INET6 => mem.bigToNative(u16, addr.in6.port),
+        else => 0,
+    };
+}
 
 pub fn initUnix(path: []const u8) !Address {
     var sock_addr = sockaddr.un{
@@ -1313,4 +1338,140 @@ pub fn kill(pid: pid_t, sig: SIG) KillError!void {
         .SRCH => return error.ProcessNotFound,
         else => |err| return unexpectedErrno(err),
     }
+}
+
+// ---------------------------------------------------------------------------
+// UDP plumbing used by the zmosh gateway (sendto/recvfrom/setsockopt/
+// getsockname) plus DNS resolution and a monotonic clock. Kept in this
+// wrapper so network modules never touch std.posix directly.
+// ---------------------------------------------------------------------------
+
+pub const IPPROTO = system.IPPROTO;
+
+/// IPV6_V6ONLY is 26 on both Linux and macOS.
+pub const IPV6_V6ONLY: u32 = 26;
+
+pub fn sendto(
+    fd: fd_t,
+    buf: []const u8,
+    flags: u32,
+    dst: *const sockaddr,
+    dst_len: socklen_t,
+) WriteError!usize {
+    while (true) {
+        const rc = system.sendto(fd, buf.ptr, @intCast(buf.len), @intCast(flags), dst, dst_len);
+        switch (errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .INVAL => return error.InvalidArgument,
+            .FAULT => unreachable,
+            .AGAIN => return error.WouldBlock,
+            .NOMEM => return error.SystemResources,
+            .MSGSIZE => return error.MessageTooBig,
+            .BADF => return error.NotOpenForWriting, // can be a race condition.
+            .PIPE => return error.BrokenPipe,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+pub fn recvfrom(
+    fd: fd_t,
+    buf: []u8,
+    flags: u32,
+    src_addr: ?*sockaddr,
+    addrlen: ?*socklen_t,
+) ReadError!usize {
+    while (true) {
+        const rc = system.recvfrom(fd, buf.ptr, @intCast(buf.len), @intCast(flags), src_addr, addrlen);
+        switch (errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .INVAL => unreachable,
+            .FAULT => unreachable,
+            .NOMEM => return error.SystemResources,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.NotOpenForReading, // can be a race condition.
+            .CONNRESET => return error.ConnectionResetByPeer,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+pub const SetSockOptError = error{
+    InvalidSocketOption,
+    SystemResources,
+    NoBufferSpace,
+} || UnexpectedError;
+
+pub fn setsockopt(fd: fd_t, level: u32, optname: u32, opt: []const u8) SetSockOptError!void {
+    switch (errno(system.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len)))) {
+        .SUCCESS => return,
+        .INVAL => return error.InvalidSocketOption,
+        .NOMEM => return error.SystemResources,
+        .NOBUFS => return error.NoBufferSpace,
+        .BADF => unreachable, // always a race condition
+        .FAULT => unreachable,
+        else => |err| return unexpectedErrno(err),
+    }
+}
+
+pub fn getsockname(fd: fd_t, addr: *sockaddr, len: *socklen_t) (error{SocketNotBound} || UnexpectedError)!void {
+    switch (errno(system.getsockname(fd, addr, len))) {
+        .SUCCESS => return,
+        .BADF => unreachable, // always a race condition
+        .FAULT => unreachable,
+        .INVAL => return error.SocketNotBound,
+        else => |err| return unexpectedErrno(err),
+    }
+}
+
+pub const ResolveError = error{
+    UnknownHostName,
+    TemporaryNameServerFailure,
+    SystemResources,
+} || UnexpectedError;
+
+/// Resolve a host (name or numeric IP) and port into a socket-ready Address.
+/// Uses getaddrinfo: AF_UNSPEC + DGRAM, so it prefers the address family the
+/// kernel will actually route. Caller receives a copy; no allocation needed.
+pub fn resolveHost(host: []const u8, port: u16) ResolveError!Address {
+    if (host.len >= 255) return error.UnknownHostName;
+    var node_buf: [255:0]u8 = undefined;
+    @memcpy(node_buf[0..host.len], host);
+    node_buf[host.len] = 0;
+
+    var serv_buf: [16:0]u8 = undefined;
+    const serv = std.fmt.bufPrintZ(&serv_buf, "{d}", .{port}) catch unreachable;
+
+    var hints: system.addrinfo = std.mem.zeroes(system.addrinfo);
+    hints.family = AF.UNSPEC;
+    hints.socktype = SOCK.DGRAM;
+
+    var res: ?*system.addrinfo = null;
+    const rc = system.getaddrinfo(&node_buf, serv.ptr, &hints, &res);
+    if (@intFromEnum(rc) != 0) {
+        return switch (rc) {
+            .NONAME, .NODATA, .SERVICE => error.UnknownHostName,
+            .AGAIN => error.TemporaryNameServerFailure,
+            .MEMORY => error.SystemResources,
+            else => error.UnknownHostName,
+        };
+    }
+    defer system.freeaddrinfo(res.?);
+    const ai = res orelse return error.UnknownHostName;
+    if (ai.addr == null) return error.UnknownHostName;
+
+    var addr: Address = std.mem.zeroes(Address);
+    const n = @min(@as(usize, ai.addr_len), @sizeOf(Address));
+    @memcpy(std.mem.asBytes(&addr)[0..n], @as([*]const u8, @ptrCast(ai.addr.?))[0..n]);
+    return addr;
+}
+
+/// Monotonic nanoseconds since an arbitrary epoch — the clock the UDP
+/// transport uses for RTT, heartbeats, and retransmit timing.
+pub fn nowNs() i64 {
+    var ts: system.timespec = undefined;
+    _ = system.clock_gettime(system.CLOCK.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
