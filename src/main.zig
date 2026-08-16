@@ -898,7 +898,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
                 }
             }
 
-            try stdout.print("\nSee the logs:\nzmx history {s}\nzmx attach {s}\n", .{ session.name, session.name });
+            try stdout.print("\nSee the logs:\nzmosh history {s}\nzmosh attach {s}\n", .{ session.name, session.name });
             try stdout.flush();
         }
     }

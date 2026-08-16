@@ -26,7 +26,7 @@ pub const Shell = enum {
 };
 
 const bash_completions =
-    \\_zmx_completions() {
+    \\_zmosh_completions() {
     \\  local cur prev words cword
     \\  COMPREPLY=()
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
@@ -55,12 +55,12 @@ const bash_completions =
     \\  esac
     \\}
     \\
-    \\complete -o bashdefault -o default -F _zmx_completions zmosh
+    \\complete -o bashdefault -o default -F _zmosh_completions zmosh
 ;
 
 const zsh_completions =
     \\#compdef zmosh
-    \\_zmx() {
+    \\_zmosh() {
     \\  local context state state_descr line
     \\  typeset -A opt_args
     \\
@@ -97,7 +97,7 @@ const zsh_completions =
     \\    args)
     \\      case $words[2] in
     \\        attach|a|kill|k|run|r|send|se|print|p|write|wr|history|get|g|set|clear|hi|wait|w|tail|t)
-    \\          _zmx_sessions
+    \\          _zmosh_sessions
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish' 'nu'
@@ -113,7 +113,7 @@ const zsh_completions =
     \\  esac
     \\}
     \\
-    \\_zmx_sessions() {
+    \\_zmosh_sessions() {
     \\  local -a sessions
     \\
     \\  local local_sessions=$(zmosh list --short 2>/dev/null)
@@ -124,7 +124,7 @@ const zsh_completions =
     \\  _describe 'local session' sessions
     \\}
     \\
-    \\compdef _zmx zmosh
+    \\compdef _zmosh zmosh
 ;
 
 const fish_completions =

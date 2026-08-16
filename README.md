@@ -101,7 +101,7 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 
 ### libzmosh (C library)
 
-zmosh exposes a C API (`include/zmosh.h`) for embedding the remote session client into native apps. The API is callback-driven and designed for event loop integration:
+zmosh exposes a C API (`include/zmosh/zmosh.h`) for embedding the remote session client into native apps. The API is callback-driven and designed for event loop integration:
 
 ```c
 // Connect to a remote zmosh gateway

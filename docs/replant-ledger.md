@@ -45,7 +45,11 @@ Dispositions: **ported** (carried in this branch), **port-pending** (scheduled s
 - Aliases: `send` now `se` (zmx's fish completions advertised a ghost `se set` that the
   dispatch never implemented — removed); `s` reserved for `serve` (arrives Stage 2).
 - Dropped zmx release infra: `brew.tmpl`, `gen-brew.sh`, `index.tmpl`, `pico.sh`,
-  `Dockerfile*`, `.dockerignore`, `docs/index.html`.
+  `Dockerfile*`, `.dockerignore`, `docs/index.html`. **Amendment (review round 1):**
+  `docs/index.html` removal is hereby explicitly approved — it is zmx's release/download
+  webpage (upstream superseded it with `index.tmpl`, also dropped); it carries zmx
+  branding and download links, not zmosh documentation, so "preserve `docs/`" means the
+  zmosh-authored docs (`udp-auto-reconnect-research.md`, `logo.png`), which are preserved.
 - Deferred: `flake.nix` rebrand + Zig 0.16 pin → Stage 6 (nix unavailable on this host;
   bundling avoids a half-updated state).
 - Toolchain (Stage 0, not repo content): Zig 0.16.0 official tarball, sha256-verified
