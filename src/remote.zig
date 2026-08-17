@@ -88,15 +88,19 @@ pub fn connectRemote(
     const colorterm = lib_posix.getenv("COLORTERM");
     var remote_cmd_buf: std.ArrayList(u8) = .empty;
     defer remote_cmd_buf.deinit(alloc);
+    // Shell-quote TERM/COLORTERM: raw values with metacharacters must not
+    // be able to alter the remote command line.
     try remote_cmd_buf.appendSlice(alloc, "TERM=");
-    try remote_cmd_buf.appendSlice(alloc, term);
+    try appendShellQuoted(&remote_cmd_buf, alloc, term);
     try remote_cmd_buf.append(alloc, ' ');
     if (colorterm) |ct| {
         try remote_cmd_buf.appendSlice(alloc, "COLORTERM=");
-        try remote_cmd_buf.appendSlice(alloc, ct);
+        try appendShellQuoted(&remote_cmd_buf, alloc, ct);
         try remote_cmd_buf.append(alloc, ' ');
     }
-    try remote_cmd_buf.appendSlice(alloc, "PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve ");
+    // --exact-session: `sesh` is already prefix-resolved locally; the remote
+    // gateway must not apply ZMX_SESSION_PREFIX a second time.
+    try remote_cmd_buf.appendSlice(alloc, "PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve --exact-session ");
     try appendShellQuoted(&remote_cmd_buf, alloc, session);
     if (command) |args| {
         for (args) |arg| {
@@ -168,7 +172,7 @@ const ssh_bootstrap_timeout_ms: i32 = 10_000;
 fn getTerminalSize() ipc.Resize {
     var ws: c.struct_winsize = undefined;
     if (c.ioctl(lib_posix.STDOUT_FILENO, c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col };
+        return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
     }
     return .{ .rows = 24, .cols = 80 };
 }
@@ -265,13 +269,57 @@ fn requestResync(
     last_resync_request_ns.* = now;
 }
 
+/// Resolve an SSH-config alias to a real hostname via `ssh -G HOST`.
+/// Returns the input host unchanged on any failure (spawn error, parse
+/// miss, or a ZMX_SSH test shim that doesn't implement -G) — the caller
+/// falls back to connecting UDP to the supplied host string.
+fn resolveSshHost(alloc: std.mem.Allocator, io: std.Io, host: []const u8) []const u8 {
+    const ssh_exe = lib_posix.getenv("ZMX_SSH") orelse "ssh";
+    const argv = [_][]const u8{ ssh_exe, "-G", host };
+    var child = std.process.spawn(io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return host;
+    defer child.kill(io);
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        var poll_fds = [_]lib_posix.pollfd{.{ .fd = child.stdout.?.handle, .events = lib_posix.POLL.IN, .revents = 0 }};
+        const ready = lib_posix.poll(&poll_fds, ssh_bootstrap_timeout_ms) catch break;
+        if (ready == 0) break;
+        const n = lib_posix.read(child.stdout.?.handle, buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+
+    // `ssh -G` emits `hostname <value>` among its config lines.
+    var lines = std.mem.splitScalar(u8, buf[0..total], '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "hostname ")) {
+            const resolved = std.mem.trim(u8, line["hostname ".len..], " \t\r");
+            if (resolved.len > 0 and !std.mem.eql(u8, resolved, host)) {
+                return alloc.dupe(u8, resolved) catch host;
+            }
+        }
+    }
+    return host;
+}
+
 /// Remote attach: connect to a remote zmx session via UDP.
 pub fn remoteAttach(alloc: std.mem.Allocator, io: std.Io, session: RemoteSession) !void {
     var session_mut = session;
     defer reapSsh(&session_mut, io);
 
+    // UDP goes to the resolved host, not the SSH alias: user@host forms and
+    // ssh-config Host aliases would otherwise fail DNS after bootstrap.
+    const udp_host = resolveSshHost(alloc, io, session.host);
+    defer if (udp_host.ptr != session.host.ptr) alloc.free(udp_host);
+
     // Resolve host address (numeric IP or DNS via getaddrinfo)
-    const addr = try lib_posix.resolveHost(session.host, session.port);
+    const addr = try lib_posix.resolveHost(udp_host, session.port);
 
     // Create UDP socket — bind ephemeral port (OS picks)
     const sock_fd = try lib_posix.socket(
@@ -509,6 +557,31 @@ pub fn remoteAttach(alloc: std.mem.Allocator, io: std.Io, session: RemoteSession
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "appendShellQuoted escapes metacharacters" {
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "plain", .out = "'plain'" },
+        .{ .in = "with space", .out = "'with space'" },
+        .{ .in = "it's", .out = "'it'\\''s'" },
+        .{ .in = "a;b", .out = "'a;b'" },
+        .{ .in = "$HOME", .out = "'$HOME'" },
+        .{ .in = "-leading-dash", .out = "'-leading-dash'" },
+    };
+    for (cases) |case| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.testing.allocator);
+        try appendShellQuoted(&buf, std.testing.allocator, case.in);
+        try std.testing.expectEqualStrings(case.out, buf.items);
+    }
+}
+
+test "appendShellQuoted survives round-trip through a shell word" {
+    // newline must stay inside the quotes, not break the command
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendShellQuoted(&buf, std.testing.allocator, "two\nlines");
+    try std.testing.expectEqualStrings("'two\nlines'", buf.items);
+}
 
 test "parseConnectLine valid" {
     const result = try parseConnectLine("ZMX_CONNECT udp 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
