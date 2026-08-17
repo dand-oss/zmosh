@@ -127,7 +127,10 @@ pub fn main(init: std.process.Init) !void {
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
         while (args.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
+            // -r/--remote is only an option before the session name; once the
+            // session is set, everything (including args like `grep -r`) is
+            // forwarded verbatim to the remote command.
+            if (session_name.len == 0 and (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r"))) {
                 remote_host = args.next() orelse {
                     _ = lib_posix.write(lib_posix.STDERR_FILENO, "zmosh: -r requires a host\n") catch {};
                     return error.MissingRemoteHost;
@@ -189,13 +192,23 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(gpa, io, &daemon);
     } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
-        const session_name = args.next() orelse "";
+        // --exact-session (hidden): the name is already fully resolved
+        // (prefix applied) by the remote client; do not prefix it again.
+        var session_name: []const u8 = "";
+        var exact_session = false;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--exact-session")) {
+                exact_session = true;
+            } else if (session_name.len == 0) {
+                session_name = arg;
+            }
+        }
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
             return help(io);
         }
 
-        const sesh = try socket.getSeshName(gpa, session_name);
-        defer gpa.free(sesh);
+        const sesh = if (exact_session) session_name else try socket.getSeshName(gpa, session_name);
+        defer if (!exact_session) gpa.free(sesh);
         const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
             error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
