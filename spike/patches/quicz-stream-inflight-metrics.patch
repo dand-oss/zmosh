@@ -1,0 +1,61 @@
+diff --git i/src/quic/connection.zig w/src/quic/connection.zig
+index 3fb2266..b1e7686 100644
+--- i/src/quic/connection.zig
++++ w/src/quic/connection.zig
+@@ -1105,6 +1105,56 @@ pub const Connection = struct {
+         };
+     }
+ 
++    /// Bytes of one stream's send side that are queued locally plus sent
++    /// but not yet acknowledged. Acked packets leave `sent_packets`, so
++    /// the in-flight walk is exactly the unacknowledged set. Returns null
++    /// when the stream has no send side.
++    ///
++    /// Callers with bounded output queues (multiplexers, gateways) use
++    /// this to detect a slow consumer before memory grows without bound.
++    pub fn streamSendOutstandingBytes(self: *Connection, stream_id: u64) ?u64 {
++        var total: u64 = 0;
++        const has_send_side = self.findSendStream(stream_id) != null;
++        for (self.send_queue.items) |pending| {
++            if (pending.stream_id == stream_id) {
++                total += pending.data.len;
++            }
++        }
++        inline for ([_]PacketNumberSpace{ .initial, .handshake, .application }) |space| {
++            const packet_space = self.packetNumberSpace(space);
++            for (packet_space.sent_packets.items) |sent| {
++                if (sent.stream_frame) |pending| {
++                    if (pending.stream_id == stream_id) {
++                        total += pending.data.len;
++                    }
++                }
++            }
++        }
++        return if (has_send_side) total else null;
++    }
++
++    /// Send time of the oldest sent-but-unacknowledged packet carrying
++    /// bytes of one stream, in the caller's clock (nanoseconds), or null
++    /// when nothing for that stream is outstanding. Pairs with
++    /// `streamSendOutstandingBytes` for age-based slow-consumer limits.
++    pub fn streamSendOldestUnackedSentTimeNanos(self: *Connection, stream_id: u64) ?i64 {
++        if (self.findSendStream(stream_id) == null) return null;
++        var oldest: ?i64 = null;
++        inline for ([_]PacketNumberSpace{ .initial, .handshake, .application }) |space| {
++            const packet_space = self.packetNumberSpace(space);
++            for (packet_space.sent_packets.items) |sent| {
++                if (sent.stream_frame) |pending| {
++                    if (pending.stream_id == stream_id) {
++                        if (oldest == null or sent.sent_time_nanos < oldest.?) {
++                            oldest = sent.sent_time_nanos;
++                        }
++                    }
++                }
++            }
++        }
++        return oldest;
++    }
++
+     /// Return the effective max idle timeout in milliseconds, or null when disabled.
+     ///
+     /// RFC 9000 uses the shorter non-zero timeout advertised by either endpoint.
