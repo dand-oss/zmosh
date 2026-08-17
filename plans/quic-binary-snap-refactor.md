@@ -798,6 +798,81 @@ acceptance tests. Push no bead-generated code or branch change automatically.
   service.
 - No backward compatibility between pre-QUIC and QUIC gateway/client binaries.
 
+## Evaluated prior art
+
+Evaluated 2026-08-17. These projects are design references, not proposed
+runtime dependencies. The decision remains to use the forked Zig `quicz`
+transport with Ghostty Snapshot v1; none of the projects below replaces both
+halves of that design.
+
+- **[p2sh](https://github.com/eskimor/p2sh) — future discovery/relay reference,
+  not an implementation candidate.** Its intended model is a stable node ID,
+  NAT traversal, relay fallback, QUIC, and eventually terminal-state
+  synchronization, but the repository describes itself as a crude proof of
+  concept: it still invokes ordinary SSH and has not implemented QUIC or NAT
+  traversal. Retain its node-addressing and relay roadmap as input to a future
+  direct-UDP-reachability project; do not add those concerns to this refactor.
+
+- **[quicssh-rs](https://github.com/oowl/quicssh-rs) — transparent-tunnel
+  reference.** It puts an unmodified SSH byte stream through QUIC by using
+  OpenSSH `ProxyCommand`, Quinn, and Tokio. This usefully demonstrates that
+  connection migration can be hidden behind conventional SSH tooling, but it
+  has no terminal snapshot, output-epoch, or session-state semantics. Its Rust
+  async stack also conflicts with zmosh's Zig-only, single-threaded `poll()`
+  architecture. Borrow lifecycle and interoperability test ideas, not its
+  runtime or proxy architecture.
+
+- **[tsshd](https://github.com/trzsz/tsshd) and its
+  [Show HN report](https://news.ycombinator.com/item?id=46680813) — primary
+  operational reference for bootstrap and roaming.** It uses ordinary SSH to
+  start a temporary server, moves traffic to QUIC or KCP, authenticates a new
+  address before replacing the active path, and preserves full OpenSSH
+  behavior. This is strong evidence for the SSH-bootstrap UX and for tests of
+  authenticated rebinding, one-client ownership, reconnect visibility, and
+  orphan-free process cleanup. It is nevertheless a Go SSH proxy with its own
+  reconnect/heartbeat layer; zmosh should let QUIC own path migration and let
+  Ghostty snapshots/output epochs own terminal recovery. The HN post is an
+  author deployment report, useful corroboration rather than independent
+  protocol evidence.
+
+- **[Latch](https://github.com/unixshells/latch) — product and trust-boundary
+  reference.** Its single binary exposes shared terminal sessions through
+  standard SSH, native Mosh, a web terminal, and an encrypted relay. Its useful
+  lessons are consistent session naming across transports, explicit relay
+  trust claims, and simple one-binary remote-access UX. Its multiplexer,
+  windowing, hosted relay, web client, and multi-transport scope are outside
+  this refactor, and it offers no QUIC plus Ghostty binary-snapshot path.
+
+- **[RoSE](https://github.com/nikhiljha/rose) — closest architectural
+  comparison.** RoSE combines QUIC streams and RFC 9221 datagrams, SSH
+  bootstrap, roaming, local prediction, scrollback, and a terminal-state
+  synchronization protocol. It validates the broad direction and is valuable
+  for fault-matrix and stream/datagram-separation test ideas. Do not adopt its
+  Rust/GPL implementation, X.509/TOFU identity model, terminal emulator, or
+  state-synchronization protocol: those duplicate the selected SSH-delivered
+  PSK, native Zig Ghostty terminal, and Snapshot v1 design. QUIC migration
+  should also avoid an application-level reconnect state machine where the
+  library can preserve the connection.
+
+- **[libghostty-rs](https://github.com/uzaaft/libghostty-rs) — binding and
+  packaging reference only.** It provides generated raw FFI plus safe Rust
+  wrappers over `libghostty-vt`, pins the Ghostty source, supports local and
+  network-free source overrides, and tests Rust-owned unsafe boundaries. Those
+  are useful precedents for pin discipline, static-library packaging, and C ABI
+  smoke tests. It does not remove zmosh's need for a native Zig Snapshot v1
+  re-export: its documented render snapshots are not the binary continuation
+  protocol, and adopting it would add Rust and transfer terminal ownership
+  through the C ABI. Keep it as C-library/build-system prior art, not a
+  dependency or fallback.
+
+The concrete additions to qualification are therefore limited to test ideas:
+authenticated path replacement must reject the old path; SSH bootstrap and
+gateway teardown must leave no orphan; transport migration must not create a
+second application session; stream backpressure must not block control traffic;
+and snapshot/output-epoch recovery must remain byte-correct through loss,
+reordering, and address changes. No new feature scope or dependency follows
+from this survey.
+
 ## References
 
 - quicz: <https://github.com/venjiang/quicz>
