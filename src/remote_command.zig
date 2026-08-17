@@ -32,14 +32,11 @@ pub const header_len: usize = 20;
 /// Largest command payload carried in a single transport packet.
 pub const max_chunk_payload: usize = transport.max_payload_len - header_len;
 
-/// Shared cap for local and remote `write` (and any request body):
-/// 64 MiB, so parity and memory bounds stay identical.
+/// Generic envelope limit for any request body. Write's v1 semantic
+/// limit is lower — the shared 128 KiB that Phase 4A introduces as a
+/// constant — so parity and memory bounds stay identical locally and
+/// remotely.
 pub const max_total_len: usize = 64 * 1024 * 1024;
-
-/// In-flight command frames allowed at once. The transport ACK window
-/// is 32 packets; staying at 16 leaves headroom for heartbeats, ACKs,
-/// and retransmits so a lost early chunk remains recoverable.
-pub const max_inflight_chunks: usize = 16;
 
 pub const Kind = enum(u8) {
     request = 1,

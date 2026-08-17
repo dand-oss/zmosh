@@ -155,7 +155,7 @@ LAST flag regardless of arrival order. Cache the completed response by exact
 request_id and compare opcode and total length before serving a duplicate.
 Allow only one request per command gateway.
 
-Use a 16-packet reliable send window, queue later chunks until ACKs release
+Bound sending to a 16-sequence span from the oldest unacknowledged packet; queue later chunks until ACKs release
 capacity, and continue ACK and heartbeat processing during command execution.
 Never log command content, labels, keys, file data, or protocol secrets.
 
@@ -163,7 +163,7 @@ Unit coverage must include golden bytes, empty requests, invalid versions,
 unsupported opcodes, malformed flags, reserved bytes, status errors, offset
 overflow, truncation, oversized payloads, invalid kill values, out-of-order
 chunks, duplicate chunks, conflicting overlaps, conflicting metadata, missing
-LAST, actual packet loss and retransmission, more than 32 chunks, 16-packet
+LAST, actual packet loss and retransmission, more than 32 chunks, the 16-sequence-span
 flow control, and duplicate request IDs without repeated execution.
 
 This phase is a review gate. Do not begin gateway or CLI work until its tests
@@ -208,13 +208,14 @@ Depends on Phase 3. One limit for local and remote write (128 KiB v1),
 complete encoded PTY input built before enqueue, atomic rejection when
 queue space is insufficient, no ACK of partial or dropped data, path
 quoting via util.shellQuote, redacted logging (lengths/counts only —
-never paths, labels, keys, or file data). Redirect gateway stdout to
-/dev/null after the bootstrap line instead of closing it.
+never paths, labels, keys, or file data).
 
 #### Phase 4B: finite command executor and encrypted command gateway
 
 Depends on 4A. The serve --command gateway and finite command execution
-per the semantic matrix below.
+per the semantic matrix below. Redirect gateway stdout to /dev/null after
+the bootstrap line instead of closing it, so post-bootstrap session
+creation cannot die on BrokenPipe.
 
 #### Phase 4C: ordered tail streaming, cancellation, backpressure
 
