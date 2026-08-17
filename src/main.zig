@@ -1481,12 +1481,15 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
         if (n == 0) break;
         try stdin_buf.appendSlice(gpa, tmp[0..n]);
         if (stdin_buf.items.len > ipc.max_write_len) {
-            try w.interface.print(
+            // Command errors exit 1 with one concise stderr line.
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
                 "zmosh: write input exceeds the {d} KiB limit; nothing was sent\n",
                 .{ipc.max_write_len / 1024},
-            );
-            try w.interface.flush();
-            return;
+            ) catch "zmosh: write input exceeds the limit\n";
+            _ = lib_posix.write(lib_posix.STDERR_FILENO, msg) catch {};
+            std.process.exit(1);
         }
     }
 
@@ -1551,10 +1554,17 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
             // payload is the error text. Nothing was enqueued or written.
             if (msg.payload.len == 0) {
                 try w.interface.print("file created {s}\n", .{file_path});
+                try w.interface.flush();
             } else {
-                try w.interface.print("zmosh: write rejected: {s}\n", .{msg.payload});
+                var msg_buf: [256]u8 = undefined;
+                const msg_txt = std.fmt.bufPrint(
+                    &msg_buf,
+                    "zmosh: write rejected: {s}\n",
+                    .{msg.payload},
+                ) catch "zmosh: write rejected\n";
+                _ = lib_posix.write(lib_posix.STDERR_FILENO, msg_txt) catch {};
+                std.process.exit(1);
             }
-            try w.interface.flush();
             return;
         }
     }

@@ -1050,6 +1050,26 @@ test "raw header echoes unknown opcode for error responses" {
     try testing.expectEqual(@as(u8, @intFromEnum(Status.unsupported_opcode)), parsed_rsp.status);
 }
 
+test "remote write framing enforces the shared 128 KiB boundary" {
+    const alloc = std.testing.allocator;
+    const path = "f";
+    const body_len = 4 + path.len;
+
+    // Exactly at the cap: accepted.
+    const ok_body = try alloc.alloc(u8, body_len + ipc.max_write_len);
+    defer alloc.free(ok_body);
+    std.mem.writeInt(u32, ok_body[0..4], path.len, .big);
+    @memcpy(ok_body[4..5], path);
+    try validateRequestBody(.write, ok_body);
+
+    // One byte over: rejected.
+    const big_body = try alloc.alloc(u8, body_len + ipc.max_write_len + 1);
+    defer alloc.free(big_body);
+    std.mem.writeInt(u32, big_body[0..4], path.len, .big);
+    @memcpy(big_body[4..5], path);
+    try std.testing.expectError(error.WriteTooLarge, validateRequestBody(.write, big_body));
+}
+
 test "request body validation" {
     try validateRequestBody(.send, "any bytes");
     try validateRequestBody(.tail, "");

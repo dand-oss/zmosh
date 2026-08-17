@@ -30,6 +30,7 @@ load test_helper
   # 200 KiB of input: the client must refuse before sending anything.
   head -c 204800 /dev/zero | tr '\0' 'a' > "$BATS_TEST_TMPDIR/big.txt"
   run "$ZMX" write wt-limit "$BATS_TEST_TMPDIR/wt-limit.txt" < "$BATS_TEST_TMPDIR/big.txt"
+  [ "$status" -eq 1 ]
   [[ "$output" == *"exceeds the 128 KiB limit"* ]]
   [[ "$output" != *"file created"* ]]
 
@@ -60,4 +61,52 @@ load test_helper
   sleep 2
   [ ! -f "$BATS_TEST_TMPDIR/PWNED" ]
   [ -f "$BATS_TEST_TMPDIR/$evil" ]
+}
+
+@test "write accepts exactly 128 KiB and rejects one byte more" {
+  cd "$BATS_TEST_TMPDIR"
+  run "$ZMX" run wt-boundary -d bash
+  [ "$status" -eq 0 ]
+  sleep 1
+
+  # Exactly at the cap: accepted, full content round-trips.
+  head -c 131072 /dev/zero | tr '\0' 'b' > exact.bin
+  run "$ZMX" write wt-boundary "$BATS_TEST_TMPDIR/exact.out" < exact.bin
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"file created"* ]]
+
+  # One byte over: rejected with exit 1 before anything is sent.
+  head -c 131073 /dev/zero | tr '\0' 'c' > over.bin
+  run "$ZMX" write wt-boundary "$BATS_TEST_TMPDIR/over.out" < over.bin
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"exceeds the 128 KiB limit"* ]]
+
+  # A capped write echoes ~170 KiB back through the PTY; under full-suite
+  # load it needs longer than a fixed sleep. Poll, bounded.
+  local i=0
+  while [ "$i" -lt 20 ] && [ ! -f "$BATS_TEST_TMPDIR/exact.out" ]; do
+    sleep 0.5
+    i=$((i + 1))
+  done
+  [ -f "$BATS_TEST_TMPDIR/exact.out" ]
+  [ "$(wc -c < "$BATS_TEST_TMPDIR/exact.out")" -eq 131072 ]
+  [ ! -f "$BATS_TEST_TMPDIR/over.out" ]
+}
+
+@test "daemon rejects a write when the pty queue is full, with exit 1" {
+  # A non-reading command fills the queue: the first capped write occupies
+  # it, the second cannot fit and must be rejected atomically.
+  run "$ZMX" run wt-full -d bash -c 'sleep 300'
+  [ "$status" -eq 0 ]
+  sleep 1
+
+  head -c 131072 /dev/zero | tr '\0' 'd' > one.bin
+  run "$ZMX" write wt-full "$BATS_TEST_TMPDIR/full-one.out" < one.bin
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"file created"* ]]
+
+  run "$ZMX" write wt-full "$BATS_TEST_TMPDIR/full-two.out" < one.bin
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"write rejected: session busy"* ]]
+  [[ "$output" != *"file created"* ]]
 }

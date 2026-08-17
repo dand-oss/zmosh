@@ -825,6 +825,15 @@ pub const Daemon = struct {
     /// the old direct-write ptyWrite (drop on EAGAIN), just at a 64x higher
     /// threshold. Capping avoids OOM when the shell stops reading; dropping
     /// new (not old) bytes avoids tearing a partially-accepted sequence.
+    /// Fallible, atomic enqueue for command paths that must know the
+    /// bytes are queued: returns QueueFull or the allocator error instead
+    /// of silently dropping, and leaves the queue untouched on failure.
+    fn queuePtyInputChecked(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) error{ QueueFull, OutOfMemory }!void {
+        if (data.len == 0) return;
+        if (self.pty_write_buf.items.len + data.len > PTY_WRITE_BUF_MAX) return error.QueueFull;
+        try self.pty_write_buf.appendSlice(gpa, data);
+    }
+
     fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) void {
         if (data.len == 0) return;
         if (self.pty_write_buf.items.len + data.len > PTY_WRITE_BUF_MAX) {
@@ -1266,17 +1275,22 @@ pub const Daemon = struct {
 
         // Atomic enqueue: the finished command must fit alongside what is
         // already queued, or the write is rejected without touching the
-        // queue — a partial command must never reach the PTY.
-        if (self.pty_write_buf.items.len + cmd_buf.items.len > PTY_WRITE_BUF_MAX) {
-            try ipc.appendMessage(gpa, &client.write_buf, .Ack, "session busy; try again");
+        // queue — a partial command must never reach the PTY, and an
+        // allocation failure mid-enqueue must never report success.
+        self.queuePtyInputChecked(gpa, cmd_buf.items) catch |err| {
+            const reason: []const u8 = switch (err) {
+                error.QueueFull => "session busy; try again",
+                error.OutOfMemory => "internal error; try again",
+            };
+            try ipc.appendMessage(gpa, &client.write_buf, .Ack, reason);
             client.has_pending_output = true;
-            std.log.warn("write rejected queue full queued={d} needed={d}", .{
+            std.log.warn("write rejected err={s} queued={d} needed={d}", .{
+                @errorName(err),
                 self.pty_write_buf.items.len,
                 cmd_buf.items.len,
             });
             return;
-        }
-        self.queuePtyInput(gpa, cmd_buf.items);
+        };
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
@@ -1356,4 +1370,127 @@ test "send queues PTY input without changing leader" {
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
+}
+
+// ---------------------------------------------------------------------------
+// Write-path safety (Phase 4A)
+// ---------------------------------------------------------------------------
+
+fn writeWirePayload(alloc: std.mem.Allocator, path: []const u8, content: []const u8) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(alloc, 4 + path.len + content.len);
+    defer buf.deinit(alloc);
+    const path_len: u32 = @intCast(path.len);
+    try buf.appendSlice(alloc, std.mem.asBytes(&path_len));
+    try buf.appendSlice(alloc, path);
+    try buf.appendSlice(alloc, content);
+    return buf.toOwnedSlice(alloc);
+}
+
+fn lastAckPayload(client: *const Client) ?[]const u8 {
+    var head: usize = 0;
+    var last: ?[]const u8 = null;
+    while (ipc.expectedLength(client.write_buf.items[head..])) |total| {
+        if (client.write_buf.items.len - head < total) break;
+        const hdr = std.mem.bytesToValue(ipc.Header, client.write_buf.items[head..][0..@sizeOf(ipc.Header)]);
+        const payload = client.write_buf.items[head..][@sizeOf(ipc.Header)..total];
+        if (hdr.tag == .Ack) last = payload;
+        head += total;
+    }
+    return last;
+}
+
+test "handleWrite rejects a full pty queue without touching it" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+
+    // Queue nearly full: only 10 bytes of headroom.
+    try daemon.pty_write_buf.resize(alloc, Daemon.PTY_WRITE_BUF_MAX - 10);
+    @memset(daemon.pty_write_buf.items, 'x');
+    const queued_before = daemon.pty_write_buf.items.len;
+
+    const payload = try writeWirePayload(alloc, "file.txt", "hello");
+    defer alloc.free(payload);
+    try daemon.handleWrite(alloc, &client, payload);
+
+    // Rejection is atomic: the queue is byte-for-byte unchanged.
+    try std.testing.expectEqual(queued_before, daemon.pty_write_buf.items.len);
+    // And the client sees an Ack carrying the rejection reason.
+    const ack = lastAckPayload(&client).?;
+    try std.testing.expect(ack.len > 0);
+}
+
+test "handleWrite allocation failure never sends a success Ack" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+
+    const payload = try writeWirePayload(alloc, "file.txt", "hello");
+    defer alloc.free(payload);
+
+    // Fail the very first allocation inside handleWrite: the error must
+    // propagate (no Ack of any kind), never an empty-payload success Ack.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, daemon.handleWrite(failing.allocator(), &client, payload));
+    try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+    try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+}
+
+test "queuePtyInputChecked leaves the queue untouched on failure" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    try daemon.pty_write_buf.appendSlice(alloc, "abc");
+    // Over capacity: rejected, unchanged.
+    try std.testing.expectError(error.QueueFull, daemon.queuePtyInputChecked(alloc, &([_]u8{'y'} ** (Daemon.PTY_WRITE_BUF_MAX + 1))));
+    try std.testing.expectEqualStrings("abc", daemon.pty_write_buf.items);
+
+    // Allocation failure mid-append: unchanged, error surfaced.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    // Large enough to force growth beyond the existing capacity, so the
+    // allocation actually happens (and fails) instead of fitting in place.
+    const big = try alloc.alloc(u8, 4096);
+    defer alloc.free(big);
+    @memset(big, 'z');
+    try std.testing.expectError(error.OutOfMemory, daemon.queuePtyInputChecked(failing.allocator(), big));
+    try std.testing.expectEqualStrings("abc", daemon.pty_write_buf.items);
 }
