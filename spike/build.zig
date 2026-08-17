@@ -28,8 +28,35 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run Q1 snapshot-access spike tests");
-    test_step.dependOn(&run_tests.step);
+
+    // Q1 hard gate: certificate-free external-PSK TLS 1.3 over the sans-I/O
+    // layer, against the unmodified quicz pin.
+    const quicz = b.dependency("quicz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const psk_mod = b.addModule("spike-psk", .{
+        .root_source_file = b.path("src/quic_psk_gate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    psk_mod.addImport("quicz", quicz.module("quicz"));
+
+    const psk_tests = b.addTest(.{ .root_module = psk_mod });
+    const run_psk_tests = b.addRunArtifact(psk_tests);
+
+    // quicz's build registers its own top-level "test" step; avoid the
+    // name collision by giving every gate an explicit unique step.
+    const spike_test = b.step("spike-test", "Run Q1 spike tests (snapshot access + PSK gate)");
+    spike_test.dependOn(&run_tests.step);
+    spike_test.dependOn(&run_psk_tests.step);
+
+    const quicz_suite = b.step("quicz-suite", "Run the pinned quicz upstream test suite");
+    if (quicz.builder.top_level_steps.get("test")) |dep_test| {
+        quicz_suite.dependOn(&dep_test.step);
+    } else {
+        quicz_suite.dependOn(&b.addFail("quicz-test-step-missing").step);
+    }
 
     b.default_step = b.step("spike", "No-op default; use zig build test");
 }

@@ -10,6 +10,11 @@
         .ghostty = .{
             .path = "deps/ghostty",
         },
+        // Unmodified upstream spike pin; the PSK gate must pass through
+        // public APIs with zero patches.
+        .quicz = .{
+            .path = "deps/quicz-upstream",
+        },
     },
     .paths = .{
         "build.zig",
