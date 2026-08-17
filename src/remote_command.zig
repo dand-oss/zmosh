@@ -78,6 +78,50 @@ pub const Flags = struct {
     pub const STREAM: u8 = 4;
 };
 
+/// Minimally validated header: raw integer fields, no enum checks. This
+/// is what error responses are built from — an unsupported_opcode reply
+/// must echo the request ID and the RAW opcode value that was rejected.
+pub const RawHeader = struct {
+    version: u8,
+    kind: u8,
+    opcode: u8,
+    status: u8,
+    flags: u8,
+    request_id: u32,
+    total_len: u32,
+    offset: u32,
+};
+
+/// Decode the 20-byte layout without validating any field semantics.
+pub fn parseRawHeader(data: []const u8) error{TooShort}!RawHeader {
+    if (data.len < header_len) return error.TooShort;
+    return .{
+        .version = data[0],
+        .kind = data[1],
+        .opcode = data[2],
+        .status = data[3],
+        .flags = data[4],
+        .request_id = std.mem.readInt(u32, data[8..12], .big),
+        .total_len = std.mem.readInt(u32, data[12..16], .big),
+        .offset = std.mem.readInt(u32, data[16..20], .big),
+    };
+}
+
+/// Serialize a raw header (response construction with unknown opcodes).
+pub fn writeRawHeader(dst: *[header_len]u8, h: RawHeader) void {
+    dst[0] = h.version;
+    dst[1] = h.kind;
+    dst[2] = h.opcode;
+    dst[3] = h.status;
+    dst[4] = h.flags;
+    dst[5] = 0;
+    dst[6] = 0;
+    dst[7] = 0;
+    std.mem.writeInt(u32, dst[8..12], h.request_id, .big);
+    std.mem.writeInt(u32, dst[12..16], h.total_len, .big);
+    std.mem.writeInt(u32, dst[16..20], h.offset, .big);
+}
+
 pub const Header = struct {
     version: u8,
     kind: Kind,
@@ -361,53 +405,76 @@ pub const Reassembler = struct {
 // Response cache — duplicates must never re-execute write or kill
 // ---------------------------------------------------------------------------
 
+/// The completed response for a request ID, retained in full so a
+/// retransmitted request is answered from cache and never re-executed
+/// (write and kill are not idempotent). The opcode and status are kept
+/// alongside the payload so duplicate handling can verify the echoed
+/// metadata matches the original request.
+pub const CachedResponse = struct {
+    opcode: Opcode,
+    status: Status,
+    payload: []u8,
+};
+
 pub const ResponseCache = struct {
     request_id: ?u32 = null,
-    response: []u8 = &.{},
+    response: CachedResponse = .{ .opcode = .send, .status = .ok, .payload = &.{} },
 
-    pub fn store(self: *ResponseCache, alloc: std.mem.Allocator, request_id: u32, response: []const u8) !void {
-        const copy = try alloc.dupe(u8, response);
-        if (self.response.len > 0) alloc.free(self.response);
-        self.response = copy;
+    pub fn store(
+        self: *ResponseCache,
+        alloc: std.mem.Allocator,
+        request_id: u32,
+        opcode: Opcode,
+        status: Status,
+        payload: []const u8,
+    ) !void {
+        const copy = try alloc.dupe(u8, payload);
+        if (self.response.payload.len > 0) alloc.free(self.response.payload);
+        self.response = .{ .opcode = opcode, .status = status, .payload = copy };
         self.request_id = request_id;
     }
 
     /// Hit only on the exact request_id.
-    pub fn get(self: *const ResponseCache, request_id: u32) ?[]const u8 {
+    pub fn get(self: *const ResponseCache, request_id: u32) ?CachedResponse {
         if (self.request_id == request_id) return self.response;
         return null;
     }
 
     pub fn deinit(self: *ResponseCache, alloc: std.mem.Allocator) void {
-        if (self.response.len > 0) alloc.free(self.response);
+        if (self.response.payload.len > 0) alloc.free(self.response.payload);
         self.* = .{};
     }
 };
 
 // ---------------------------------------------------------------------------
-// Sender-side flow-control accounting
+// Frozen wire contracts: cancellation and tail streaming
 // ---------------------------------------------------------------------------
 
-pub const WindowError = error{WindowFull};
+// Cancellation (frozen):
+//   - Cancel frame: kind=cancel, EMPTY body, FIRST|LAST, offset 0, and the
+//     SAME request_id and opcode as the request it aborts.
+//   - Idempotent: a second cancel for the same request is a no-op.
+//   - Terminal response on cancellation: kind=response, status=cancelled,
+//     empty payload. Client exits 0 (SIGINT/SIGTERM map to cancel).
+//
+// Tail streaming (frozen):
+//   - Request: empty body. Initial response: kind=response, status=ok,
+//     empty payload, no STREAM flag — acceptance only.
+//   - Stream chunks: kind=response, STREAM flag set, payload is RAW daemon
+//     output bytes (the client strips ANSI; the gateway never rewrites).
+//   - Ordering: stream chunks ride reliable transport sequences and MUST
+//     be delivered in transport-sequence order — the receiving side
+//     buffers by sequence before printing, since packets may arrive
+//     out of order (RecvState admits them that way).
+//   - Terminal on normal session EOF: kind=response, status=ok, empty.
+//   - Terminal on cancellation: status=cancelled, empty.
+//   - SSH EOF alone is NEVER sufficient to distinguish success from
+//     failure; only the terminal response decides.
 
-/// Tracks in-flight command frames against the 16-packet budget. The
-/// sender queues additional chunks until ACKs release capacity.
-pub const SendWindow = struct {
-    in_flight: usize = 0,
-
-    pub fn admit(self: *SendWindow) WindowError!void {
-        if (self.in_flight >= max_inflight_chunks) return error.WindowFull;
-        self.in_flight += 1;
-    }
-
-    pub fn release(self: *SendWindow, n: usize) void {
-        self.in_flight -= @min(n, self.in_flight);
-    }
-
-    pub fn capacity(self: *const SendWindow) usize {
-        return max_inflight_chunks - self.in_flight;
-    }
-};
+/// Command senders configure ReliableSend with this span so a lost early
+/// chunk cannot age out of the receiver's 32-sequence ACK history (see
+/// transport.ReliableSend.max_span).
+pub const command_span: u32 = 16;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -819,30 +886,88 @@ test "more than 32 chunks with loss, retransmission, and reorder" {
     try testing.expectEqualSlices(u8, body, r.message());
 }
 
-test "send window admits 16 then blocks until release" {
-    var w = SendWindow{};
-    var n: usize = 0;
-    while (n < max_inflight_chunks) : (n += 1) try w.admit();
-    try testing.expectError(error.WindowFull, w.admit());
-    try testing.expectEqual(@as(usize, 0), w.capacity());
-    w.release(4);
-    try testing.expectEqual(@as(usize, 4), w.capacity());
-    try w.admit();
-    w.release(99); // over-release clamps
-    try testing.expectEqual(@as(usize, 0), w.in_flight);
-}
-
-test "response cache: exact id hit, overwrite frees" {
+test "response cache: exact id hit, retains opcode/status/payload" {
     const alloc = testing.allocator;
     var cache = ResponseCache{};
     defer cache.deinit(alloc);
 
-    try cache.store(alloc, 42, "OK");
-    try testing.expectEqualStrings("OK", cache.get(42).?);
+    try cache.store(alloc, 42, .write, .ok, "done");
+    const hit = cache.get(42).?;
+    try testing.expectEqual(Opcode.write, hit.opcode);
+    try testing.expectEqual(Status.ok, hit.status);
+    try testing.expectEqualStrings("done", hit.payload);
     try testing.expect(cache.get(43) == null);
 
-    try cache.store(alloc, 42, "OK-longer");
-    try testing.expectEqualStrings("OK-longer", cache.get(42).?);
+    try cache.store(alloc, 42, .write, .cancelled, "");
+    const over = cache.get(42).?;
+    try testing.expectEqual(Status.cancelled, over.status);
+    try testing.expectEqual(@as(usize, 0), over.payload.len);
+}
+
+test "cancel frame parses with same id and opcode" {
+    const alloc = testing.allocator;
+    var r = Reassembler{};
+    defer r.deinit(alloc);
+
+    const req = try frameFor(alloc, 10, 4, 0, Flags.FIRST | Flags.LAST, "tail");
+    defer alloc.free(req);
+    _ = try r.start(alloc, (try parseChunk(req)).header);
+    try testing.expectEqual(OnChunkResult.complete, try r.onChunk(req));
+
+    // Cancel: empty, FIRST|LAST, offset 0, same request_id + opcode.
+    var buf: [header_len]u8 = undefined;
+    writeHeader(&buf, .{
+        .version = version,
+        .kind = .cancel,
+        .opcode = .tail,
+        .status = .ok,
+        .flags = Flags.FIRST | Flags.LAST,
+        .request_id = 10,
+        .total_len = 4,
+        .offset = 0,
+    });
+    const cancel = try parseHeader(&buf);
+    try testing.expectEqual(Kind.cancel, cancel.kind);
+    try testing.expectEqual(@as(u32, 10), cancel.request_id);
+    try testing.expectEqual(Opcode.tail, cancel.opcode);
+}
+
+test "raw header echoes unknown opcode for error responses" {
+    // Build a frame with an opcode outside the frozen set.
+    var buf: [header_len]u8 = undefined;
+    writeRawHeader(&buf, .{
+        .version = version,
+        .kind = @intFromEnum(Kind.request),
+        .opcode = 77, // not a frozen opcode
+        .status = 0,
+        .flags = Flags.FIRST | Flags.LAST,
+        .request_id = 0xC0FFEE,
+        .total_len = 1,
+        .offset = 0,
+    });
+
+    // Raw layer decodes without judgment; typed layer rejects.
+    const raw = try parseRawHeader(&buf);
+    try testing.expectEqual(@as(u8, 77), raw.opcode);
+    try testing.expectEqual(@as(u32, 0xC0FFEE), raw.request_id);
+    try testing.expectError(error.InvalidOpcode, parseHeader(&buf));
+
+    // An unsupported_opcode response can echo the raw opcode and id.
+    var rsp: [header_len]u8 = undefined;
+    writeRawHeader(&rsp, .{
+        .version = version,
+        .kind = @intFromEnum(Kind.response),
+        .opcode = raw.opcode,
+        .status = @intFromEnum(Status.unsupported_opcode),
+        .flags = Flags.FIRST | Flags.LAST,
+        .request_id = raw.request_id,
+        .total_len = 0,
+        .offset = 0,
+    });
+    const parsed_rsp = try parseRawHeader(&rsp);
+    try testing.expectEqual(@as(u8, 77), parsed_rsp.opcode);
+    try testing.expectEqual(@as(u32, 0xC0FFEE), parsed_rsp.request_id);
+    try testing.expectEqual(@as(u8, @intFromEnum(Status.unsupported_opcode)), parsed_rsp.status);
 }
 
 test "request body validation" {

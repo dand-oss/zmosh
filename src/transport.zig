@@ -3,6 +3,10 @@ const ipc = @import("ipc.zig");
 
 pub const version: u8 = 1;
 pub const max_payload_len: usize = 1100;
+/// Default span bound: the receiver's ACK history is 32 sequences, so a
+/// sequence more than 32 past the oldest unacknowledged one can never be
+/// acknowledged. Advisory for attach traffic, enforced for commands.
+pub const max_span_default: u32 = 32;
 const header_len: usize = 20;
 
 pub const Channel = enum(u8) {
@@ -114,6 +118,20 @@ pub const ReliableSend = struct {
     next_seq: u32 = 1,
     pending: std.ArrayList(Pending),
 
+    /// Largest gap allowed between `next_seq` and the oldest sequence
+    /// still awaiting acknowledgement. Bounding the pending COUNT is not
+    /// sufficient: with selective ACKs a lost early packet keeps the count
+    /// low while later sequences advance, aging the hole out of the
+    /// receiver's 32-sequence ACK history — after which the lost packet
+    /// is unrecoverable no matter how few packets are in flight.
+    max_span: u32 = max_span_default,
+
+    /// When false (attach traffic today), a full span never errors — the
+    /// caller keeps its historical fire-and-retransmit behavior. When
+    /// true, `buildAndTrack` returns `error.SendWindowFull` once the span
+    /// is exhausted and the sender must queue until ACKs release capacity.
+    enforce_span: bool = false,
+
     const Pending = struct {
         seq: u32,
         sent_ns: i64,
@@ -139,6 +157,22 @@ pub const ReliableSend = struct {
         return self.pending.items.len > 0;
     }
 
+    /// The oldest sequence still pending acknowledgement.
+    pub fn oldestUnacked(self: *const ReliableSend) ?u32 {
+        var oldest: ?u32 = null;
+        for (self.pending.items) |p| {
+            if (oldest == null or p.seq < oldest.?) oldest = p.seq;
+        }
+        return oldest;
+    }
+
+    /// True while a new sequence stays within `max_span` of the oldest
+    /// unacknowledged one (trivially true with nothing pending).
+    pub fn withinSpan(self: *const ReliableSend) bool {
+        const oldest = self.oldestUnacked() orelse return true;
+        return self.next_seq -% oldest < self.max_span;
+    }
+
     pub fn buildAndTrack(
         self: *ReliableSend,
         channel: Channel,
@@ -147,6 +181,7 @@ pub const ReliableSend = struct {
         ack_bits: u32,
         now_ns: i64,
     ) ![]const u8 {
+        if (self.enforce_span and !self.withinSpan()) return error.SendWindowFull;
         const seq = self.next_seq;
         self.next_seq +%= 1;
 
@@ -317,4 +352,66 @@ test "output gap detection" {
     try std.testing.expect(out.onPacket(1) == .accept);
     try std.testing.expect(out.onPacket(3) == .gap);
     try std.testing.expect(out.onPacket(2) == .duplicate);
+}
+
+// ---------------------------------------------------------------------------
+// Span-window tests: genuine loss, selective ACK, and retransmission
+// ---------------------------------------------------------------------------
+
+test "span window blocks new sequences until the oldest hole is recovered" {
+    const alloc = std.testing.allocator;
+    var rs = try ReliableSend.init(alloc);
+    defer rs.deinit();
+    rs.max_span = 16;
+    rs.enforce_span = true;
+
+    // Receiver-side ACK generation.
+    var recv = RecvState{};
+    const t0: i64 = 1_000_000;
+
+    // Send sequences 1..16.
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        _ = try rs.buildAndTrack(.command, "x", 0, 0, t0);
+    }
+    try std.testing.expectEqual(@as(?u32, 1), rs.oldestUnacked());
+
+    // The receiver gets 2..16 but DROPS sequence 1.
+    var r: usize = 2;
+    while (r <= 16) : (r += 1) {
+        _ = recv.onReliable(@intCast(r));
+    }
+    rs.ack(recv.ack(), recv.ackBits());
+
+    // Only the hole is pending: count is 1, but the span is exhausted —
+    // exactly the case a count-only window would wrongly admit.
+    try std.testing.expectEqual(@as(usize, 1), rs.pending.items.len);
+    try std.testing.expect(!rs.withinSpan());
+    try std.testing.expectError(error.SendWindowFull, rs.buildAndTrack(.command, "y", 0, 0, t0));
+
+    // Retransmit after the RTO; the receiver finally accepts sequence 1.
+    var re = try rs.collectRetransmits(alloc, t0 + 10 * std.time.ns_per_s, 50_000);
+    defer re.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), re.items.len);
+    _ = recv.onReliable(1);
+    rs.ack(recv.ack(), recv.ackBits());
+    try std.testing.expect(!rs.hasPending());
+    try std.testing.expect(rs.withinSpan());
+
+    // Span released: new sequences flow again.
+    _ = try rs.buildAndTrack(.command, "z", 0, 0, t0);
+}
+
+test "attach traffic keeps historical behavior beyond the span" {
+    const alloc = std.testing.allocator;
+    var rs = try ReliableSend.init(alloc);
+    defer rs.deinit();
+    rs.max_span = 4;
+    // enforce_span stays false: the attach gateway and client never see
+    // SendWindowFull; retransmission remains the recovery path.
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        _ = try rs.buildAndTrack(.reliable_ipc, "x", 0, 0, 1);
+    }
+    try std.testing.expectEqual(@as(usize, 16), rs.pending.items.len);
 }
