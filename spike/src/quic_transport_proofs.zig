@@ -1,7 +1,9 @@
 //! Q1 transport and resource proofs over the sans-I/O harness:
 //! negotiated bounds, RESET_STREAM / STOP_SENDING observability, idle
-//! lifetime negotiation with scaled timer expiry, keepalive, and the
-//! deterministic fault matrix (loss, duplication, corruption, blackout).
+//! lifetime negotiation with scaled timer expiry, keepalive across
+//! multiple original idle deadlines, send-progress accounting, and the
+//! deterministic fault matrix (loss, duplication, reordering, corruption,
+//! delay, blackout, NAT rebinding, slow reader, datagram-size caps).
 
 const std = @import("std");
 const testing = std.testing;
@@ -57,7 +59,7 @@ test "RESET_STREAM is observable by the application" {
     try p.completeHandshake();
 
     const stream_id = try p.client.openStream();
-    if (try p.clientToServer(stream_id, "before-reset", false)) |got| testing.allocator.free(got);
+    if (try p.clientToServer(stream_id, "before-reset", false)) |got| alloc.free(got);
     try p.client.resetStream(stream_id, 4242);
     // Deliver the RESET_STREAM.
     try p.flushClientShort();
@@ -66,20 +68,29 @@ test "RESET_STREAM is observable by the application" {
     try testing.expectEqual(@as(u64, 4242), state.receive_reset_error_code.?);
 }
 
-test "STOP_SENDING is observable by the application" {
+test "STOP_SENDING produces RESET_STREAM with the same code at the peer" {
     const alloc = testing.allocator;
     var p = try Pair.create(alloc, try randomPsk());
     defer p.destroy();
     try p.completeHandshake();
 
     const stream_id = try p.client.openStream();
-    if (try p.clientToServer(stream_id, "early", false)) |got| testing.allocator.free(got);
+    if (try p.clientToServer(stream_id, "early", false)) |got| alloc.free(got);
 
-    // The server asks the client to stop sending on that stream.
+    // The server asks the client to stop sending with code 7777...
     try p.server.stopSending(stream_id, 7777);
     try p.flushServerShort();
     const server_state = (try p.server.streamState(stream_id)).?;
     try testing.expect(server_state.receive_stop_sending_sent == true);
+
+    // ...and the peer observes it: quicz queues RESET_STREAM carrying the
+    // SAME application error code, which the server receives.
+    try p.flushClientShort();
+    const client_state = (try p.client.streamState(stream_id)).?;
+    try testing.expect(client_state.send == .reset_sent or client_state.send == .reset_acked);
+    const after = (try p.server.streamState(stream_id)).?;
+    try testing.expect(after.receive_reset_error_code != null);
+    try testing.expectEqual(@as(u64, 7777), after.receive_reset_error_code.?);
 }
 
 test "24h idle lifetime negotiated; scaled idle expiry closes" {
@@ -109,33 +120,67 @@ test "24h idle lifetime negotiated; scaled idle expiry closes" {
 
         const deadline = p.client.idleTimeoutDeadline();
         try testing.expect(deadline != null);
-        // Advance far past the deadline and service the connection's
-        // pending work; the connection must leave the active state.
+        // Advance far past the deadline; the connection must report a
+        // closed/draining state through its state machine.
         p.now_nanos += 5 * std.time.ns_per_s;
         _ = try p.client_lifecycle.processPendingWork(harness.client_handle, p.client, p.now_nanos);
         try testing.expect(p.client.connectionState() != .active);
     }
 }
 
-test "keepalive PING holds the connection open across idle windows" {
+test "keepalive stays active across multiple original idle deadlines" {
     const alloc = testing.allocator;
+    // 500 ms idle deadline with a 20 ms keepalive: the connection must
+    // survive 1.2 s — well past two original idle deadlines — and then
+    // actually close once keepalives stop, proving the deadlines were
+    // real all along.
     var opts = try randomPsk();
-    opts.idle_timeout_ms = 250;
+    opts.idle_timeout_ms = 500;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();
     try p.completeHandshake();
 
-    // Scaled 1-second keepalive from the plan becomes 50 ms here: send a
-    // PING and deliver it well within each 250 ms idle window, three
-    // times, advancing the clock across what would otherwise be several
-    // idle deadlines.
     var round: usize = 0;
-    while (round < 3) : (round += 1) {
-        p.now_nanos += 50 * std.time.ns_per_ms;
+    while (round < 60) : (round += 1) {
+        p.now_nanos += 20 * std.time.ns_per_ms;
         try p.client.sendPing();
         try p.flushClientShort();
+        try p.flushServerShort();
         try testing.expect(p.client.connectionState() == .active);
+        try testing.expect(p.server.connectionState() == .active);
     }
+
+    // Stop keeping alive: the (still-negotiated) idle deadline closes it.
+    p.now_nanos += 1 * std.time.ns_per_s;
+    _ = try p.client_lifecycle.processPendingWork(harness.client_handle, p.client, p.now_nanos);
+    try testing.expect(p.client.connectionState() != .active);
+}
+
+test "streamSendProgress end-to-end across an ACK round trip" {
+    const alloc = testing.allocator;
+    var p = try Pair.create(alloc, try randomPsk());
+    defer p.destroy();
+    try p.completeHandshake();
+
+    const s = try p.client.openStream();
+    const fresh = p.client.streamSendProgress(s).?;
+    try testing.expectEqual(@as(u64, 0), fresh.accepted_offset);
+    try testing.expectEqual(@as(u64, 0), fresh.contiguous_acked_offset);
+    try testing.expect(fresh.last_ack_progress_nanos == null);
+    try testing.expect(p.client.streamSendProgress(999_999) == null);
+
+    const payload = "progress-across-the-wire";
+    const got = try p.clientToServer(s, payload, false);
+    defer if (got) |x| alloc.free(x);
+    try testing.expectEqualStrings(payload, got.?);
+
+    // Server ACK return drains the logical offsets to zero.
+    try p.flushServerShort();
+    const progress = p.client.streamSendProgress(s).?;
+    try testing.expectEqual(@as(u64, payload.len), progress.accepted_offset);
+    try testing.expectEqual(@as(u64, payload.len), progress.contiguous_acked_offset);
+    try testing.expectEqual(@as(u64, 0), progress.outstandingBytes());
+    try testing.expect(progress.last_ack_progress_nanos != null);
 }
 
 test "fault matrix: loss, duplication, reordering, corruption, blackout" {
@@ -192,30 +237,49 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
         try testing.expect((try p.server.recvOnStream(s, &buf)) == null);
     }
 
-    // Corruption: an AEAD-failed datagram is discarded without killing
-    // the connection; subsequent traffic flows normally. (Retransmission
-    // of the lost bytes rides the same PTO machinery proven by the
-    // Initial-loss block above and quicz's own retransmission suite.)
+    // Corruption: the AEAD-failed datagram is discarded without killing
+    // the connection, and its bytes are still delivered exactly once —
+    // the surviving traffic's ACKs reveal the lost packet and QUIC
+    // retransmits it, in order before the later data.
     {
         var p = try Pair.create(alloc, try randomPsk());
         defer p.destroy();
         try p.completeHandshake();
+        // Flush any post-handshake stragglers first so the corruptor
+        // deterministically hits the stream-data datagram itself.
+        try p.flushClientShort();
+        try p.flushServerShort();
         p.wire.corrupt_once = true;
         const s = try p.client.openStream();
-        const lost = try p.clientToServer(s, "corrupted-copy", true);
-        defer if (lost) |x| alloc.free(x);
+        // First write is corrupted on the wire and dropped by the server.
+        const lost = try p.clientToServer(s, "AAAA", false);
+        try testing.expect(lost == null);
         try testing.expectEqual(@as(usize, 1), p.wire.corrupted);
         try testing.expect(p.client.connectionState() == .active);
 
-        // Fresh traffic after the corrupted datagram delivers exactly.
-        const s2 = try p.client.openStream();
-        const got = try p.clientToServer(s2, "after-corruption", true);
-        defer if (got) |x| alloc.free(x);
-        try testing.expectEqualStrings("after-corruption", got.?);
+        // A later write on the same stream survives; its ACK makes the
+        // loss detector requeue the corrupted packet's stream data.
+        const got_b = try p.clientToServer(s, "BBBB", true);
+        defer if (got_b) |x| alloc.free(x);
+
+        var assembled: std.ArrayList(u8) = .empty;
+        defer assembled.deinit(alloc);
+        var round: usize = 0;
+        while (round < 12 and assembled.items.len < 8) : (round += 1) {
+            try p.recoverBoth();
+            try p.flushServerShort();
+            var buf: [256]u8 = undefined;
+            while (try p.server.recvOnStream(s, &buf)) |n| {
+                try assembled.appendSlice(alloc, buf[0..n]);
+            }
+        }
+        try testing.expectEqualStrings("AAAABBBB", assembled.items);
+        try testing.expect(p.client.connectionState() == .active);
     }
 
     // Ten-second outage (scaled to 100 ms): nothing delivers during the
-    // blackout; the connection recovers afterwards and still passes data.
+    // blackout; afterwards the connection recovers AND the bytes lost
+    // inside the blackout are delivered exactly once.
     {
         var p = try Pair.create(alloc, try randomPsk());
         defer p.destroy();
@@ -227,71 +291,135 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
         try testing.expect(p.wire.dropped > 0);
 
         p.now_nanos += 150 * std.time.ns_per_ms;
-        const s2 = try p.client.openStream();
-        const got = try p.clientToServer(s2, "after-blackout", true);
+        var got: ?[]u8 = null;
+        var round: usize = 0;
+        while (got == null and round < 8) : (round += 1) {
+            try p.recoverBoth();
+            var buf: [256]u8 = undefined;
+            if (try p.server.recvOnStream(s, &buf)) |n| {
+                got = try alloc.dupe(u8, buf[0..n]);
+            }
+        }
         defer if (got) |x| alloc.free(x);
-        try testing.expectEqualStrings("after-blackout", got.?);
+        try testing.expectEqualStrings("lost-in-blackout", got.?);
+        var buf: [256]u8 = undefined;
+        try testing.expect((try p.server.recvOnStream(s, &buf)) == null);
+    }
+
+    // Delay: datagrams held for two pump cycles still deliver exactly
+    // once; the connection stays healthy.
+    {
+        var p = try Pair.create(alloc, try randomPsk());
+        defer p.destroy();
+        try p.completeHandshake();
+        p.wire.delay_client_cycles = 2;
+        const s = try p.client.openStream();
+        const none = try p.clientToServer(s, "delayed-payload", true);
+        try testing.expect(none == null);
+        try testing.expect(p.wire.delayed >= 1);
+        var got: ?[]u8 = null;
+        var round: usize = 0;
+        while (got == null and round < 6) : (round += 1) {
+            try p.flushAged();
+            var buf: [256]u8 = undefined;
+            if (try p.server.recvOnStream(s, &buf)) |n| {
+                got = try alloc.dupe(u8, buf[0..n]);
+            }
+            if (got == null) try p.recoverBoth();
+        }
+        defer if (got) |x| alloc.free(x);
+        try testing.expectEqualStrings("delayed-payload", got.?);
+        try testing.expect(p.client.connectionState() == .active);
     }
 }
 
-test "stream isolation: a stalled output stream cannot block input or control" {
+test "NAT rebinding: the route follows a new client source port" {
     const alloc = testing.allocator;
     var opts = try randomPsk();
-    // Tiny per-stream credit so the heavy stream stalls quickly.
+    opts.migration_disabled = false;
+    var p = try Pair.create(alloc, opts);
+    defer p.destroy();
+    try p.completeHandshake();
+
+    const s = try p.client.openStream();
+    const first = try p.clientToServer(s, "before-rebind", false);
+    defer if (first) |x| alloc.free(x);
+    try testing.expectEqualStrings("before-rebind", first.?);
+
+    // The client rebinds to a new source port (NAT rebinding).
+    p.client_path.local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40123);
+    p.server_path.remote = p.client_path.local;
+
+    // Data from the new path still routes by DCID; with migration enabled
+    // the server accepts the path change and traffic continues.
+    const second = try p.clientToServer(s, "after-rebind", true);
+    defer if (second) |x| alloc.free(x);
+    try testing.expectEqualStrings("after-rebind", second.?);
+    try testing.expect(p.client.connectionState() == .active);
+
+    // Data from the new path is ACCEPTED (routed by DCID, migration
+    // enabled) but the committed route is not moved until the caller
+    // validates the new path — the plan's path-validation-before-commit
+    // discipline, enforced by the routing layer itself.
+    const pre_commit = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(!pre_commit.remote.eql(p.client_path.local));
+
+    // Completing validation commits the migration to the new path.
+    _ = try p.server_lifecycle.updateRoutePathFromValidatedDatagramAndResetSpinBit(&harness.server_scid, p.server_path, p.server);
+    const route_path = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(route_path.remote.eql(p.client_path.local));
+}
+
+test "slow reader: unread stream data bounds sender memory by flow control" {
+    const alloc = testing.allocator;
+    var opts = try randomPsk();
     opts.max_stream_data = 256;
     opts.max_data = 4 * 1024;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();
     try p.completeHandshake();
 
-    const output = try p.client.openStream();
-    const input = try p.client.openStream();
-
-    // Drain the 256-byte stream credit on `output` so it is provably
-    // stalled by per-stream flow control.
+    const slow = try p.client.openStream();
+    // The server never reads `slow`: the client can place at most the
+    // 256-byte stream credit, then is blocked — memory bounded by the
+    // negotiated credit, not by the peer's silence.
     var chunk: [128]u8 = undefined;
-    @memset(&chunk, 'O');
-    if (try p.clientToServer(output, &chunk, false)) |got| alloc.free(got);
-    if (try p.clientToServer(output, &chunk, false)) |got| alloc.free(got);
+    @memset(&chunk, 'S');
+    if (try p.clientToServer(slow, &chunk, false)) |x| alloc.free(x);
+    if (try p.clientToServer(slow, &chunk, false)) |x| alloc.free(x);
+    try testing.expectError(error.FlowControlBlocked, p.client.sendOnStream(slow, &chunk, false));
 
-    // The stalled output stream now blocks further writes on itself...
-    try testing.expectError(error.FlowControlBlocked, p.client.sendOnStream(output, &chunk, false));
+    const progress = p.client.streamSendProgress(slow).?;
+    try testing.expect(progress.outstandingBytes() <= 256);
 
-    // ...while a different stream and control (PING) still flow and are
-    // delivered: stream isolation under output stall.
-    try p.client.sendPing();
-    const small = try p.clientToServer(input, "input-wins", true);
-    defer if (small) |s_| alloc.free(s_);
-    try testing.expectEqualStrings("input-wins", small.?);
-    try testing.expect(p.client.connectionState() == .active);
+    // A healthy stream is unaffected by the slow one.
+    const fast = try p.client.openStream();
+    const got = try p.clientToServer(fast, "fast-wins", true);
+    defer if (got) |x| alloc.free(x);
+    try testing.expectEqualStrings("fast-wins", got.?);
 }
 
-test "per-stream outstanding bytes and oldest-unacked age (upstreamable patch)" {
+test "emitted datagrams respect the configured maximum size" {
     const alloc = testing.allocator;
     var opts = try randomPsk();
-    opts.max_stream_data = 2048;
+    opts.max_data = 4 * 1024 * 1024;
+    opts.max_stream_data = 64 * 1024;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();
     try p.completeHandshake();
 
     const s = try p.client.openStream();
-    // A fresh send side reports zero outstanding, no unacked age.
-    try testing.expectEqual(@as(?u64, 0), p.client.streamSendOutstandingBytes(s));
-    try testing.expect(p.client.streamSendOldestUnackedSentTimeNanos(s) == null);
-    // A stream with no send side reports null.
-    try testing.expect(p.client.streamSendOutstandingBytes(999_999) == null);
-
-    // Send while the server's ACK has not returned: every byte is queued
-    // or in flight and unacknowledged, with a real send timestamp.
-    const payload = "outstanding-bytes-payload";
-    const got = try p.clientToServer(s, payload, false);
-    defer if (got) |x| alloc.free(x);
-    try testing.expectEqualStrings(payload, got.?);
-    try testing.expectEqual(@as(?u64, payload.len), p.client.streamSendOutstandingBytes(s));
-    const oldest = p.client.streamSendOldestUnackedSentTimeNanos(s).?;
-    try testing.expect(oldest <= p.now_nanos);
-
-    // After the server's ACK returns, the stream drains to zero.
-    try p.flushServerShort();
-    try testing.expectEqual(@as(?u64, 0), p.client.streamSendOutstandingBytes(s));
+    var big: [8192]u8 = undefined;
+    @memset(&big, 'M');
+    var sent: usize = 0;
+    while (sent < big.len) {
+        const got = try p.clientToServer(s, big[sent..@min(sent + 1024, big.len)], false);
+        if (got) |x| alloc.free(x);
+        sent += 1024;
+    }
+    // In-process the wire is unbounded, but quicz never emits a datagram
+    // larger than the configured max_datagram_size (8192 here; the
+    // real-socket proofs pin 1200/1350 against actual UDP payloads).
+    try testing.expect(p.wire.max_datagram_seen <= 8192);
+    try testing.expect(p.wire.max_datagram_seen >= 1200);
 }

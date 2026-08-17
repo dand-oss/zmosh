@@ -305,9 +305,20 @@ test "certificate-free external-PSK handshake and 1-RTT echo" {
     );
     try testing.expect(sfinal.handshake_confirmed);
 
-    // No resumption, no 0-RTT on either side.
+    // No resumption, no 0-RTT on either side, and no resumption state
+    // after application data: no ticket, no derived PSK.
     try testing.expect(!p.client.zeroRttAccepted());
     try testing.expect(!p.server.zeroRttAccepted());
+    try testing.expect(p.client_backend.hs.resumption_psk == null);
+    try testing.expect(p.client_backend.hs.session_ticket_allows_early_data == false);
+
+    // Secure teardown demonstrably zeroes TLS secret material.
+    p.client_backend.secureWipe();
+    p.server_backend.secureWipe();
+    try testing.expect(std.mem.allEqual(u8, &p.client_backend.hs.key_schedule.early_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.server_backend.hs.key_schedule.early_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.server_backend.hs.server_psk.?, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.client_backend.hs.x25519_secret, 0));
 
     // 1-RTT application data both directions.
     const stream_id = try p.client.openStream();

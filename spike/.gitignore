@@ -1,5 +1,6 @@
-# Fetched dependency trees; reproduction commands live in docs/quic-spike.md
-# and spike/patches/.
-deps/
+# Build caches and fetched dependency trees; exact dependency pins live
+# in build.zig.zon and reproduction commands in docs/quic-spike.md.
 zig-cache/
 .zig-cache/
+zig-pkg/
+zig-out/

@@ -53,6 +53,18 @@ pub const Wire = struct {
     corrupt_once: bool = false,
     /// Drop everything while now_nanos < blackout_until.
     blackout_until_nanos: i64 = 0,
+    /// Delay each client datagram by N pump cycles before delivery.
+    delay_client_cycles: usize = 0,
+    /// Datagrams held for later delivery (delay injection).
+    held_late: std.ArrayList([]u8) = .empty,
+    held_late_remaining: std.ArrayList(usize) = .empty,
+    delayed: usize = 0,
+    /// Largest datagram size observed passing the wire (MTU cap proofs).
+    max_datagram_seen: usize = 0,
+    /// Datagrams discarded on delivery (AEAD/routing failures).
+    undeliverable: usize = 0,
+    /// Verbose per-datagram tracing (debugging only).
+    trace: bool = false,
     now_nanos: *i64,
 
     client_sent: usize = 0,
@@ -102,6 +114,9 @@ pub const Wire = struct {
     pub fn deinit(self: *Wire, alloc: std.mem.Allocator) void {
         if (self.held_client) |h| alloc.free(h);
         self.held_client = null;
+        for (self.held_late.items) |h| alloc.free(h);
+        self.held_late.deinit(alloc);
+        self.held_late_remaining.deinit(alloc);
     }
 };
 
@@ -206,13 +221,14 @@ pub const Pair = struct {
         p.client_backend.* = Tls13Backend.initClientWithPsk(.{
             .alpn = &alpn_zmosh,
             .server_name = "zmosh",
+            .disable_session_resumption = true,
         }, opts.client_psk);
-        p.client_backend.hs.session_ticket_len = psk_identity.len;
-        @memcpy(p.client_backend.hs.session_ticket[0..psk_identity.len], psk_identity);
+        try p.client_backend.setClientPskIdentity(psk_identity);
 
         p.server_backend = try alloc.create(Tls13Backend);
         p.server_backend.* = Tls13Backend.initServerWithPsk(.{
             .alpn = opts.server_alpn,
+            .disable_session_resumption = true,
             // No certificate material: PSK-only or fail.
         }, opts.server_psk);
         if (opts.server_identity) |identity| try p.server_backend.setServerPskIdentity(identity);
@@ -244,6 +260,24 @@ pub const Pair = struct {
         return @intCast(self.pkt);
     }
 
+    /// Derive this side's 1-RTT send keys from the TLS backend's public
+    /// key schedule, for the dedicated application-space recovery bridge
+    /// (which takes explicit keys; the connection keeps its own copies).
+    fn oneRttSendKeys(self: *Pair, client_side: bool) ?protection.Aes128PacketProtectionKeys {
+        const backend = if (client_side) self.client_backend else self.server_backend;
+        const ks = &backend.hs.key_schedule;
+        if (!ks.app_secret_derived) return null;
+        const secret = if (client_side)
+            ks.client_app_traffic_secret
+        else
+            ks.server_app_traffic_secret;
+        const cipher: protection.CipherSuite = switch (backend.hs.negotiatedCipherSuite()) {
+            0x1303 => .chacha20_poly1305,
+            else => .aes_128_gcm,
+        };
+        return protection.deriveForCipher(secret, .v1, cipher);
+    }
+
     /// Destination CID for client Initial-space datagrams: the original
     /// DCID for the very first ClientHello, the server's Initial SCID
     /// afterwards (quicz validates this on every client Initial build).
@@ -270,10 +304,23 @@ pub const Pair = struct {
     /// destination in the appropriate packet space.
     pub fn deliver(self: *Pair, from_client: bool, data: []const u8) !void {
         const alloc = self.alloc;
+        if (self.wire.trace) std.debug.print("WIRE {s} len={d}\n", .{ if (from_client) "c->s" else "s->c", data.len });
         var bytes = data;
         var owned: ?[]u8 = null;
         defer if (owned) |o| alloc.free(o);
 
+        if (data.len > self.wire.max_datagram_seen) self.wire.max_datagram_seen = data.len;
+        if (from_client and self.wire.delay_client_cycles > 0) {
+            // Delayed datagram: hold for N pump cycles (drop if the delay
+            // slot already holds data; the harness pumps one at a time).
+            if (self.wire.held_late.items.len == 0) {
+                try self.wire.held_late.append(alloc, try alloc.dupe(u8, data));
+                try self.wire.held_late_remaining.append(alloc, self.wire.delay_client_cycles + 1);
+                self.wire.delayed += 1;
+                return;
+            }
+        }
+        try self.flushAged();
         switch (self.wire.classify(from_client, alloc, bytes)) {
             .drop => return,
             .hold => return,
@@ -321,9 +368,15 @@ pub const Pair = struct {
                 path,
                 self.now_nanos,
                 data,
-            ) catch |err| switch (err) {
-                error.InvalidPacket => {},
-                else => return err,
+            ) catch |err| {
+                if (self.wire.trace) std.debug.print("WIRE {s} process err={}\n", .{ if (from_client) "c->s" else "s->c", err });
+                switch (err) {
+                    // Delivery to an already-closed peer or an
+                    // undecryptable datagram is a normal harness event:
+                    // count it, never fail the pump.
+                    error.InvalidPacket, error.ConnectionClosed => self.wire.undeliverable += 1,
+                    else => return err,
+                }
             };
             return;
         };
@@ -364,6 +417,22 @@ pub const Pair = struct {
         }
     }
 
+    /// Deliver delayed datagrams whose hold has elapsed.
+    pub fn flushAged(self: *Pair) !void {
+        var i: usize = 0;
+        while (i < self.wire.held_late_remaining.items.len) {
+            if (self.wire.held_late_remaining.items[i] > 1) {
+                self.wire.held_late_remaining.items[i] -= 1;
+                i += 1;
+                continue;
+            }
+            const dg = self.wire.held_late.orderedRemove(i);
+            _ = self.wire.held_late_remaining.orderedRemove(i);
+            defer self.alloc.free(dg);
+            try self.deliverDirect(true, dg);
+        }
+    }
+
     /// Replay parked Handshake-space datagrams whose receiver now has
     /// keys. Entries that are still early stay parked.
     pub fn flushPendingHandshake(self: *Pair) !void {
@@ -390,7 +459,7 @@ pub const Pair = struct {
         while (try self.client_lifecycle.pollProtectedShortDatagramWithInstalledKeys(
             client_handle,
             self.client,
-            self.nextPkt(),
+            self.now_nanos,
             &server_scid,
         )) |dgram| {
             defer self.alloc.free(dgram);
@@ -403,7 +472,7 @@ pub const Pair = struct {
         while (try self.server_lifecycle.pollProtectedShortDatagramWithInstalledKeys(
             server_handle,
             self.server,
-            self.nextPkt(),
+            self.now_nanos,
             &client_scid,
         )) |dgram| {
             defer self.alloc.free(dgram);
@@ -430,15 +499,33 @@ pub const Pair = struct {
         }
     }
 
-    /// One full recovery cycle: advance the clock past PTO, retransmit
-    /// each side's due handshake datagrams, then drive and pump both
-    /// backends so delivered bytes are consumed and answered.
+    /// One full recovery cycle: advance the clock exactly past the
+    /// earliest due deadline (loss/PTO or otherwise), retransmit each
+    /// side's due datagrams, then drive and pump both backends so
+    /// delivered bytes are consumed and answered.
     pub fn recoverBoth(self: *Pair) !void {
         self.now_nanos += 200 * std.time.ns_per_ms;
+        // Jump exactly to a due RECOVERY deadline (loss/PTO) when one is
+        // pending sooner than the fixed step; never jump past idle or
+        // close deadlines, which would retire an otherwise live pair.
+        if (self.client_lifecycle.nextDeadline(client_handle, self.client)) |d| {
+            if (d.kind == .recovery and d.deadline_nanos > self.now_nanos) {
+                self.now_nanos = d.deadline_nanos;
+            }
+        }
+        if (self.server_lifecycle.nextDeadline(server_handle, self.server)) |d| {
+            if (d.kind == .recovery and d.deadline_nanos > self.now_nanos) {
+                self.now_nanos = d.deadline_nanos;
+            }
+        }
+        try self.flushAged();
+        try self.flushPendingHandshake();
         try self.retransmitDue(true);
         try self.retransmitDue(false);
         try self.pumpServer();
         try self.pumpClient();
+        try self.flushAged();
+        try self.flushPendingHandshake();
     }
 
     /// Poll one side's due retransmission datagrams and deliver them.
@@ -483,20 +570,28 @@ pub const Pair = struct {
             }
         }
 
-        // Application-space loss recovery (1-RTT PTO probe) once the
-        // handshake is confirmed.
+        // Application-space loss recovery: arm the endpoint recovery
+        // timer from the connection's own loss/PTO state, then service a
+        // due deadline and poll the probe/retransmission datagram.
         if (conn.handshakeConfirmed() and conn.hasOneRttProtectionKeys()) {
-            if (try lifecycle.processDueDeadlineAndPollDatagram(
+            try lifecycle.armRecoveryTimerFromConnection(handle, conn);
+            if (self.wire.trace) std.debug.print("LOSS {s}: loss_dl={any} pto_dl={any} now={d}\n", .{ if (client_side) "client" else "server", conn.lossDetectionDeadline(.application), conn.ptoDeadline(.application), self.now_nanos });
+            const keys = self.oneRttSendKeys(client_side) orelse return;
+            if (lifecycle.serviceRecoveryTimerAndPollProtectedShortDatagram(
                 handle,
                 conn,
                 self.now_nanos,
                 if (client_side) &server_scid else &client_scid,
-                if (client_side) &client_scid else &server_scid,
+                keys,
             )) |result| {
+                if (self.wire.trace) std.debug.print("BRIDGE {s}: serviced={any} dgram={any}\n", .{ if (client_side) "client" else "server", result.serviced != null, if (result.datagram) |dg| dg.len else @as(?usize, null) });
                 if (result.datagram) |dg| {
                     defer self.alloc.free(dg);
                     try self.deliver(client_side, dg);
                 }
+            } else |err| switch (err) {
+                error.InvalidPacket => {},
+                else => return err,
             }
         }
     }
@@ -511,11 +606,28 @@ pub const Pair = struct {
         return lifecycle.pollProtectedLongDatagram(
             handle,
             conn,
-            self.nextPkt(),
+            self.now_nanos,
             if (client_side) self.clientInitialDst() else &client_scid,
             if (client_side) &client_scid else &server_scid,
             &[_]u8{},
             .{ .initial = if (client_side) self.secrets.client else self.secrets.server },
+        ) catch |err| switch (err) {
+            error.InvalidPacket => null,
+            else => return err,
+        };
+    }
+
+    /// Opportunistic 1-RTT short-datagram poll with the same tolerance.
+    fn pollShortTolerant(self: *Pair, client_side: bool) !?[]u8 {
+        const lifecycle = if (client_side) self.client_lifecycle else self.server_lifecycle;
+        const conn = if (client_side) self.client else self.server;
+        const handle = if (client_side) client_handle else server_handle;
+        if (!conn.hasOneRttProtectionKeys()) return null;
+        return lifecycle.pollProtectedShortDatagramWithInstalledKeys(
+            handle,
+            conn,
+            self.now_nanos,
+            if (client_side) &server_scid else &client_scid,
         ) catch |err| switch (err) {
             error.InvalidPacket => null,
             else => return err,
@@ -531,7 +643,7 @@ pub const Pair = struct {
         return lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(
             handle,
             conn,
-            self.nextPkt(),
+            self.now_nanos,
             if (client_side) &server_scid else &client_scid,
             if (client_side) &client_scid else &server_scid,
         ) catch |err| switch (err) {
@@ -554,10 +666,19 @@ pub const Pair = struct {
             defer self.alloc.free(dg);
             try self.deliver(false, dg);
         }
+        // 1-RTT retransmissions and ACKs flow on both sides.
+        if (try self.pollShortTolerant(false)) |dg| {
+            defer self.alloc.free(dg);
+            try self.deliver(false, dg);
+        }
         // The client consumes whatever arrived and answers.
         try self.driveClient(.initial);
         try self.driveClient(.handshake);
         if (try self.pollHandshakeTolerant(true)) |dg| {
+            defer self.alloc.free(dg);
+            try self.deliver(true, dg);
+        }
+        if (try self.pollShortTolerant(true)) |dg| {
             defer self.alloc.free(dg);
             try self.deliver(true, dg);
         }
@@ -577,10 +698,18 @@ pub const Pair = struct {
             defer self.alloc.free(dg);
             try self.deliver(true, dg);
         }
+        if (try self.pollShortTolerant(true)) |dg| {
+            defer self.alloc.free(dg);
+            try self.deliver(true, dg);
+        }
         // The server consumes whatever arrived and answers.
         try self.driveServer(.initial);
         try self.driveServer(.handshake);
         if (try self.pollHandshakeTolerant(false)) |dg| {
+            defer self.alloc.free(dg);
+            try self.deliver(false, dg);
+        }
+        if (try self.pollShortTolerant(false)) |dg| {
             defer self.alloc.free(dg);
             try self.deliver(false, dg);
         }
@@ -613,7 +742,7 @@ pub const Pair = struct {
 
         // Flight 1: client Initial.
         try self.driveClient(.initial);
-        if (try self.client_lifecycle.pollProtectedLongDatagram(client_handle, self.client, self.nextPkt(), self.clientInitialDst(), &client_scid, &[_]u8{}, .{ .initial = self.secrets.client })) |ch| {
+        if (try self.client_lifecycle.pollProtectedLongDatagram(client_handle, self.client, self.now_nanos, self.clientInitialDst(), &client_scid, &[_]u8{}, .{ .initial = self.secrets.client })) |ch| {
             defer alloc.free(ch);
             try self.deliver(true, ch);
         }
@@ -621,7 +750,7 @@ pub const Pair = struct {
         // Flight 2: server processes the Initial, installs handshake keys,
         // answers with the ServerHello.
         try self.driveServer(.initial);
-        if (try self.server_lifecycle.pollProtectedLongDatagram(server_handle, self.server, self.nextPkt(), &client_scid, &server_scid, &[_]u8{}, .{ .initial = self.secrets.server })) |sh| {
+        if (try self.server_lifecycle.pollProtectedLongDatagram(server_handle, self.server, self.now_nanos, &client_scid, &server_scid, &[_]u8{}, .{ .initial = self.secrets.server })) |sh| {
             defer alloc.free(sh);
             try self.deliver(false, sh);
         }
@@ -637,7 +766,7 @@ pub const Pair = struct {
         // the recovery loop instead.
         if (!self.server.hasHandshakeProtectionKeys()) return error.HandshakeNeedsRecovery;
         try self.driveServer(.handshake);
-        if (try self.server_lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(server_handle, self.server, self.nextPkt(), &client_scid, &server_scid)) |flight| {
+        if (try self.server_lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(server_handle, self.server, self.now_nanos, &client_scid, &server_scid)) |flight| {
             defer alloc.free(flight);
             try self.deliver(false, flight);
         }
@@ -647,7 +776,7 @@ pub const Pair = struct {
         // seal Handshake-space datagrams yet.
         if (!self.client.hasHandshakeProtectionKeys()) return error.HandshakeNeedsRecovery;
         try self.driveClient(.handshake);
-        if (try self.client_lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(client_handle, self.client, self.nextPkt(), &server_scid, &client_scid)) |fin| {
+        if (try self.client_lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(client_handle, self.client, self.now_nanos, &server_scid, &client_scid)) |fin| {
             defer alloc.free(fin);
             try self.deliver(true, fin);
         }
@@ -655,6 +784,22 @@ pub const Pair = struct {
         // Flight 6: server confirms.
         try self.driveServer(.handshake);
         if (!self.server.handshakeConfirmed()) return error.HandshakeNotConfirmed;
+
+        // Flight 7: the server sends HANDSHAKE_DONE so the client
+        // confirms too; without client confirmation, application-space
+        // recovery stays gated server-side only.
+        try self.server.sendHandshakeDone();
+        if (try self.pollShortTolerant(false)) |dg| {
+            defer self.alloc.free(dg);
+            try self.deliver(false, dg);
+        }
+        try self.driveClient(.handshake);
+        if (try self.pollShortTolerant(true)) |dg| {
+            defer self.alloc.free(dg);
+            try self.deliver(true, dg);
+        }
+        try self.driveServer(.handshake);
+        if (!self.client.handshakeConfirmed()) return error.ClientNotConfirmed;
     }
 
     /// Send application bytes on one stream client->server; returns what
@@ -665,7 +810,7 @@ pub const Pair = struct {
         var delivered: ?[]u8 = null;
         var attempts: usize = 0;
         while (attempts < 8) : (attempts += 1) {
-            if (try self.client_lifecycle.pollProtectedShortDatagramWithInstalledKeys(client_handle, self.client, self.nextPkt(), &server_scid)) |dgram| {
+            if (try self.client_lifecycle.pollProtectedShortDatagramWithInstalledKeys(client_handle, self.client, self.now_nanos, &server_scid)) |dgram| {
                 defer alloc.free(dgram);
                 try self.deliver(true, dgram);
             } else break;
@@ -686,7 +831,7 @@ pub const Pair = struct {
         var delivered: ?[]u8 = null;
         var attempts: usize = 0;
         while (attempts < 8) : (attempts += 1) {
-            if (try self.server_lifecycle.pollProtectedShortDatagramWithInstalledKeys(server_handle, self.server, self.nextPkt(), &client_scid)) |dgram| {
+            if (try self.server_lifecycle.pollProtectedShortDatagramWithInstalledKeys(server_handle, self.server, self.now_nanos, &client_scid)) |dgram| {
                 defer alloc.free(dgram);
                 try self.deliver(false, dgram);
             } else break;

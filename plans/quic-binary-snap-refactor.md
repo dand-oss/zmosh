@@ -39,7 +39,9 @@ Record these inputs before coding and do not silently advance them:
 | zmx base | `cd88d1b` | zmx v0.7.0 replant base |
 | custom fallback | `master` at `db4661c02965733d5975011e92875e3c639cac87` | zmosh 0.5.3 reliable snapshot/reordering implementation |
 | quicz spike | `b4352201f1217bbc4538e379be0f68f783558070` | only QUIC candidate admitted to the spike |
+| **quicz production pin** | dand-oss/quicz `3a75a8b63dd4137f07932d3d85ee773b24ad80c1` | fork of upstream `b4352201` + six reviewed zmosh commits (external-PSK identity API; explicit resumption disable; address-neutral routing; streamSendProgress; secureWipe; lifecycle neutral process entries); immutable tag `zmosh-quic-q1-2` (`zmosh-quic-q1` = first five commits, also immutable) |
 | Ghostty audited tree | `b97b17f06b1ffd694f80edd3df5dd2134a0bcb9e` | frozen 2026-08-17 tree containing the reviewed Snapshot v1 Zig and C APIs; the commit itself is an unrelated i18n change |
+| **Ghostty production pin** | dand-oss/ghostty `6361b2eac73e8243a7042f517ea95ab87165f105` | fork of upstream `56e1f3a62` + the public `lib_vt` snapshot re-export; immutable tag `zmosh-snapshot-v1`; snapshot content ref still `1359973ae` |
 | Ghostty snapshot content | `1359973aefb37a9beaa2ec3e8f79df78290ea6f5` | last commit touching `src/terminal/snapshot/` as of the audited tree, 2026-08-15 |
 | Zig | `0.16.0` | project and dependency toolchain |
 
@@ -130,15 +132,29 @@ must carry its governing plan. The spike may modify only spike code,
 dependency metadata, and its report. It must not delete the custom transport
 or begin the command gateway.
 
+### Phase ownership (frozen)
+
+- Q1 owns dependency and transport feasibility: fork pins, the PSK gate, the
+  fault matrix, send-progress accounting, secure teardown, real-socket family
+  proofs, and the spike report.
+- Q2 owns production zmosh integration: the `poll()` loop, sockets, UDP
+  port range, bootstrap, and zmosh-side key cleanup and zeroization.
+- Q3 owns HELLO authorization, replay and pre-handshake rejection, and the
+  one-client-per-gateway policy.
+- Q5 owns visible disconnect/reconnect behavior and output replacement.
+- Q7/Q8 own attribution, packaging, process cleanup, platform execution, and
+  soak qualification.
+
 ### Independent Ghostty snapshot API prerequisite
 
 - Require this upstream addition to `src/lib_vt.zig`:
 
       pub const snapshot = terminal.snapshot;
 
-- Treat the re-export like a required quicz API gap: it must be small, tested,
-  upstreamable, and present in the exact production Ghostty pin. A permanent
-  zmosh-only Ghostty fork is a failed gate.
+- The re-export landed in the dand-oss Ghostty fork (upstream `56e1f3a62` +
+  one commit, tag `zmosh-snapshot-v1`); the production pin is that exact fork
+  commit. Original projects remain configured as upstream remotes for future
+  synchronization; no upstream acceptance is required for Q1/Q2.
 - Do not use the Ghostty C snapshot API as a fallback. It owns a C
   `TerminalWrapper`, while zmosh owns a native Zig `ghostty_vt.Terminal`; using
   it would require an unrelated terminal-ownership rewrite.
@@ -146,8 +162,7 @@ or begin the command gateway.
   `vt-features=+snapshot` explicitly so a future default change cannot silently
   remove it.
 - Track this prerequisite independently of the quicz decision. It blocks both
-  the QUIC production path and the custom-transport fallback. If it cannot
-  land upstream, stop and report the snapshot refactor blocked.
+  the QUIC production path and the custom-transport fallback.
 
 ### Dependency and API proof
 
@@ -159,11 +174,13 @@ or begin the command gateway.
   `poll()` loop.
 - Prove IPv4, IPv6, and dual-stack operation without regressing current zmosh
   behavior.
-- Prove all required behavior through public quicz APIs. The final dependency
-  must be an unmodified upstream commit. Required endpoint PSK or per-stream
-  outstanding-byte APIs must be small, tested, upstreamable changes that land
-  upstream before the production pin advances. A permanent zmosh-only quicz
-  fork is a failed gate.
+- Prove all required behavior through public quicz APIs. The production
+  dependency is the dand-oss fork pin: upstream `b4352201` plus six reviewed
+  zmosh commits adding exactly those APIs (`setClientPskIdentity`, explicit
+  resumption/0-RTT disable, address-neutral IPv4/IPv6 routing,
+  `streamSendProgress`, `secureWipe`, lifecycle neutral process entries).
+  Each commit passed the full quicz suite; the fork tracks upstream
+  `venjiang/quicz` for future synchronization.
 - Keep the production compatibility adapter below 500 non-test lines. This
   excludes zmosh's application protocol but includes all quicz-specific
   lifecycle glue.
@@ -237,10 +254,10 @@ shutdown.
 Write `docs/quic-spike.md` with exact SHAs, patches/API gaps, test output,
 binary/build measurements, platform results, and residual risks.
 
-QUIC is accepted only if every hard gate above passes. On acceptance, update
-the production quicz pin to the exact reviewed upstream commit containing any
-required API additions. If a hard gate fails, stop and follow the fallback
-section; do not weaken the gate during implementation.
+QUIC is accepted only if every hard gate above passes. On acceptance, the
+production quicz pin is the dand-oss fork commit recorded in the frozen-inputs
+table. If a hard gate fails, stop and follow the fallback section; do not
+weaken the gate during implementation.
 
 Checkpoint: spike report committed and pushed; implementation remains locked
 pending review.
@@ -364,10 +381,11 @@ not network logic.
 
 ### Ghostty pin and continuation
 
-- Advance Ghostty to the exact upstream commit containing the reviewed
-  `pub const snapshot = terminal.snapshot;` re-export, then regenerate and
-  record the Zig package hash. The audited `b97b17f...` tree and snapshot
-  content reference `1359973a...` are review inputs, not the production pin.
+- Advance Ghostty to the dand-oss fork pin (`6361b2eac...`, upstream
+  `56e1f3a62` plus the reviewed `pub const snapshot = terminal.snapshot;`
+  re-export), then regenerate and record the Zig package hash. The audited
+  `b97b17f...` tree and snapshot content reference `1359973a...` are review
+  inputs, not the production pin.
 - Pass `vt-features=+snapshot` explicitly and, only after the re-export lands,
   use the public `ghostty_vt.snapshot` encoder and Decoder. Do not copy or
   reinterpret Ghostty record definitions, use the C wrapper, or carry a

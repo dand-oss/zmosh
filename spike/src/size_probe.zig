@@ -22,7 +22,6 @@ pub fn main(init: std.process.Init) !void {
     var buf: [1200]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try backend.writeKeylog(&w);
-    _ = conn.streamSendOutstandingBytes(0);
-    _ = conn.streamSendOldestUnackedSentTimeNanos(0);
+    _ = conn.streamSendProgress(0);
     std.debug.print("probe: {d} keylog bytes\n", .{w.buffered().len});
 }

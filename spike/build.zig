@@ -56,12 +56,31 @@ pub fn build(b: *std.Build) void {
     const proofs_tests = b.addTest(.{ .root_module = proofs_mod });
     const run_proofs_tests = b.addRunArtifact(proofs_tests);
 
+    // Q1 real-socket proofs: IPv4 / native IPv6 / dual-stack over actual
+    // UDP with poll()-driven exchange.
+    const socket_mod = b.addModule("spike-sockets", .{
+        .root_source_file = b.path("src/quic_socket_proofs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    socket_mod.addImport("quicz", quicz.module("quicz"));
+    const socket_tests = b.addTest(.{ .root_module = socket_mod });
+    const run_socket_tests = b.addRunArtifact(socket_tests);
+
     // quicz's build registers its own top-level "test" step; avoid the
     // name collision by giving every gate an explicit unique step.
-    const spike_test = b.step("spike-test", "Run Q1 spike tests (snapshot access + PSK gate + transport proofs)");
+    const spike_test = b.step("spike-test", "Run Q1 spike tests (snapshot access + PSK gate + transport + real-socket proofs)");
     spike_test.dependOn(&run_tests.step);
     spike_test.dependOn(&run_psk_tests.step);
     spike_test.dependOn(&run_proofs_tests.step);
+    spike_test.dependOn(&run_socket_tests.step);
+
+    // Canonical `zig build test` entry point for the spike gates.
+    const test_step = b.step("test", "Run all Q1 spike gates");
+    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_psk_tests.step);
+    test_step.dependOn(&run_proofs_tests.step);
+    test_step.dependOn(&run_socket_tests.step);
 
     // Stripped-size probe: one exe linking quicz the way zmosh would.
     const probe_mod = b.createModule(.{
