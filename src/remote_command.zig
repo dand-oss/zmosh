@@ -95,6 +95,7 @@ pub const ParseError = error{
     InvalidKind,
     InvalidOpcode,
     InvalidStatus,
+    InvalidStatusForKind,
     ReservedNotZero,
     InvalidFlags,
     InvalidGeometry,
@@ -150,23 +151,44 @@ pub const Chunk = struct {
 };
 
 /// Parse a full frame (header + payload) and enforce chunk geometry:
-/// aligned offset, in-bounds sizes, FIRST only at offset 0.
+/// aligned offset, in-bounds sizes, and canonical FIRST/LAST geometry.
 pub fn parseChunk(data: []const u8) ParseError!Chunk {
     const h = try parseHeader(data);
     const payload = data[header_len..];
 
-    if (h.total_len == 0 or h.total_len > max_total_len) return error.InvalidGeometry;
+    if ((h.kind == .request or h.kind == .cancel) and h.status != .ok) {
+        return error.InvalidStatusForKind;
+    }
+    if (h.total_len > max_total_len) return error.InvalidGeometry;
     if (payload.len > max_chunk_payload) return error.InvalidGeometry;
-    if (h.offset % max_chunk_payload != 0) return error.InvalidGeometry;
+
+    // Empty request bodies still need one authenticated frame so tail and
+    // label_clear can be represented without inventing a sentinel byte.
+    if (h.total_len == 0) {
+        if (payload.len != 0 or h.offset != 0 or h.flags != (Flags.FIRST | Flags.LAST)) {
+            return error.InvalidGeometry;
+        }
+        if ((h.kind == .request or h.kind == .cancel) and h.flags & Flags.STREAM != 0) {
+            return error.InvalidGeometry;
+        }
+        return .{ .header = h, .payload = payload };
+    }
+
+    if (h.offset > max_total_len or h.offset % max_chunk_payload != 0) return error.InvalidGeometry;
 
     const offset_len = @as(usize, h.offset) + payload.len;
     if (offset_len > h.total_len) return error.InvalidGeometry;
-    if (h.flags & Flags.FIRST != 0 and h.offset != 0) return error.InvalidGeometry;
     // A non-final chunk must be full-size; the final chunk is whatever
     // remains. Enforced via alignment + the offset_len bound above, but a
     // short chunk claiming to be in the middle is malformed.
     if (offset_len < h.total_len and payload.len != max_chunk_payload) return error.InvalidGeometry;
-    if (h.kind != .request and h.kind != .cancel and h.kind != .response) return error.InvalidKind;
+
+    const expected_flags: u8 = (if (h.offset == 0) Flags.FIRST else 0) |
+        (if (offset_len == h.total_len) Flags.LAST else 0);
+    if (h.flags & (Flags.FIRST | Flags.LAST) != expected_flags) return error.InvalidGeometry;
+    if ((h.kind == .request or h.kind == .cancel) and h.flags & Flags.STREAM != 0) {
+        return error.InvalidGeometry;
+    }
 
     return .{ .header = h, .payload = payload };
 }
@@ -209,7 +231,7 @@ pub fn validateRequestBody(op: Opcode, body: []const u8) BodyError!void {
         },
         .kill => {
             // one byte: force=false/true
-            if (body.len != 1) return error.InvalidKillBody;
+            if (body.len != 1 or (body[0] != 0 and body[0] != 1)) return error.InvalidKillBody;
         },
         .tail => {
             if (body.len != 0) return error.InvalidTailBody;
@@ -252,9 +274,6 @@ pub const Reassembler = struct {
     covered: []bool = &.{},
     chunks_received: usize = 0,
     chunks_total: usize = 0,
-    /// Set when the final-index chunk arrived carrying LAST — completion
-    /// must not depend on chunk arrival order.
-    last_flag_ok: bool = false,
     complete: bool = false,
 
     /// Begin (or resume) reassembly for a request's FIRST chunk. Only one
@@ -263,25 +282,34 @@ pub const Reassembler = struct {
     pub fn start(self: *Reassembler, alloc: std.mem.Allocator, h: Header) ReassembleError!StartResult {
         if (h.kind != .request) return error.KindMismatch;
         if (self.complete) {
-            if (h.request_id == self.request_id) return .already_complete;
-            return error.SecondRequest;
+            if (h.request_id != self.request_id) return error.SecondRequest;
+            if (h.opcode != self.opcode or h.total_len != self.total_len) return error.ConflictingOverlap;
+            return .already_complete;
         }
         if (self.chunks_total != 0) {
             // In progress: only the same request continues.
             if (h.request_id != self.request_id) return error.SecondRequest;
+            if (h.opcode != self.opcode or h.total_len != self.total_len) return error.ConflictingOverlap;
             return .started;
         }
-        if (h.total_len == 0 or h.total_len > max_total_len) return error.InvalidGeometry;
+        if (h.total_len > max_total_len) return error.InvalidGeometry;
 
         const total: usize = h.total_len;
+        const chunks_total = if (total == 0)
+            1
+        else
+            std.math.divCeil(usize, total, max_chunk_payload) catch return error.InvalidGeometry;
+        const buf = try alloc.alloc(u8, total);
+        errdefer alloc.free(buf);
+        const covered = try alloc.alloc(bool, chunks_total);
+        @memset(covered, false);
+
         self.request_id = h.request_id;
         self.opcode = h.opcode;
         self.total_len = total;
-        self.chunks_total = std.math.divCeil(usize, total, max_chunk_payload) catch return error.InvalidGeometry;
-        self.buf = try alloc.alloc(u8, total);
-        errdefer self.buf = &.{};
-        self.covered = try alloc.alloc(bool, self.chunks_total);
-        @memset(self.covered, false);
+        self.chunks_total = chunks_total;
+        self.buf = buf;
+        self.covered = covered;
         return .started;
     }
 
@@ -295,9 +323,9 @@ pub const Reassembler = struct {
         if (h.request_id != self.request_id) return error.SecondRequest;
         if (h.kind != .request) return error.KindMismatch;
         if (self.complete) return error.ChunkAfterComplete;
-        if (h.opcode != self.opcode) return error.InvalidGeometry;
+        if (h.opcode != self.opcode or h.total_len != self.total_len) return error.ConflictingOverlap;
 
-        const idx = h.offset / max_chunk_payload;
+        const idx = if (self.total_len == 0) 0 else h.offset / max_chunk_payload;
         if (idx >= self.chunks_total) return error.InvalidGeometry;
 
         if (self.covered[idx]) {
@@ -310,14 +338,7 @@ pub const Reassembler = struct {
         @memcpy(self.buf[h.offset .. h.offset + chunk.payload.len], chunk.payload);
         self.covered[idx] = true;
         self.chunks_received += 1;
-        if (idx == self.chunks_total - 1 and h.flags & Flags.LAST != 0) {
-            self.last_flag_ok = true;
-        }
-
         if (self.chunks_received == self.chunks_total) {
-            // All chunks present: complete only if the final chunk declared
-            // LAST. Its absence is malformed geometry.
-            if (!self.last_flag_ok) return error.InvalidGeometry;
             self.complete = true;
             return .complete;
         }
@@ -488,6 +509,75 @@ test "header validation rejects bad fields" {
     buf[5] = 0;
 }
 
+test "empty request frame reassembles" {
+    const alloc = testing.allocator;
+    var frame: [header_len]u8 = undefined;
+    writeHeader(&frame, .{
+        .version = version,
+        .kind = .request,
+        .opcode = .tail,
+        .status = .ok,
+        .flags = Flags.FIRST | Flags.LAST,
+        .request_id = 11,
+        .total_len = 0,
+        .offset = 0,
+    });
+
+    const chunk = try parseChunk(&frame);
+    var r = Reassembler{};
+    defer r.deinit(alloc);
+    try testing.expectEqual(StartResult.started, try r.start(alloc, chunk.header));
+    try testing.expectEqual(OnChunkResult.complete, try r.onChunk(&frame));
+    try testing.expectEqual(@as(usize, 0), r.message().len);
+    try validateRequestBody(.tail, r.message());
+    try validateRequestBody(.label_clear, r.message());
+}
+
+test "chunk semantics reject nonzero request status, stream requests, and bad FIRST/LAST" {
+    var buf: [header_len + max_chunk_payload]u8 = undefined;
+    const total = max_chunk_payload + 1;
+    const base = Header{
+        .version = version,
+        .kind = .request,
+        .opcode = .send,
+        .status = .ok,
+        .flags = Flags.FIRST,
+        .request_id = 12,
+        .total_len = @intCast(total),
+        .offset = 0,
+    };
+
+    writeHeader(buf[0..header_len], base);
+    @memset(buf[header_len..], 'x');
+    try testing.expectEqual(max_chunk_payload, (try parseChunk(buf[0 .. header_len + max_chunk_payload])).payload.len);
+
+    var bad = base;
+    bad.status = .internal_error;
+    writeHeader(buf[0..header_len], bad);
+    try testing.expectError(error.InvalidStatusForKind, parseChunk(buf[0 .. header_len + max_chunk_payload]));
+
+    bad = base;
+    bad.flags = Flags.FIRST | Flags.STREAM;
+    writeHeader(buf[0..header_len], bad);
+    try testing.expectError(error.InvalidGeometry, parseChunk(buf[0 .. header_len + max_chunk_payload]));
+
+    bad = base;
+    bad.flags = 0;
+    writeHeader(buf[0..header_len], bad);
+    try testing.expectError(error.InvalidGeometry, parseChunk(buf[0 .. header_len + max_chunk_payload]));
+
+    bad = base;
+    bad.flags = Flags.FIRST | Flags.LAST;
+    writeHeader(buf[0..header_len], bad);
+    try testing.expectError(error.InvalidGeometry, parseChunk(buf[0 .. header_len + max_chunk_payload]));
+
+    bad = base;
+    bad.offset = @intCast(max_chunk_payload);
+    bad.flags = Flags.FIRST | Flags.LAST;
+    writeHeader(buf[0..header_len], bad);
+    try testing.expectError(error.InvalidGeometry, parseChunk(buf[0 .. header_len + 1]));
+}
+
 test "chunk geometry validation" {
     var buf: [header_len + max_chunk_payload]u8 = undefined;
     const base = Header{ .version = 1, .kind = .request, .opcode = .send, .status = .ok, .flags = Flags.FIRST, .request_id = 1, .total_len = max_chunk_payload + 10, .offset = 0 };
@@ -631,7 +721,55 @@ test "one request per gateway" {
     try testing.expectError(error.SecondRequest, r.onChunk(b));
 }
 
-test "more than 32 chunks with loss and reorder" {
+test "same request id with conflicting metadata is rejected" {
+    const alloc = testing.allocator;
+    var r = Reassembler{};
+    defer r.deinit(alloc);
+
+    const body = "a" ** max_chunk_payload ++ "b";
+    const first = try frameFor(alloc, 13, body.len, 0, Flags.FIRST, body[0..max_chunk_payload]);
+    defer alloc.free(first);
+    const final = try frameFor(alloc, 13, body.len, max_chunk_payload, Flags.LAST, body[max_chunk_payload..]);
+    defer alloc.free(final);
+
+    _ = try r.start(alloc, (try parseChunk(first)).header);
+    try testing.expectEqual(OnChunkResult.progress, try r.onChunk(first));
+
+    var different_total = try alloc.dupe(u8, first);
+    defer alloc.free(different_total);
+    writeHeader(different_total[0..header_len], .{
+        .version = version,
+        .kind = .request,
+        .opcode = .send,
+        .status = .ok,
+        .flags = Flags.FIRST,
+        .request_id = 13,
+        .total_len = @intCast(max_chunk_payload * 2),
+        .offset = 0,
+    });
+    try testing.expectError(error.ConflictingOverlap, r.onChunk(different_total));
+
+    var different_opcode = try alloc.dupe(u8, first);
+    defer alloc.free(different_opcode);
+    different_opcode[2] = @intFromEnum(Opcode.print);
+    try testing.expectError(error.ConflictingOverlap, r.onChunk(different_opcode));
+
+    try testing.expectEqual(OnChunkResult.complete, try r.onChunk(final));
+
+    const complete_header = (try parseChunk(final)).header;
+    try testing.expectError(error.ConflictingOverlap, r.start(alloc, .{
+        .version = complete_header.version,
+        .kind = complete_header.kind,
+        .opcode = .print,
+        .status = complete_header.status,
+        .flags = complete_header.flags,
+        .request_id = complete_header.request_id,
+        .total_len = complete_header.total_len,
+        .offset = complete_header.offset,
+    }));
+}
+
+test "more than 32 chunks with loss, retransmission, and reorder" {
     const alloc = testing.allocator;
     var r = Reassembler{};
     defer r.deinit(alloc);
@@ -641,7 +779,8 @@ test "more than 32 chunks with loss and reorder" {
     defer alloc.free(body);
     for (body, 0..) |*b, i| b.* = @intCast((i * 7) % 251);
 
-    // simulate loss: deliver even indexes, then odd (reordered)
+    // Simulate loss: deliver even indexes while odd indexes are lost, then
+    // retransmit the odd indexes in a reordered pass.
     var frames = try alloc.alloc([]u8, n_chunks);
     defer {
         for (frames) |f| alloc.free(f);
@@ -656,11 +795,18 @@ test "more than 32 chunks with loss and reorder" {
     _ = try r.start(alloc, (try parseChunk(frames[0])).header);
     var i: usize = 0;
     while (i < n_chunks) : (i += 2) {
-        const res = try r.onChunk(frames[i]);
-        if (i == n_chunks - 1) try testing.expectEqual(OnChunkResult.complete, res);
+        try testing.expectEqual(OnChunkResult.progress, try r.onChunk(frames[i]));
     }
-    // last (odd count boundary: n_chunks=40 → last index 39 is odd, so it
-    // arrives in the odd pass below)
+
+    // An identical retransmission is harmless; a changed payload for an
+    // already-covered slot is a conflicting overlap.
+    try testing.expectEqual(OnChunkResult.progress, try r.onChunk(frames[2]));
+    const conflict = try alloc.dupe(u8, frames[2]);
+    defer alloc.free(conflict);
+    conflict[header_len] ^= 0xFF;
+    try testing.expectError(error.ConflictingOverlap, r.onChunk(conflict));
+
+    // The lost odd indexes now arrive as retransmissions, out of order.
     i = 1;
     while (i < n_chunks) : (i += 2) {
         const res = try r.onChunk(frames[i]);
@@ -706,6 +852,7 @@ test "request body validation" {
     try testing.expectError(error.InvalidTailBody, validateRequestBody(.tail, "x"));
     try testing.expectError(error.InvalidKillBody, validateRequestBody(.kill, ""));
     try testing.expectError(error.InvalidKillBody, validateRequestBody(.kill, "\x01\x02"));
+    try testing.expectError(error.InvalidKillBody, validateRequestBody(.kill, "\x02"));
 
     var wbuf: [16]u8 = undefined;
     // path_len = 3, path "abc", empty file bytes: valid
