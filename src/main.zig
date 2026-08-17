@@ -194,13 +194,21 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
         // --exact-session (hidden): the name is already fully resolved
         // (prefix applied) by the remote client; do not prefix it again.
+        // Recognized only before the session name — a payload argument
+        // literally named --exact-session must forward to the command.
         var session_name: []const u8 = "";
         var exact_session = false;
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(gpa);
         while (args.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--exact-session")) {
+            if (session_name.len == 0 and std.mem.eql(u8, arg, "--exact-session")) {
                 exact_session = true;
             } else if (session_name.len == 0) {
                 session_name = arg;
+            } else {
+                // Forwarded command payload, verbatim: -r, --exact-session,
+                // spaces, and shell metacharacters included.
+                try command_args.append(gpa, arg);
             }
         }
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -214,6 +222,12 @@ pub fn main(init: std.process.Init) !void {
             error.OutOfMemory => return err,
         };
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
+        if (command_args.items.len > 0) {
+            daemon.command = command_args.items;
+        }
+        var serve_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const serve_cwd_len = std.process.currentPath(io, &serve_cwd_buf) catch 0;
+        daemon.setCwd(serve_cwd_buf[0..serve_cwd_len]);
         const is_daemon_proc = try daemon.ensureSession(io);
         if (is_daemon_proc) return;
         return serve_mod.serveMain(gpa, io, &cfg, sesh);

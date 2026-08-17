@@ -21,7 +21,7 @@ setup() {
 }
 
 teardown() {
-  "$ZMX" kill rt-output rt-prefix rt-args >/dev/null 2>&1 || true
+  "$ZMX" kill rt-output rt-prefix rt-args rt-new >/dev/null 2>&1 || true
 }
 
 @test "remote attach rehydrates session output over UDP" {
@@ -71,6 +71,27 @@ teardown() {
   grep -q args-marker "$BATS_TEST_TMPDIR/attach.out"
   grep -q -- "-r requires a host" "$BATS_TEST_TMPDIR/attach.out" && return 1
   return 0
+}
+
+@test "attach -r creates a new remote session running the forwarded command" {
+  run "$ZMX" list --short
+  [[ "$output" != *"rt-new"* ]]
+
+  # The command must outlive the attach so the session is still listed;
+  # a command that exits instantly ends (and removes) the session.
+  timeout 8 script -qec "$ZMX attach -r localhost rt-new bash -c 'echo forwarded-command-marker; sleep 15'" /dev/null \
+    >"$BATS_TEST_TMPDIR/attach.out" 2>&1 || true
+
+  grep -q forwarded-command-marker "$BATS_TEST_TMPDIR/attach.out"
+  run "$ZMX" list --short
+  [[ "$output" == *"rt-new"* ]]
+}
+
+@test "fish completion exposes both remote spellings" {
+  run "$ZMX" completions fish
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"-s r"* ]]
+  [[ "$output" == *"-l remote"* ]]
 }
 
 @test "bootstrap failure is visible and exits 2" {

@@ -66,6 +66,19 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
     return .{ .port = port, .key = key };
 }
 
+/// Return the first complete line starting with ZMX_CONNECT, ignoring
+/// preceding chatter (SSH banners, daemon-creation notices). A candidate
+/// only counts once its terminating newline has arrived.
+fn findConnectLine(data: []const u8) ?[]const u8 {
+    var rest = data;
+    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        const line = rest[0..nl];
+        if (std.mem.startsWith(u8, line, "ZMX_CONNECT")) return line;
+        rest = rest[nl + 1 ..];
+    }
+    return null;
+}
+
 /// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
 /// Prepends common user bin dirs to PATH since SSH non-interactive sessions
 /// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
@@ -125,12 +138,17 @@ pub fn connectRemote(
     };
     errdefer child.kill(io);
 
-    // Read the bootstrap line from SSH stdout with a bounded 10s wait.
+    // Read SSH stdout with a bounded 10s wait and scan for the bootstrap
+    // line. The pipe can carry unrelated chatter before it — daemon-creation
+    // notices when the gateway creates a new session, SSH banners, MOTDs —
+    // so only a line starting with ZMX_CONNECT is parsed; everything else
+    // is ignored.
     const stdout_fd = child.stdout.?.handle;
-    var buf: [512]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var total: usize = 0;
 
-    outer: while (total < buf.len) {
+    while (total < buf.len) {
+        if (findConnectLine(buf[0..total]) != null) break;
         var poll_fds = [_]lib_posix.pollfd{.{ .fd = stdout_fd, .events = lib_posix.POLL.IN, .revents = 0 }};
         const ready = lib_posix.poll(&poll_fds, ssh_bootstrap_timeout_ms) catch break;
         if (ready == 0) {
@@ -143,12 +161,15 @@ pub fn connectRemote(
         };
         if (n == 0) break;
         total += n;
-        if (std.mem.indexOf(u8, buf[0..total], "\n") != null) break :outer;
     }
 
     if (total == 0) return error.SshNoOutput;
 
-    const result = parseConnectLine(buf[0..total]) catch |err| {
+    const connect_line = findConnectLine(buf[0..total]) orelse {
+        log.err("no ZMX_CONNECT line in SSH output", .{});
+        return error.InvalidConnectLine;
+    };
+    const result = parseConnectLine(connect_line) catch |err| {
         log.err("failed to parse connect line: {s}", .{@errorName(err)});
         return error.InvalidConnectLine;
     };
@@ -581,6 +602,21 @@ test "appendShellQuoted survives round-trip through a shell word" {
     defer buf.deinit(std.testing.allocator);
     try appendShellQuoted(&buf, std.testing.allocator, "two\nlines");
     try std.testing.expectEqualStrings("'two\nlines'", buf.items);
+}
+
+test "findConnectLine ignores preceding chatter" {
+    const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const data = "Welcome to host\r\n" ++
+        "session \"x\" created\n" ++
+        "ZMX_CONNECT udp 60042 " ++ key ++ "\n" ++
+        "later noise\n";
+    const line = findConnectLine(data).?;
+    try std.testing.expect(std.mem.startsWith(u8, line, "ZMX_CONNECT udp 60042 "));
+}
+
+test "findConnectLine rejects unterminated candidate" {
+    // No newline after the candidate: must not match a partial line.
+    try std.testing.expect(findConnectLine("noise\nZMX_CONNECT udp 60") == null);
 }
 
 test "parseConnectLine valid" {
