@@ -1,0 +1,39 @@
+diff --git i/src/lib_vt.zig w/src/lib_vt.zig
+index 28722f0..c4d5570 100644
+--- i/src/lib_vt.zig
++++ w/src/lib_vt.zig
+@@ -66,6 +66,15 @@ pub const sgr = terminal.sgr;
+ pub const size = terminal.size;
+ pub const x11_color = terminal.x11_color;
+ 
++/// Terminal snapshot binary representation and codecs (Snapshot v1).
++///
++/// Embedders that persist or transfer terminal state (multiplexers,
++/// recorders, remote-attach clients) need the encoder and incremental
++/// decoder as Zig values, against Zig-owned `Terminal` instances. The C
++/// API in include/ghostty/vt/snapshot.h serves C embedders through the C
++/// TerminalWrapper; this alias is the Zig-native path.
++pub const snapshot = terminal.snapshot;
++
+ pub const Charset = terminal.Charset;
+ pub const CharsetSlot = terminal.CharsetSlot;
+ pub const CharsetActiveSlot = terminal.CharsetActiveSlot;
+@@ -531,6 +540,18 @@ test {
+ 
+     _ = terminal;
+     _ = @import("lib/main.zig");
++
++    // The public snapshot alias must stay wired to the terminal package's
++    // snapshot module so Zig embedders can reach the Snapshot v1 codecs
++    // without the C TerminalWrapper.
++    comptime {
++        if (snapshot.Decoder != terminal.snapshot.Decoder) {
++            @compileError("lib_vt.snapshot must alias terminal.snapshot");
++        }
++        if (snapshot.Continuation != terminal.snapshot.Continuation) {
++            @compileError("snapshot Continuation re-export drifted");
++        }
++    }
+     @import("std").testing.refAllDecls(input);
+     @import("std").testing.refAllDecls(unicode);
+     if (comptime terminal.options.c_abi) {

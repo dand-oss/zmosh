@@ -1,0 +1,5 @@
+# Fetched dependency trees; reproduction commands live in docs/quic-spike.md
+# and spike/patches/.
+deps/
+zig-cache/
+.zig-cache/
