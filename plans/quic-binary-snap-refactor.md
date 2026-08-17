@@ -118,9 +118,11 @@ retain, an existing TCP connection; they do not recover its channels after
 that connection dies. OpenSSH's old experimental roaming client was disabled
 and then removed in 7.2, and matching server code was never shipped. An
 automatic SSH reconnect or a fresh SSH login is therefore a new transport and
-new channel. A persistent program under tmux, screen, or the zmosh daemon may
-survive, but SSH does not reconstruct its terminal state or prove which output
-was displayed before the break.
+new channel. A program under tmux or screen may survive independently. zmosh
+instead has a detached owner process per live session; it owns that session's
+PTY master and shell child and survives ordinary client disconnect. Neither
+mechanism is SSH channel resumption, and SSH does not reconstruct terminal
+state or prove which output was displayed before the break.
 
 Keep these layers distinct:
 
@@ -134,10 +136,15 @@ Keep these layers distinct:
   outcomes. Session tickets, resumption, and 0-RTT remain disabled in v1 so a
   new connection always receives a fresh SSH-delivered secret and cannot
   replay application work.
-- **zmosh reattachment** preserves the PTY and process in the session daemon,
-  installs a Ghostty binary snapshot, and crosses an explicit output-epoch
-  boundary before live output resumes. This is the actual terminal-session
-  continuation mechanism.
+- **zmosh reattachment** reconnects to the existing detached per-session owner
+  while it is alive, installs a Ghostty binary snapshot, and crosses an
+  explicit output-epoch boundary before live output resumes. This is the
+  actual terminal-session continuation mechanism.
+
+The per-session owner is not a global service or durable store. Its lifetime is
+bounded by the PTY child: it ends when the shell exits, the session is killed,
+or the owner fails, and it does not survive a host reboot. "Persistence" in
+this plan means continuity across client detach and network loss only.
 
 Mosh remains a behavior and qualification reference, not a component. Mosh
 uses SSH bootstrap followed by UDP, synchronizes terminal screen state instead
@@ -149,9 +156,10 @@ session continuity, and remains outside v1.
 
 If a future OpenSSH release ships authenticated reconnection of live channels,
 re-evaluate whether SSH can replace part of the bootstrap/transport layer. It
-still does not replace zmosh's persistent daemon, binary terminal snapshot,
-output epochs, remote command semantics, or C ABI without explicit proof of
-equivalent behavior under loss, migration, and detached reattachment.
+still does not replace zmosh's detached per-session PTY owner, binary terminal
+snapshot, output epochs, remote command semantics, or C ABI without explicit
+proof of equivalent behavior under loss, migration, and detached
+reattachment.
 
 ## Phase Q0: reconcile the checkpoint and freeze recovery
 
