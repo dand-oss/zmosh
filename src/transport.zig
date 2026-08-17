@@ -10,6 +10,8 @@ pub const Channel = enum(u8) {
     reliable_ipc = 1,
     output = 2,
     control = 3,
+    /// Remote one-shot command channel (remote_command.zig envelope).
+    command = 4,
 };
 
 pub const Control = enum(u8) {

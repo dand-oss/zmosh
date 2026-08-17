@@ -15,4 +15,5 @@ comptime {
     _ = @import("serve.zig");
     _ = @import("remote.zig");
     _ = @import("lib.zig");
+    _ = @import("remote_command.zig");
 }

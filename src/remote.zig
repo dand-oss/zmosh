@@ -500,6 +500,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, io: std.Io, session: RemoteSession
 
                 switch (packet.channel) {
                     .heartbeat => {},
+                    // Attach never receives command-channel packets; the
+                    // one-shot client (stage 4/5) handles them.
+                    .command => {},
                     .control => {
                         ack_dirty = true;
                         if (reliable_recv.onReliable(packet.seq) != .accept) continue;

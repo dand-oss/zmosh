@@ -381,6 +381,9 @@ pub const Gateway = struct {
             .output => {
                 // Client never sends output channel packets.
             },
+            // One-shot command channel: the ephemeral command gateway
+            // (stage 4) interprets these; the attach gateway ignores them.
+            .command => {},
             .reliable_ipc, .control => {
                 self.ack_dirty = true;
                 const action = self.reliable_recv.onReliable(packet.seq);

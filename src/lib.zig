@@ -301,6 +301,9 @@ export fn zmosh_poll(session: ?*Session) Status {
 
         switch (packet.channel) {
             .heartbeat => {},
+            // The C API is attach-only; command-channel packets belong to
+            // the one-shot client (stage 4/5).
+            .command => {},
             .control => {
                 s.ack_dirty = true;
                 if (s.reliable_recv.onReliable(packet.seq) != .accept) continue;
