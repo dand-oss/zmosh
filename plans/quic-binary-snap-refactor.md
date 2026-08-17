@@ -105,6 +105,54 @@ packet state machine; Ghostty removes the terminal serialization state
 machine. zmosh must still coordinate connection negotiation, stream roles,
 snapshot installation, output replacement, command completion, and shutdown.
 
+## SSH resumption, Mosh, and terminal continuity
+
+Decision: zmosh does not depend on Mosh or implement Mosh's State
+Synchronization Protocol, but it retains the user-visible properties that
+make Mosh valuable: roaming, tolerance of intermittent connectivity, visible
+staleness, responsive control traffic, and deterministic terminal recovery.
+
+As of OpenSSH 10.4, OpenSSH has no reconnectable interactive-session
+resumption. `ControlMaster` and `ControlPersist` multiplex sessions over, and
+retain, an existing TCP connection; they do not recover its channels after
+that connection dies. OpenSSH's old experimental roaming client was disabled
+and then removed in 7.2, and matching server code was never shipped. An
+automatic SSH reconnect or a fresh SSH login is therefore a new transport and
+new channel. A persistent program under tmux, screen, or the zmosh daemon may
+survive, but SSH does not reconstruct its terminal state or prove which output
+was displayed before the break.
+
+Keep these layers distinct:
+
+- **SSH bootstrap** authenticates the host and user, applies existing SSH
+  configuration, and launches/owns the ephemeral zmosh gateway. It is not the
+  terminal data transport.
+- **QUIC path migration** preserves the same authenticated QUIC connection
+  through address and port changes while its connection state remains alive.
+- **QUIC TLS resumption** would only accelerate creation of a new connection;
+  it would not resume zmosh stream state, terminal state, or uncertain command
+  outcomes. Session tickets, resumption, and 0-RTT remain disabled in v1 so a
+  new connection always receives a fresh SSH-delivered secret and cannot
+  replay application work.
+- **zmosh reattachment** preserves the PTY and process in the session daemon,
+  installs a Ghostty binary snapshot, and crosses an explicit output-epoch
+  boundary before live output resumes. This is the actual terminal-session
+  continuation mechanism.
+
+Mosh remains a behavior and qualification reference, not a component. Mosh
+uses SSH bootstrap followed by UDP, synchronizes terminal screen state instead
+of replaying a byte stream, supports roaming and local prediction, and keeps
+control responsive under loss. zmosh obtains those correctness properties
+from QUIC plus Ghostty Snapshot v1, while also preserving scrollback and parser
+continuation. Predictive local echo is optional latency UX, not required for
+session continuity, and remains outside v1.
+
+If a future OpenSSH release ships authenticated reconnection of live channels,
+re-evaluate whether SSH can replace part of the bootstrap/transport layer. It
+still does not replace zmosh's persistent daemon, binary terminal snapshot,
+output epochs, remote command semantics, or C ABI without explicit proof of
+equivalent behavior under loss, migration, and detached reattachment.
+
 ## Phase Q0: reconcile the checkpoint and freeze recovery
 
 1. Re-run `zig build`, `zig build check`, `zig build test`, full Bats,
@@ -183,6 +231,9 @@ or begin the command gateway.
   generator.
 - Disable session tickets, resumption, and 0-RTT. No application stream is
   accepted before `handshakeConfirmed()` and successful application HELLO.
+  This is QUIC/TLS handshake resumption, not zmosh terminal reattachment; the
+  latter remains supported through a fresh authenticated connection followed
+  by snapshot installation.
 - Require QUIC Retry/address validation before allocating large per-client
   state. Accept only one authenticated connection per ephemeral gateway.
 - Prove that a wrong PSK, wrong identity, replayed Initial, second client, and
@@ -789,6 +840,7 @@ acceptance tests. Push no bead-generated code or branch change automatically.
 
 - No HTTP/3, WebTransport, QUIC DATAGRAM live-output path, KCP, or second QUIC
   implementation.
+- No Mosh dependency, Mosh SSP implementation, or predictive local echo in v1.
 - No runtime custom-UDP fallback after QUIC acceptance.
 - No public C ABI change and no native binary-snapshot callback in v1.
 - No remote list, history, run, wait, switch, wildcard, or multi-session
@@ -882,4 +934,10 @@ from this survey.
 - Ghostty snapshot source: <https://github.com/ghostty-org/ghostty/tree/main/src/terminal/snapshot>
 - Ghostty C snapshot API: <https://github.com/ghostty-org/ghostty/blob/main/include/ghostty/vt/snapshot.h>
 - Paneflow Ghostty integration lessons: <https://github.com/arthjean/paneflow/blob/main/BUILD_WEEK.md>
+- OpenSSH release notes, including 10.4 and removal of experimental roaming in
+  7.2: <https://www.openssh.com/releasenotes.html>
+- OpenSSH `ControlMaster`/`ControlPersist` semantics:
+  <https://man.openbsd.org/ssh_config.5>
+- Mosh behavior and State Synchronization Protocol overview:
+  <https://mosh.org/>
 - zmosh custom fallback commits: `7404914`, `db4661c`
