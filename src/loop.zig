@@ -1219,9 +1219,26 @@ pub const Daemon = struct {
         const file_path = payload[@sizeOf(u32)..][0..path_len];
         const file_content = payload[@sizeOf(u32) + path_len ..];
 
-        // Inject file creation through the PTY so it works over SSH.
-        // Base64-encode content and pipe through printf | base64 -d > file.
-        // Chunk large files to stay under command-line length limits.
+        // Ack convention (v1): empty payload = success; non-empty payload =
+        // the write was rejected atomically and nothing was enqueued.
+        // Shared semantic cap, identical for local and remote writes.
+        if (file_content.len > ipc.max_write_len) {
+            try ipc.appendMessage(gpa, &client.write_buf, .Ack, "input exceeds the 128 KiB write limit");
+            client.has_pending_output = true;
+            std.log.warn("write rejected over limit len={d}", .{file_content.len});
+            return;
+        }
+
+        // Build the COMPLETE PTY input before enqueueing anything so the
+        // write is atomic: either the whole encoded command fits the queue
+        // or nothing is enqueued and the client is told why. The path is
+        // shell-quoted — never interpolated raw into the shell command.
+        const quoted_path = try util.shellQuote(gpa, file_path);
+        defer gpa.free(quoted_path);
+
+        var cmd_buf: std.ArrayList(u8) = .empty;
+        defer cmd_buf.deinit(gpa);
+
         // 48000 is divisible by 3 (clean base64 boundaries) and encodes
         // to ~64KB, well under typical ARG_MAX.
         const chunk_size = 48000;
@@ -1237,28 +1254,38 @@ pub const Daemon = struct {
             defer gpa.free(encoded);
             _ = std.base64.standard.Encoder.encode(encoded, chunk);
 
-            self.queuePtyInput(gpa, "printf '%s' '");
-            self.queuePtyInput(gpa, encoded);
-            if (is_first) {
-                self.queuePtyInput(gpa, "' | base64 -d > '");
-            } else {
-                self.queuePtyInput(gpa, "' | base64 -d >> '");
-            }
-            self.queuePtyInput(gpa, file_path);
-            self.queuePtyInput(gpa, "'");
-            self.queuePtyInput(gpa, "\r");
+            try cmd_buf.appendSlice(gpa, "printf '%s' '");
+            try cmd_buf.appendSlice(gpa, encoded);
+            try cmd_buf.appendSlice(gpa, if (is_first) "' | base64 -d > " else "' | base64 -d >> ");
+            try cmd_buf.appendSlice(gpa, quoted_path);
+            try cmd_buf.appendSlice(gpa, "\r");
 
             offset = end;
             is_first = false;
         }
 
+        // Atomic enqueue: the finished command must fit alongside what is
+        // already queued, or the write is rejected without touching the
+        // queue — a partial command must never reach the PTY.
+        if (self.pty_write_buf.items.len + cmd_buf.items.len > PTY_WRITE_BUF_MAX) {
+            try ipc.appendMessage(gpa, &client.write_buf, .Ack, "session busy; try again");
+            client.has_pending_output = true;
+            std.log.warn("write rejected queue full queued={d} needed={d}", .{
+                self.pty_write_buf.items.len,
+                cmd_buf.items.len,
+            });
+            return;
+        }
+        self.queuePtyInput(gpa, cmd_buf.items);
+
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
         self.has_had_client = true;
-        std.log.debug(
-            "write command len={d} file_path={s}",
-            .{ file_content.len, file_path },
-        );
+        // Privacy: sizes only — never paths, content, or keys.
+        std.log.debug("write accepted len={d} encoded_len={d}", .{
+            file_content.len,
+            cmd_buf.items.len,
+        });
     }
 
     fn handleLabelGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
@@ -1269,7 +1296,8 @@ pub const Daemon = struct {
     }
 
     fn handleLabelSet(self: *Daemon, gpa: std.mem.Allocator, client: *Client, labels: []const u8) !void {
-        std.log.info("handle label set payload={s}", .{labels});
+        // Privacy: log counts only — never label keys or values.
+        std.log.info("handle label set payload_len={d}", .{labels.len});
 
         var kvs = label.LabelIterator.init(labels);
         while (kvs.next()) |kv| {

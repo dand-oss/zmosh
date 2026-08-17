@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const transport = @import("transport.zig");
+const ipc = @import("ipc.zig");
 
 pub const version: u8 = 1;
 pub const header_len: usize = 20;
@@ -251,6 +252,7 @@ fn writeFrameHeaderOnly(dst: []u8, h: Header) void {
 
 pub const BodyError = error{
     InvalidWriteBody,
+    WriteTooLarge,
     InvalidKillBody,
     InvalidTailBody,
     InvalidLabelClearBody,
@@ -268,6 +270,8 @@ pub fn validateRequestBody(op: Opcode, body: []const u8) BodyError!void {
             const path_len = std.mem.readInt(u32, body[0..4], .big);
             if (path_len == 0 or path_len > body.len - 4) return error.InvalidWriteBody;
             if (std.mem.indexOfScalar(u8, body[4 .. 4 + path_len], 0) != null) return error.InvalidWriteBody;
+            // Same semantic cap as the local write command (ipc.max_write_len).
+            if (body.len - 4 - path_len > ipc.max_write_len) return error.WriteTooLarge;
         },
         .kill => {
             // one byte: force=false/true

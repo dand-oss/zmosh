@@ -3,6 +3,12 @@ const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const lib_posix = @import("posix.zig");
 
+/// Shared semantic cap for the write command, local and remote: the
+/// complete encoded PTY input must fit the daemon's 256 KiB queue with
+/// headroom, so file content is limited to 128 KiB. Raising it requires
+/// streamed daemon-side flow control (out of scope for v1).
+pub const max_write_len: usize = 128 * 1024;
+
 pub const Tag = enum(u8) {
     Input = 0,
     Output = 1,
