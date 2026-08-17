@@ -48,6 +48,9 @@ const bash_completions =
     \\      local sessions=$(zmosh list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
+    \\    -r|--remote)
+    \\      COMPREPLY=()
+    \\      ;;
     \\    completions)
     \\      COMPREPLY=($(compgen -W "bash zsh fish nu" -- "$cur"))
     \\      ;;
