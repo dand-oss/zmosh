@@ -81,21 +81,26 @@ load test_helper
   [ "$status" -eq 1 ]
   [[ "$output" == *"exceeds the 128 KiB limit"* ]]
 
-  # A capped write echoes ~170 KiB back through the PTY; under full-suite
-  # load it needs longer than a fixed sleep. Poll, bounded.
-  local i=0
-  while [ "$i" -lt 20 ] && [ ! -f "$BATS_TEST_TMPDIR/exact.out" ]; do
+  # A capped write lands in three chunks (printf|base64 > then >>), so
+  # poll on the final SIZE, not existence — under full-suite load the
+  # chunks drain at very different speeds.
+  local i=0 size=0
+  while [ "$i" -lt 120 ]; do
+    if [ -f "$BATS_TEST_TMPDIR/exact.out" ]; then
+      size=$(wc -c < "$BATS_TEST_TMPDIR/exact.out")
+    fi
+    [ "$size" -eq 131072 ] && break
     sleep 0.5
     i=$((i + 1))
   done
-  [ -f "$BATS_TEST_TMPDIR/exact.out" ]
-  [ "$(wc -c < "$BATS_TEST_TMPDIR/exact.out")" -eq 131072 ]
+  [ "$size" -eq 131072 ]
   [ ! -f "$BATS_TEST_TMPDIR/over.out" ]
 }
 
 @test "daemon rejects a write when the pty queue is full, with exit 1" {
   # A non-reading command fills the queue: the first capped write occupies
   # it, the second cannot fit and must be rejected atomically.
+  cd "$BATS_TEST_TMPDIR"
   run "$ZMX" run wt-full -d bash -c 'sleep 300'
   [ "$status" -eq 0 ]
   sleep 1
