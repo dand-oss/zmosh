@@ -87,6 +87,7 @@ pub const RawHeader = struct {
     opcode: u8,
     status: u8,
     flags: u8,
+    reserved: [3]u8 = .{ 0, 0, 0 },
     request_id: u32,
     total_len: u32,
     offset: u32,
@@ -101,6 +102,7 @@ pub fn parseRawHeader(data: []const u8) error{TooShort}!RawHeader {
         .opcode = data[2],
         .status = data[3],
         .flags = data[4],
+        .reserved = .{ data[5], data[6], data[7] },
         .request_id = std.mem.readInt(u32, data[8..12], .big),
         .total_len = std.mem.readInt(u32, data[12..16], .big),
         .offset = std.mem.readInt(u32, data[16..20], .big),
@@ -114,9 +116,9 @@ pub fn writeRawHeader(dst: *[header_len]u8, h: RawHeader) void {
     dst[2] = h.opcode;
     dst[3] = h.status;
     dst[4] = h.flags;
-    dst[5] = 0;
-    dst[6] = 0;
-    dst[7] = 0;
+    dst[5] = h.reserved[0];
+    dst[6] = h.reserved[1];
+    dst[7] = h.reserved[2];
     std.mem.writeInt(u32, dst[8..12], h.request_id, .big);
     std.mem.writeInt(u32, dst[12..16], h.total_len, .big);
     std.mem.writeInt(u32, dst[16..20], h.offset, .big);
@@ -146,46 +148,43 @@ pub const ParseError = error{
 };
 
 /// Serialize a header (big-endian fields) into exactly 20 bytes.
+/// Delegates to writeRawHeader so the frozen byte offsets exist once.
 pub fn writeHeader(dst: *[header_len]u8, h: Header) void {
-    dst[0] = h.version;
-    dst[1] = @intFromEnum(h.kind);
-    dst[2] = @intFromEnum(h.opcode);
-    dst[3] = @intFromEnum(h.status);
-    dst[4] = h.flags;
-    dst[5] = 0;
-    dst[6] = 0;
-    dst[7] = 0;
-    std.mem.writeInt(u32, dst[8..12], h.request_id, .big);
-    std.mem.writeInt(u32, dst[12..16], h.total_len, .big);
-    std.mem.writeInt(u32, dst[16..20], h.offset, .big);
+    writeRawHeader(dst, .{
+        .version = h.version,
+        .kind = @intFromEnum(h.kind),
+        .opcode = @intFromEnum(h.opcode),
+        .status = @intFromEnum(h.status),
+        .flags = h.flags,
+        .request_id = h.request_id,
+        .total_len = h.total_len,
+        .offset = h.offset,
+    });
 }
 
 /// Parse and validate a header. Field-level validation happens before the
-/// caller ever allocates reassembly state.
+/// caller ever allocates reassembly state. Built on parseRawHeader so the
+/// frozen byte offsets exist once.
 pub fn parseHeader(data: []const u8) ParseError!Header {
-    if (data.len < header_len) return error.TooShort;
+    const raw = parseRawHeader(data) catch return error.TooShort;
+    if (raw.version != version) return error.UnsupportedVersion;
 
-    const ver = data[0];
-    if (ver != version) return error.UnsupportedVersion;
+    const kind = std.enums.fromInt(Kind, raw.kind) orelse return error.InvalidKind;
+    const opcode = std.enums.fromInt(Opcode, raw.opcode) orelse return error.InvalidOpcode;
+    const status = std.enums.fromInt(Status, raw.status) orelse return error.InvalidStatus;
 
-    const kind = std.enums.fromInt(Kind, data[1]) orelse return error.InvalidKind;
-    const opcode = std.enums.fromInt(Opcode, data[2]) orelse return error.InvalidOpcode;
-    const status = std.enums.fromInt(Status, data[3]) orelse return error.InvalidStatus;
-
-    const flags = data[4];
-    if (flags & ~(Flags.FIRST | Flags.LAST | Flags.STREAM) != 0) return error.InvalidFlags;
-
-    if (data[5] != 0 or data[6] != 0 or data[7] != 0) return error.ReservedNotZero;
+    if (raw.flags & ~(Flags.FIRST | Flags.LAST | Flags.STREAM) != 0) return error.InvalidFlags;
+    if (!std.mem.allEqual(u8, &raw.reserved, 0)) return error.ReservedNotZero;
 
     return .{
-        .version = ver,
+        .version = raw.version,
         .kind = kind,
         .opcode = opcode,
         .status = status,
-        .flags = flags,
-        .request_id = std.mem.readInt(u32, data[8..12], .big),
-        .total_len = std.mem.readInt(u32, data[12..16], .big),
-        .offset = std.mem.readInt(u32, data[16..20], .big),
+        .flags = raw.flags,
+        .request_id = raw.request_id,
+        .total_len = raw.total_len,
+        .offset = raw.offset,
     };
 }
 
@@ -476,6 +475,19 @@ pub const ResponseCache = struct {
 /// transport.ReliableSend.max_span).
 pub const command_span: u32 = 16;
 
+pub const CancelError = error{ NotACancel, CancelMismatch };
+
+/// Correlate a parsed cancel frame with the request it aborts: the same
+/// request_id, the same opcode, and an empty FIRST|LAST frame. The cancel
+/// state machine itself (idempotent re-cancel, tail teardown) is gateway
+/// work; this is the wire-level correlation it relies on.
+pub fn validateCancel(request: Header, cancel: Chunk) CancelError!void {
+    if (cancel.header.kind != .cancel) return error.NotACancel;
+    if (cancel.payload.len != 0 or cancel.header.total_len != 0) return error.NotACancel;
+    if (cancel.header.request_id != request.request_id) return error.CancelMismatch;
+    if (cancel.header.opcode != request.opcode) return error.CancelMismatch;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -684,11 +696,24 @@ test "chunk geometry validation" {
 }
 
 fn frameFor(alloc: std.mem.Allocator, id: u32, total: usize, offset: usize, flags: u8, payload: []const u8) ![]u8 {
+    return frameOp(alloc, .request, .send, id, total, offset, flags, payload);
+}
+
+fn frameOp(
+    alloc: std.mem.Allocator,
+    kind: Kind,
+    opcode: Opcode,
+    id: u32,
+    total: usize,
+    offset: usize,
+    flags: u8,
+    payload: []const u8,
+) ![]u8 {
     const buf = try alloc.alloc(u8, header_len + payload.len);
     writeHeader(buf[0..header_len], .{
         .version = version,
-        .kind = .request,
-        .opcode = .send,
+        .kind = kind,
+        .opcode = opcode,
         .status = .ok,
         .flags = flags,
         .request_id = id,
@@ -904,32 +929,86 @@ test "response cache: exact id hit, retains opcode/status/payload" {
     try testing.expectEqual(@as(usize, 0), over.payload.len);
 }
 
-test "cancel frame parses with same id and opcode" {
+test "empty tail request and its cancel both pass chunk validation" {
     const alloc = testing.allocator;
-    var r = Reassembler{};
-    defer r.deinit(alloc);
 
-    const req = try frameFor(alloc, 10, 4, 0, Flags.FIRST | Flags.LAST, "tail");
+    // Empty .tail request: total_len=0, FIRST|LAST, no payload.
+    const req = try frameOp(alloc, .request, .tail, 55, 0, 0, Flags.FIRST | Flags.LAST, "");
     defer alloc.free(req);
-    _ = try r.start(alloc, (try parseChunk(req)).header);
-    try testing.expectEqual(OnChunkResult.complete, try r.onChunk(req));
+    const req_chunk = try parseChunk(req);
+    try testing.expectEqual(Opcode.tail, req_chunk.header.opcode);
+    try testing.expectEqual(@as(usize, 0), req_chunk.header.total_len);
+    try testing.expectEqual(@as(usize, 0), req_chunk.payload.len);
 
-    // Cancel: empty, FIRST|LAST, offset 0, same request_id + opcode.
-    var buf: [header_len]u8 = undefined;
-    writeHeader(&buf, .{
+    // Cancel: same id + opcode, empty, FIRST|LAST.
+    const cancel = try frameOp(alloc, .cancel, .tail, 55, 0, 0, Flags.FIRST | Flags.LAST, "");
+    defer alloc.free(cancel);
+    const cancel_chunk = try parseChunk(cancel);
+    try testing.expectEqual(Kind.cancel, cancel_chunk.header.kind);
+    try validateCancel(req_chunk.header, cancel_chunk);
+}
+
+test "cancel with wrong id or opcode is rejected by correlation" {
+    const alloc = testing.allocator;
+    const req = try frameOp(alloc, .request, .tail, 55, 0, 0, Flags.FIRST | Flags.LAST, "");
+    defer alloc.free(req);
+    const req_chunk = try parseChunk(req);
+
+    // Wrong request id.
+    const wrong_id = try frameOp(alloc, .cancel, .tail, 56, 0, 0, Flags.FIRST | Flags.LAST, "");
+    defer alloc.free(wrong_id);
+    try testing.expectError(error.CancelMismatch, validateCancel(req_chunk.header, try parseChunk(wrong_id)));
+
+    // Wrong opcode.
+    const wrong_op = try frameOp(alloc, .cancel, .send, 55, 0, 0, Flags.FIRST | Flags.LAST, "");
+    defer alloc.free(wrong_op);
+    try testing.expectError(error.CancelMismatch, validateCancel(req_chunk.header, try parseChunk(wrong_op)));
+
+    // A cancel carrying a payload is not a cancel.
+    const nonempty = try frameOp(alloc, .cancel, .tail, 55, 1, 0, Flags.FIRST | Flags.LAST, "x");
+    defer alloc.free(nonempty);
+    try testing.expectError(error.NotACancel, validateCancel(req_chunk.header, try parseChunk(nonempty)));
+}
+
+test "tail response geometry: initial, stream, terminal ok, terminal cancelled" {
+    const alloc = testing.allocator;
+
+    // Initial acceptance: response, ok, empty, FIRST|LAST, no STREAM.
+    const initial = try frameOp(alloc, .response, .tail, 77, 0, 0, Flags.FIRST | Flags.LAST, "");
+    defer alloc.free(initial);
+    const initial_chunk = try parseChunk(initial);
+    try testing.expectEqual(Kind.response, initial_chunk.header.kind);
+    try testing.expectEqual(Status.ok, initial_chunk.header.status);
+    try testing.expectEqual(@as(u8, 0), initial_chunk.header.flags & Flags.STREAM);
+
+    // Stream data: response, STREAM flag set, raw bytes as payload.
+    const data = try frameOp(alloc, .response, .tail, 77, 4, 0, Flags.FIRST | Flags.LAST | Flags.STREAM, "out\n");
+    defer alloc.free(data);
+    const data_chunk = try parseChunk(data);
+    try testing.expect(data_chunk.header.flags & Flags.STREAM != 0);
+    try testing.expectEqualStrings("out\n", data_chunk.payload);
+
+    // Terminal on normal EOF: response, ok, empty.
+    const term_ok = try frameOp(alloc, .response, .tail, 77, 0, 0, Flags.FIRST | Flags.LAST, "");
+    defer alloc.free(term_ok);
+    try testing.expectEqual(Status.ok, (try parseChunk(term_ok)).header.status);
+
+    // Terminal on cancellation: response, cancelled, empty. Responses may
+    // carry nonzero status (requests may not).
+    var cancelled_hdr: [header_len]u8 = undefined;
+    writeHeader(&cancelled_hdr, .{
         .version = version,
-        .kind = .cancel,
+        .kind = .response,
         .opcode = .tail,
-        .status = .ok,
+        .status = .cancelled,
         .flags = Flags.FIRST | Flags.LAST,
-        .request_id = 10,
-        .total_len = 4,
+        .request_id = 77,
+        .total_len = 0,
         .offset = 0,
     });
-    const cancel = try parseHeader(&buf);
-    try testing.expectEqual(Kind.cancel, cancel.kind);
-    try testing.expectEqual(@as(u32, 10), cancel.request_id);
-    try testing.expectEqual(Opcode.tail, cancel.opcode);
+    const cancelled = try parseChunk((&cancelled_hdr)[0..header_len]);
+    try testing.expectEqual(Status.cancelled, cancelled.header.status);
+    try testing.expectEqual(@as(usize, 0), cancelled.payload.len);
 }
 
 test "raw header echoes unknown opcode for error responses" {

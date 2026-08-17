@@ -13,8 +13,9 @@ The four non-negotiable semantic corrections are:
 - tail follows future output only and never sends .Init;
 - only write may create a missing session;
 - kill --force performs stale-socket cleanup even without a reachable daemon;
-- command chunking uses a maximum of 16 in-flight packets below the transport
-  ACK window of 32.
+- command traffic uses a 16-sequence span measured from the oldest
+  unacknowledged packet (below the transport ACK window of 32); a count-only
+  in-flight limit cannot protect a lost early packet.
 
 No merge or push to master is allowed until every gate passes and landing is
 explicitly authorized.
@@ -23,7 +24,6 @@ explicitly authorized.
 
 - Frozen upstream base: cd88d1b, zmx v0.7.0, Zig 0.16.0.
 - Local branch: replant-zmx0.7.
-- Current tip: 01b2f64, following the Stage 3 framing checkpoint ba71871.
 - master remains at 6f39fe1 and is untouched.
 - Stages 0, 1, and 2 are complete.
 - Stage 3 framing is implemented and remains the active review gate.
@@ -139,7 +139,9 @@ unsupported_opcode=3, session_not_found=4, session_unresponsive=5, timeout=6,
 too_large=7, cancelled=8, backpressure=9, and internal_error=255.
 
 Limit command payload per packet to transport.max_payload_len minus 20, which
-is 1080 bytes. Limit total command/write data to 64 MiB. Validate version,
+is 1080 bytes. The generic envelope limit is 64 MiB; the write command's v1
+semantic limit is a shared 128 KiB (local and remote), raised only if the
+daemon grows streamed flow control. Validate version,
 kind, status, opcode, flags, reserved bytes, alignment, total length, offset
 overflow, FIRST/LAST placement, body shape, and maximum size before allocation.
 
@@ -167,7 +169,7 @@ flow control, and duplicate request IDs without repeated execution.
 This phase is a review gate. Do not begin gateway or CLI work until its tests
 and implementation are accepted.
 
-### Phase 4: Ephemeral command gateway
+### Phase 4: Ephemeral command gateway (umbrella: zmosh-bu1)
 
 Add hidden command mode:
 
@@ -190,14 +192,40 @@ cleanup; a live kill succeeds only after socket EOF confirms shutdown.
 
 tail requires an existing session, connects as an ordinary daemon client,
 never sends .Init, and forwards future .Output only. It remains alive until
-cancelled, the session ends, or permanent loss occurs. Strip ANSI with the
-existing zmx helper, keep stdout clean, write reconnect diagnostics to stderr,
+cancelled, the session ends, or permanent loss occurs. The gateway forwards
+raw daemon output and never rewrites it; the CLIENT strips ANSI with the
+existing zmx helper. Keep stdout clean, write reconnect diagnostics to stderr,
 pause daemon reads when the output window is full, bound queued output, and
 return backpressure instead of unbounded growth.
 
 Handle SIGINT and SIGTERM by sending cancellation and closing the daemon
 socket. Use a short graceful-shutdown deadline, then terminate and reap the
 SSH child if necessary.
+
+#### Phase 4A: shared local write safety
+
+Depends on Phase 3. One limit for local and remote write (128 KiB v1),
+complete encoded PTY input built before enqueue, atomic rejection when
+queue space is insufficient, no ACK of partial or dropped data, path
+quoting via util.shellQuote, redacted logging (lengths/counts only —
+never paths, labels, keys, or file data). Redirect gateway stdout to
+/dev/null after the bootstrap line instead of closing it.
+
+#### Phase 4B: finite command executor and encrypted command gateway
+
+Depends on 4A. The serve --command gateway and finite command execution
+per the semantic matrix below.
+
+#### Phase 4C: ordered tail streaming, cancellation, backpressure
+
+Depends on 4B. Stream frames in transport-sequence order, cancellation
+state machine (idempotent), bounded output queues with backpressure.
+
+#### Phase 4D: encrypted loopback, timeout and orphan-process tests
+
+Depends on 4C. End-to-end encrypted loopback tests, timeout behavior,
+and no-orphan-process verification. The Phase 4 umbrella completes with
+4D; Phase 5 depends on it.
 
 ### Phase 5: Remote CLI parity
 
@@ -313,29 +341,13 @@ results, skipped platform checks, ledger summary, and remaining macOS work.
 - Existing sessions ignore forwarded creation commands; only new sessions run
   daemon.command.
 
-## Phase checkpoint split (review round on Stage 3)
-
-Phase 3R (this checkpoint, tip 0795745): sequence-span flow control in
-ReliableSend, raw malformed-header responses, frozen cancel/tail wire
-contracts, typed response cache (opcode+status+payload), duplicate
-SendWindow removed.
-
-- Phase 4A: shared local write safety — one limit for local and remote
-  write (128 KiB v1), complete encoded PTY input built before enqueue,
-  atomic rejection when queue space is insufficient, no ACK of partial or
-  dropped data, path quoting via util.shellQuote, redacted logging
-  (lengths/counts only, never paths, labels, keys, or file data).
-- Phase 4B: finite command executor and encrypted command gateway.
-- Phase 4C: ordered tail streaming, cancellation, backpressure.
-- Phase 4D: encrypted loopback tests, timeout and orphan-process tests.
-
 ## Command-semantic matrix (frozen)
 
 | opcode | creates session | IPC traffic | success signal | timeout | success output |
 |---|---|---|---|---|---|
 | send | no (session_not_found) | .Send | complete IPC write | 30 s | none (local parity) |
 | print | no | .Output | write queued | 30 s | none |
-| write | yes (daemon-ensure, then .Write) | .Write → .Ack | .Ack received | 30 s | none |
+| write | yes (daemon-ensure, then .Write) | .Write → .Ack | .Ack received | 30 s | `file created PATH` via the response payload, plus `session "NAME" created` when the session is new — gateway stdout is redirected, so parity travels through the response |
 | label_get | no | .LabelGet → .LabelData | .LabelData | 30 s | matches local get |
 | label_set | no | .LabelSet → .Ack | .Ack | 30 s | matches local set |
 | label_clear | no | .LabelClear → .Ack | .Ack | 30 s | matches local clear |
