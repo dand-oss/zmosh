@@ -203,7 +203,12 @@ or begin the command gateway.
   one-client-per-gateway policy including authenticated second-client
   rejection.
 - Q5 owns visible disconnect/reconnect behavior and output replacement.
-- DPLPMTUD is deferred entirely: v1 fixes a 1200-byte UDP payload.
+- DPLPMTUD is deferred entirely: v1 fixes the UDP payload — Initial
+  datagram minimum 1200 bytes, fixed maximum UDP payload 1232 bytes
+  (varint length-field convergence above the Initial floor; within the
+  IPv6-minimum-MTU payload), every emitted datagram checked ≤ 1232 at
+  runtime (oversized emission is a local error, the datagram freed),
+  oversized inbound datagrams discarded and counted.
 
 ### Independent Ghostty snapshot API prerequisite
 
@@ -396,9 +401,12 @@ or begin the command gateway.
 
 ### Transport proof
 
-- v1 fixes the UDP payload at 1200 bytes and never emits an IP-fragmenting
+- v1 fixes the UDP payload: Initial datagram minimum 1200 bytes, fixed
+  maximum UDP payload 1232 bytes; it never emits an IP-fragmenting
   datagram. DPLPMTUD is deferred entirely; paths that cannot carry the
-  1200-byte QUIC minimum fail loudly.
+  1200-byte QUIC minimum fail loudly. Every emitted datagram is checked
+  ≤ 1232 at runtime (oversized emission is a local error, the datagram
+  freed); oversized inbound datagrams are discarded and counted.
 - Prove stream isolation under loss: delayed snapshot/output bytes must not
   block input or control on another stream.
 - Prove connection migration after source-port and source-address changes
@@ -438,7 +446,9 @@ or begin the command gateway.
 
 The deterministic harness must inject loss, duplication, reordering,
 corruption, delay, NAT rebinding, a ten-second outage, and a slow receiver,
-and must fail loudly on paths that cannot carry the fixed 1200-byte payload.
+and must fail loudly on paths that cannot carry the fixed 1200-byte
+Initial minimum (emissions remain capped at the fixed 1232-byte maximum
+UDP payload).
 It must demonstrate successful PSK handshake, stream echo, timer recovery,
 migration, bounded memory, reset observability, and clean shutdown. Process
 cleanup (no orphan socket, SSH child, or gateway process) is proven at Q2
@@ -486,6 +496,75 @@ After spike approval:
    inherited SSH stderr, isolated stdin, shell quoting, ownership, and reaping.
 7. Add connection diagnostics using counters and durations only. Do not log
    session content, command bodies, labels, paths, snapshot bytes, or secrets.
+
+### Checkpoint-1 correction contract (frozen 2026-08-18)
+
+The checkpoint-1 review accepted the 1232-byte cap (no quicz fork
+change, no repin) and froze this contract for the correction commit.
+`src/quic_transport.zig` implements all of it:
+
+1. **Retry boundary.** Client creation and validated-server-candidate
+   creation are split. `PendingRetrySlot` and the token policy stay
+   ABOVE the adapter — the gateway (or test) classifies, adopts, and
+   commits. The server candidate exists only after the Retry
+   boundary: `validatePeerAddress()`, the stored exchange installed
+   via `issueRetryDatagram(now, odcid, client_scid, retry_scid,
+   token)` (its returned reconstruction datagram is freed and never
+   sent), Initial secrets derived from the **Retry SCID** — never the
+   first-flight ODCID. The client processes Retry datagrams through
+   the true quicz sequence (`processRetryDatagram`,
+   `retryReceived`, `resetInitialCryptoSendForRetry`, wipe and
+   re-derive Initial secrets from the recorded Retry SCID). Initial
+   output stays on the lifecycle `pollProtectedLongDatagram()` entry
+   in both phases — the connection-level crypto poll bypasses
+   lifecycle recovery-timer arming — with the Retry SCID as
+   destination and the re-derived keys; the connection auto-inserts
+   its stored Retry token. The ODCID and the post-Retry key DCID are
+   recorded separately.
+2. **Complete Retry transaction in the gate test**: classify
+   `.validated` → create and privately adopt the candidate
+   (capacity-one registry; private ownership is not publication) →
+   authenticate the follow-up Initial → **`slot.commit()` before
+   publication or echo**; assert the slot clears and the replay
+   count advances exactly once (0 → 1); any failure destroys the
+   candidate without committing.
+3. **Frozen production parameters** (module constants, no
+   caller-tunable knobs): 4 MiB connection credit, 2 KiB per-stream
+   initial credit, four bidirectional streams, eight unidirectional
+   streams, 24-hour idle timeout, 1200-byte Initial minimum,
+   1232-byte maximum UDP payload. The gate test asserts the
+   negotiated parameters on both sides.
+4. **Fixed cap invariant**: `max_udp_payload = 1232` as a constant;
+   no `max_datagram_size` option. Every EMITTED datagram is checked
+   at runtime — an oversized emission is a local error and the
+   datagram is freed (no debug-only assertions). Oversized INBOUND
+   datagrams are discarded and counted.
+5. **Symmetric error handling through quicz's own processors**: route
+   verification first, then Initial via
+   `processProtectedLongDatagramOrClose()`, Handshake via
+   `processProtectedHandshakeDatagramWithInstalledKeysOrClose()`,
+   Short via the existing UpdatePath OrClose entry. If `InvalidPacket`
+   leaves the connection active → network-originated, discarded and
+   counted. If the OrClose processor transitions the connection
+   active → closing → count a protocol violation and let the queued
+   close leave through `pollOutbound()`. Local errors (`OutOfMemory`,
+   `Internal`) propagate loudly. Outbound polling never silently
+   swallows encoding/invariant errors; only polling a closed
+   endpoint is a tolerated non-event.
+6. **Wipe and teardown**: one internal `wipeSecrets()` path (backend
+   secureWipe + Initial-secrets wipe) called by `destroy()`; the gate
+   test exercises that exact path and asserts both secret sets zeroed
+   while the transport exists. Close states follow the state
+   machine: the initiator `.closing`, the peer receiving
+   CONNECTION_CLOSE `.draining` (both `.closed` only after their
+   close deadlines).
+7. **Diagnostics and retained state**: no `handshake_nanos` until
+   poll-loop integration owns authoritative timing; the transport
+   retains only `is_server`, its SCID, and the ODCID/Retry-SCID
+   bookkeeping — never the whole `Options` (no borrowed PSK
+   pointer).
+8. **Minor**: no `if (true)` scaffolding; the loopback test performs
+   a real bidirectional echo.
 
 Do not remove the custom modules until the PSK QUIC loopback, migration, and
 shutdown tests pass in zmosh. Then remove custom XChaCha framing, packet ACKs,
