@@ -46,6 +46,13 @@ pub fn build(b: *std.Build) void {
         dep.module("ghostty-vt"),
     );
 
+    // Q2: QUIC transport on the immutable reviewed pin (zmosh-quic-q1-5).
+    const quicz_dep = b.dependency("quicz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("quicz", quicz_dep.module("quicz"));
+
     // Run
     {
         const run_step = b.step("run", "Run the app");
@@ -83,6 +90,11 @@ pub fn build(b: *std.Build) void {
             "ghostty-vt",
             test_dep.module("ghostty-vt"),
         );
+        const quicz_test_dep = b.dependency("quicz", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        test_module.addImport("quicz", quicz_test_dep.module("quicz"));
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,
@@ -134,6 +146,12 @@ pub fn build(b: *std.Build) void {
                 .@"emit-macos-app" = false,
             })) |release_dep| {
                 release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
+            }
+            if (b.lazyDependency("quicz", .{
+                .target = resolved,
+                .optimize = .ReleaseSafe,
+            })) |release_quicz| {
+                release_mod.addImport("quicz", release_quicz.module("quicz"));
             }
 
             // const is_local_macos = resolved.result.os.tag == .macos;

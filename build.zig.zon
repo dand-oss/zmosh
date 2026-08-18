@@ -8,6 +8,10 @@
             .url = "git+https://github.com/ghostty-org/ghostty/#aa21caeaa3a2feb6ef1251d20bd81b52f1da0940",
             .hash = "ghostty-1.3.2-dev-5UdBCw7jLQVbzMzfCu-BNb7P4o6P3L9WjORwuelawrt6",
         },
+        .quicz = .{
+            .url = "git+https://github.com/dand-oss/quicz#d854133d39b8d024e0b19ac34f84ef821d7766b9",
+            .hash = "quicz-0.1.0-g2J9778GlwAog98LXhKJ_bcuXttrr2432UdJ9T3scPsp",
+        },
     },
     .paths = .{
         "build.zig",

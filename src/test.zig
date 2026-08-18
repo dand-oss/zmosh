@@ -11,6 +11,7 @@ comptime {
     _ = @import("crypto.zig");
     _ = @import("udp.zig");
     _ = @import("transport.zig");
+    _ = @import("quic_transport.zig");
     // Re-added as each module is ported to 0.16 (stage 2 slices):
     _ = @import("serve.zig");
     _ = @import("remote.zig");
