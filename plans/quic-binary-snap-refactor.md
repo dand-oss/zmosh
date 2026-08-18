@@ -457,8 +457,10 @@ no-regression-versus-`6f4c4d1` criterion (round-4 rules above); if a
 hard gate fails, stop and follow the fallback section; do not weaken
 the gate during implementation.
 
-Checkpoint: spike report committed and pushed; implementation remains locked
-pending review.
+Checkpoint: Q1 approved and closed 2026-08-18 — spike report committed
+and pushed; the reviewed SHA is tagged immutable `zmosh-quic-q1-5`
+(peel-verified at `d854133`); implementation is unlocked and Q2 begins
+from that pin.
 
 ## Phase Q2: production QUIC foundation
 
