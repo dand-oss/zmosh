@@ -59,21 +59,54 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
 /// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
 /// Prepends common user bin dirs to PATH since SSH non-interactive sessions
 /// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
-pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8) !RemoteSession {
+fn appendShellQuoted(out: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
+    try out.append(alloc, '\'');
+    for (arg) |ch| {
+        if (ch == '\'') try out.appendSlice(alloc, "'\\''") else try out.append(alloc, ch);
+    }
+    try out.append(alloc, '\'');
+}
+
+fn appendRemoteBinary(out: *std.ArrayList(u8), alloc: std.mem.Allocator, binary: []const u8) !void {
+    const home_prefix = "$HOME/";
+    if (std.mem.startsWith(u8, binary, home_prefix)) {
+        try out.appendSlice(alloc, "\"$HOME\"/");
+        try appendShellQuoted(out, alloc, binary[home_prefix.len..]);
+        return;
+    }
+    try appendShellQuoted(out, alloc, binary);
+}
+
+pub fn connectRemote(
+    alloc: std.mem.Allocator,
+    host: []const u8,
+    session: []const u8,
+    command: ?[][]const u8,
+) !RemoteSession {
     const term = posix.getenv("TERM") orelse "xterm-256color";
     const colorterm = posix.getenv("COLORTERM");
-    const remote_cmd = if (colorterm) |ct|
-        try std.fmt.allocPrint(
-            alloc,
-            "TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ term, ct, session },
-        )
-    else
-        try std.fmt.allocPrint(
-            alloc,
-            "TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ term, session },
-        );
+    const remote_binary = posix.getenv("ZMOSH_REMOTE_BIN") orelse "zmosh";
+    var remote_cmd_buf: std.ArrayList(u8) = .empty;
+    defer remote_cmd_buf.deinit(alloc);
+    try remote_cmd_buf.appendSlice(alloc, "TERM=");
+    try remote_cmd_buf.appendSlice(alloc, term);
+    try remote_cmd_buf.append(alloc, ' ');
+    if (colorterm) |ct| {
+        try remote_cmd_buf.appendSlice(alloc, "COLORTERM=");
+        try remote_cmd_buf.appendSlice(alloc, ct);
+        try remote_cmd_buf.append(alloc, ' ');
+    }
+    try remote_cmd_buf.appendSlice(alloc, "PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" ");
+    try appendRemoteBinary(&remote_cmd_buf, alloc, remote_binary);
+    try remote_cmd_buf.appendSlice(alloc, " serve ");
+    try appendShellQuoted(&remote_cmd_buf, alloc, session);
+    if (command) |args| {
+        for (args) |arg| {
+            try remote_cmd_buf.append(alloc, ' ');
+            try appendShellQuoted(&remote_cmd_buf, alloc, arg);
+        }
+    }
+    const remote_cmd = try remote_cmd_buf.toOwnedSlice(alloc);
     defer alloc.free(remote_cmd);
     const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
     var child = std.process.Child.init(&argv, alloc);
@@ -501,4 +534,17 @@ test "parseConnectLine invalid prefix" {
 
 test "parseConnectLine unsupported protocol" {
     try std.testing.expectError(error.UnsupportedProtocol, parseConnectLine("ZMX_CONNECT tcp 60042 key\n"));
+}
+
+test "remote bootstrap honors a safely quoted explicit binary" {
+    const alloc = std.testing.allocator;
+    var command: std.ArrayList(u8) = .empty;
+    defer command.deinit(alloc);
+
+    try appendRemoteBinary(&command, alloc, "$HOME/.local/bin/zmosh");
+    try std.testing.expectEqualStrings("\"$HOME\"/'.local/bin/zmosh'", command.items);
+
+    command.clearRetainingCapacity();
+    try appendRemoteBinary(&command, alloc, "/tmp/zmosh test/zmosh");
+    try std.testing.expectEqualStrings("'/tmp/zmosh test/zmosh'", command.items);
 }

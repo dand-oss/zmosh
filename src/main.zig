@@ -421,7 +421,8 @@ pub fn main() !void {
 
         // Remote attach via encrypted UDP
         if (remote_host) |host| {
-            const session = remote.connectRemote(alloc, host, sesh) catch |err| {
+            const command = if (command_args.items.len > 0) command_args.items else null;
+            const session = remote.connectRemote(alloc, host, sesh, command) catch |err| {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
                 return;
             };
@@ -455,6 +456,9 @@ pub fn main() !void {
         return attach(&daemon);
     } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(alloc);
+        while (args.next()) |arg| try command_args.append(alloc, arg);
         const sesh = try getSeshName(alloc, session_name);
         defer alloc.free(sesh);
 
@@ -470,7 +474,7 @@ pub fn main() !void {
             .session_name = sesh,
             .socket_path = undefined,
             .pid = undefined,
-            .command = null,
+            .command = if (command_args.items.len > 0) command_args.items else null,
             .cwd = cwd,
             .created_at = @intCast(std.time.nanoTimestamp()),
         };
@@ -571,7 +575,7 @@ fn help() !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
-        \\  [a]ttach -r <host> <name>      Attach to remote session via UDP
+        \\  [a]ttach -r <host> <name> [command...]  Attach to remote session via UDP
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [s]erve <name>                 Start UDP gateway for remote access
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
