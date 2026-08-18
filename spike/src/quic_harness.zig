@@ -629,6 +629,70 @@ pub const Pair = struct {
         };
     }
 
+    /// 1-RTT send keys for the given side (test crafting of protected
+    /// PATH_RESPONSE datagrams). Null before the key schedule derives
+    /// application secrets.
+    pub fn serverKeyForTest(self: *Pair) protection.Aes128PacketProtectionKeys {
+        return self.oneRttSendKeys(false) orelse @panic("no server 1-RTT keys");
+    }
+
+    /// Peer (client) send keys as seen by the server.
+    pub fn clientKeyForTest(self: *Pair) protection.Aes128PacketProtectionKeys {
+        return self.peerKeyForTest() orelse @panic("no client 1-RTT keys");
+    }
+
+    fn peerKeyForTest(self: *Pair) ?protection.Aes128PacketProtectionKeys {
+        const backend = self.client_backend;
+        const ks = &backend.hs.key_schedule;
+        if (!ks.app_secret_derived) return null;
+        // The server decrypts client packets with the client's app
+        // traffic secret (its peer key).
+        return protection.deriveForCipher(ks.client_app_traffic_secret, .v1, .aes_128_gcm);
+    }
+
+    /// Poll one short datagram from the given side without delivering it.
+    pub fn pollShortTolerantForTest(self: *Pair, client_side: bool) !?[]u8 {
+        return self.pollShortTolerant(client_side);
+    }
+
+    /// Deliver one protected short datagram through the canonical
+    /// address-neutral validated feed for the given path; returns the
+    /// committed route result (null when no commit happened). Errors
+    /// from frame processing propagate.
+    pub fn deliverViaUpdatePathForTest(
+        self: *Pair,
+        from_client: bool,
+        path: quicz.endpoint.Udp4Tuple,
+        data: []const u8,
+    ) !?quicz.endpoint.RouteResult {
+        const lifecycle = if (from_client) self.server_lifecycle else self.client_lifecycle;
+        const conn = if (from_client) self.server else self.client;
+        const handle = if (from_client) server_handle else client_handle;
+        const res = try lifecycle.processRoutedProtectedShortDatagramWithInstalledKeysAndUpdatePathOrCloseAddress(
+            handle,
+            conn,
+            path.toUdp(),
+            self.now_nanos,
+            data,
+        );
+        return res.updated_route;
+    }
+
+    /// Drive decoded frame bytes directly on a connection with NO
+    /// arrival hint (fail-closed null-hint proof).
+    pub fn driveDecodedFramesNoHint(
+        self: *Pair,
+        server_side: bool,
+        data: [8]u8,
+    ) !void {
+        const conn = if (server_side) self.server else self.client;
+        var frame_buf: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&frame_buf);
+        try quicz.frame.encodeFrame(&w, .{ .path_response = .{ .data = data } });
+        conn.setReceivePathHint(null);
+        try conn.processDecodedFramesForTest(w.buffered());
+    }
+
     /// Opportunistic 1-RTT short-datagram poll with the same tolerance.
     fn pollShortTolerant(self: *Pair, client_side: bool) !?[]u8 {
         const lifecycle = if (client_side) self.client_lifecycle else self.server_lifecycle;

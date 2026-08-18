@@ -517,3 +517,170 @@ test "emitted datagrams respect the configured maximum size" {
     try testing.expect(p.wire.max_datagram_seen <= 8192);
     try testing.expect(p.wire.max_datagram_seen >= 1200);
 }
+
+/// Protected PATH_RESPONSE datagram builder for the fail-closed proofs:
+/// fresh packet number per delivery (except where replay is the point).
+fn makeResponse(
+    alloc: std.mem.Allocator,
+    pn: u64,
+    data: [8]u8,
+    keys: quicz.protection.Aes128PacketProtectionKeys,
+) ![]u8 {
+    var payload: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&payload);
+    try quicz.frame.encodeFrame(&w, .{ .path_response = .{ .data = data } });
+    return quicz.protection.protectShortPacketAes128(alloc, .{
+        .dcid = &harness.server_scid,
+        .spin_bit = false,
+        .key_phase = false,
+        .packet_number = pn,
+    }, try quicz.packet.encodePacketNumberForHeader(pn, null), keys, w.buffered());
+}
+
+test "fail-closed: null hint, wrong path, one commit, replay, stale" {
+    const alloc = testing.allocator;
+
+    // ── (1) NULL HINT on its own fresh pair ──────────────────────────
+    {
+        var p = try Pair.create(alloc, try randomPsk());
+        defer p.destroy();
+        try p.completeHandshake();
+
+        const data1 = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+        const bound = p.server_path;
+        try p.server.sendPathChallengeForPath(data1, bound.toUdp());
+        const ch = (try p.pollShortTolerantForTest(false)) orelse return error.NoChallenge;
+        defer alloc.free(ch);
+        try p.deliver(false, ch);
+        try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(bound.toUdp()));
+
+        // Decoded frames driven directly on the connection: no feed, no
+        // arrival hint — the bound challenge must NOT be consumed.
+        try p.driveDecodedFramesNoHint(true, data1);
+        try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(bound.toUdp()));
+    }
+
+    // ── (2)–(5) the wire-level matrix on a second fresh pair ────────
+    var opts = try randomPsk();
+    opts.migration_disabled = false;
+    var p = try Pair.create(alloc, opts);
+    defer p.destroy();
+    try p.completeHandshake();
+
+    const s = try p.client.openStream();
+    if (try p.clientToServer(s, "seed", false)) |x| alloc.free(x);
+    const old_path = p.server_path;
+    const candidate = quicz.endpoint.Udp4Tuple{
+        .local = old_path.local,
+        .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 2 }, 50_001),
+    };
+    const other = quicz.endpoint.Udp4Tuple{
+        .local = old_path.local,
+        .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 3 }, 50_002),
+    };
+    const client_keys = p.clientKeyForTest();
+
+    const data2 = [_]u8{ 0x21, 0x43, 0x65, 0x87, 0x78, 0x56, 0x34, 0x12 };
+    try p.server.sendPathChallengeForPath(data2, candidate.toUdp());
+    const ch2 = (try p.pollShortTolerantForTest(false)) orelse return error.NoChallenge;
+    defer alloc.free(ch2);
+    try p.deliver(false, ch2);
+    try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(candidate.toUdp()));
+
+    // (2) WRONG PATH: ignored, still outstanding, no commit.
+    const wrong_dg = try makeResponse(alloc, 1, data2, client_keys);
+    defer alloc.free(wrong_dg);
+    try testing.expect((try p.deliverViaUpdatePathForTest(true, other, wrong_dg)) == null);
+    try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(candidate.toUdp()));
+
+    // (3) CANDIDATE PATH: consumed once, committed exactly once.
+    const good_dg = try makeResponse(alloc, 2, data2, client_keys);
+    defer alloc.free(good_dg);
+    try testing.expect((try p.deliverViaUpdatePathForTest(true, candidate, good_dg)) != null);
+    try testing.expectEqual(@as(usize, 0), p.server.outstandingPathChallengeCountForPath(candidate.toUdp()));
+
+    // (4) EXACT-DATAGRAM REPLAY (same packet number): dedup, no commit.
+    try testing.expect((try p.deliverViaUpdatePathForTest(true, candidate, good_dg)) == null);
+
+    // (5) FRESH STALE and WRONG-DATA responses (fresh packet numbers)
+    //     on a FRESH pair: the OrClose entry queues a close on frame
+    //     errors, so this pair is isolated per the frozen rule.
+    {
+        var opts5 = try randomPsk();
+        opts5.migration_disabled = false;
+        var p5 = try Pair.create(alloc, opts5);
+        defer p5.destroy();
+        try p5.completeHandshake();
+        const s5 = try p5.client.openStream();
+        if (try p5.clientToServer(s5, "seed5", false)) |x| alloc.free(x);
+        const cand5 = quicz.endpoint.Udp4Tuple{
+            .local = p5.server_path.local,
+            .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 2 }, 50_001),
+        };
+        const keys5 = p5.clientKeyForTest();
+
+        // STALE: no challenge exists — rejected, nothing committed.
+        const stale_dg = try makeResponse(alloc, 1, [_]u8{1} ** 8, keys5);
+        defer alloc.free(stale_dg);
+        try testing.expect((p5.deliverViaUpdatePathForTest(true, cand5, stale_dg) catch null) == null);
+
+        // WRONG DATA with a live bound challenge: frame-level rejection
+        // and the challenge stays outstanding.
+        const wrong2 = [_]u8{ 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 };
+        try p5.server.sendPathChallengeForPath(wrong2, cand5.toUdp());
+        const ch3 = (try p5.pollShortTolerantForTest(false)) orelse return error.NoChallenge;
+        defer alloc.free(ch3);
+        try p5.deliver(false, ch3);
+        try testing.expectEqual(@as(usize, 1), p5.server.outstandingPathChallengeCountForPath(cand5.toUdp()));
+        const wrongdata_dg = try makeResponse(alloc, 2, [_]u8{9} ** 8, keys5);
+        defer alloc.free(wrongdata_dg);
+        try testing.expect((p5.deliverViaUpdatePathForTest(true, cand5, wrongdata_dg) catch null) == null);
+        try testing.expectEqual(@as(usize, 1), p5.server.outstandingPathChallengeCountForPath(cand5.toUdp()));
+    }
+}
+
+test "migration: source-ADDRESS change commits only the bound path" {
+    const alloc = testing.allocator;
+    var opts = try randomPsk();
+    opts.migration_disabled = false;
+    var p = try Pair.create(alloc, opts);
+    defer p.destroy();
+    try p.completeHandshake();
+
+    const s = try p.client.openStream();
+    const first = try p.clientToServer(s, "old-addr", false);
+    defer if (first) |x| alloc.free(x);
+    try testing.expectEqualStrings("old-addr", first.?);
+
+    // Source-ADDRESS rebind (127.0.0.1 -> 127.0.0.2), not just a port.
+    const old_remote = p.server_path.remote;
+    p.client_path.local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 2 }, p.client_path.local.port);
+    p.server_path.remote = p.client_path.local;
+    const candidate = p.server_path;
+
+    const challenge = [_]u8{ 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58 };
+    try p.server.sendPathChallengeForPath(challenge, candidate.toUdp());
+    try p.flushServerShort();
+    try testing.expect(p.server.outstandingPathChallengeCountForPath(candidate.toUdp()) > 0);
+
+    // Authenticated data from the new ADDRESS routes by DCID but
+    // commits nothing until validation completes.
+    const via_new = try p.clientToServer(s, "new-addr", false);
+    defer if (via_new) |x| alloc.free(x);
+    try testing.expectEqualStrings("new-addr", via_new.?);
+
+    var rounds: usize = 0;
+    while (p.server.outstandingPathChallengeCountForPath(candidate.toUdp()) > 0 and rounds < 6) : (rounds += 1) {
+        try p.flushClientShort();
+        try p.flushServerShort();
+    }
+    try testing.expectEqual(@as(usize, 0), p.server.outstandingPathChallengeCountForPath(candidate.toUdp()));
+
+    const post = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(post.remote.eql(p.client_path.local));
+    try testing.expect(!post.remote.eql(old_remote));
+
+    const after = try p.clientToServer(s, "after-addr-migration", true);
+    defer if (after) |x| alloc.free(x);
+    try testing.expectEqualStrings("after-addr-migration", after.?);
+}
