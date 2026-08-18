@@ -1,11 +1,12 @@
-# Q1 QUIC feasibility spike report — round-3 resubmission
+# Q1 QUIC feasibility spike report — round-4 resubmission
 
 **Verdict: GO, pending re-review.** Both hard gates pass against the
-pinned dand-oss forks under the frozen round-3 rules: fail-closed
-candidate-path validation, the adoption-transaction rollback, and the
-single secret-ownership rule. Spike branch: `8sd1-quic-q1-spike`,
-governed by the canonical plan synced from `replant-zmx0.7` at
-`f6c4454`. **No production tag exists yet**: the quicz dependency below
+pinned dand-oss forks under the frozen round-4 rules: fail-closed
+candidate-path validation with the ReceivePathHintScope guard at every
+PATH_RESPONSE-capable receive root, the adoption-transaction rollback,
+fresh-packet-number proofs, and complete secret wipes. Spike branch:
+`8sd1-quic-q1-spike`, governed by the canonical plan synced from
+`replant-zmx0.7` at `ad86781`. **No production tag exists yet**: the quicz dependency below
 is an untagged review dependency, and the production pin (immutable
 `zmosh-quic-q1-5` at the reviewed SHA) is created only after re-review
 approval. Q2 remains locked until that closure completes.
@@ -15,58 +16,77 @@ approval. Q2 remains locked until that closure completes.
 | Dependency | Pin | Base | Tag status |
 |---|---|---|---|
 | Ghostty | `git+https://github.com/dand-oss/ghostty#6361b2eac73e8243a7042f517ea95ab87165f105` (hash `ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD`) | upstream `56e1f3a62` | SHA-only (the `zmosh-snapshot-v1` tag is retired — Ghostty's own build permits only its `vX.Y.Z` tags at HEAD, verified: `test-lib-vt` exit 0 from an ordinary untagged checkout) |
-| quicz | `git+https://github.com/dand-oss/quicz#470c4bddb55d5f6978a612b46104df9edcf8d2f6` (hash `quicz-0.1.0-g2J978KqlgDLjnnKtgUqCIwprxe2Tqx1AMBF1PkacaC3`) | upstream `b4352201` | **untagged review dependency** — `zmosh-quic-q1-4` (`238a57b`) is superseded, immutable history; no production tag until re-review approval |
+| quicz | `git+https://github.com/dand-oss/quicz#7093988534e16582e0c3c53c6aebd52795777acd` (hash `quicz-0.1.0-g2J975z1lgA8gwMenw6IhH9FWVTT6wVnWGSpTQ9m-AIg`) | upstream `b4352201` | **untagged review dependency** — `zmosh-quic-q1-4` (`238a57b`) and the round-3 tip `470c4bd` are superseded, immutable history; no production tag until re-review approval |
 
 Forks keep upstream remotes for synchronization; zmosh pins exact
 commits; tags never move. The provisional SHA recorded in the plan
-(Step 0) became this concrete pin in spike commit 1/4 (`9b92f03`).
+became concrete in spike commits and is re-recorded here each round
+(round 4: `7093988` in the repair commit `b698c76`).
 
-## Round-3 corrections (all four blockers)
+## Round-4 corrections (all six blockers)
 
-1. **Path validation is fail-closed** (quicz `470c4bd`): a bound
-   challenge is consumed only when the arrival hint is present AND
-   equals the binding — a null hint ignores the frame and the challenge
-   stays outstanding. One neutral implementation
-   (`…UpdatePathOrCloseAddress(UdpTuple)`) is the only body that sets
-   the hint and performs the route update; the IPv4 entry is a pure
-   `.toUdp()` delegate, and every other routed short-datagram entry
-   brackets the hint the same way. Route commit is path-specific
-   (`outstandingPathChallengeCountForPath`): legacy unbound challenges
-   never authorize migration. Four in-fork tests cover the matrix;
-   1904/1904 at the pin.
-2. **Rollback is an adoption transaction, not a pre-adoption check**
-   (spike commit 3/4, `412e04b`): the candidate is adopted into a
-   private capacity-one `EndpointConnectionRegistry` with its route
-   installed; wrong-PSK binder failure — and any `commit()` failure
-   after successful authentication — calls `registry.retire()` and
-   returns `count()`/`activeCount()`/`routeCount()` to the pre-adoption
-   baseline; `deinit_record` `secureWipe()`s the backend and asserts
-   the wipe landed before any storage is freed. Full evidence below.
-3. **Secret ownership under one rule** (spike commit 3/4):
-   `PairOptions` carries PSK pointers; callers own and wipe the
-   mutable bootstrap/PSK/token originals via defers; the Pair retains
-   no redundant PSK arrays; `derivePsk(out: *[32]u8, bootstrap:
-   *const [32]u8)` writes the derived PSK in place; every backend
-   teardown is `secureWipe()` then `destroy()` (the backends' retained
-   copies are wiped by `secureWipe`; no claim is made about transient
-   ABI copies inside quicz's by-value PSK constructors); constructors
-   (`quic_harness.initInto`, `quic_psk_gate.Pair.init`,
-   `socketPairOver`) build each resource as a local with an adjacent
-   errdefer and assign the pair only after all steps succeed — no
-   partially initialized pair is ever observable.
-4. **Governance**: the canonical plan on `replant-zmx0.7` (`f6c4454`)
-   records q1-4 superseded, the provisional-then-concrete SHA, and the
-   four frozen rules above; the bead (`zmosh-8sd.1`) description and
-   acceptance criteria are reconciled to the fork-pin strategy; this
-   report matches both. The minor stale `zmosh-snapshot-v1` zon comment
-   was fixed in spike commit 1/4.
+1. **Arrival-path coverage now matches the frozen contract** (quicz
+   `7093988`): a tiny private `ReceivePathHintScope` guard (set on
+   init, clear on deinit; NEVER nested — exactly one per processing
+   path, delegating wrappers never create one, and the six
+   pre-existing manual brackets were REPLACED, not wrapped) now runs
+   at every public application/short-packet receive root capable of
+   decoding PATH_RESPONSE: `processRoutedProtectedShortDatagram`,
+   `…OrClose`, `…WithKeyUpdate`, `…WithKeyPhaseState`,
+   `…WithInstalledKeysOrCloseAndPollDatagram`, and BOTH installed-key
+   feed roots — `feedDatagramWithInstalledKeys` and
+   `feedDatagramWithInstalledKeysAcrossConnections`. The feed roots
+   guard only the `.application` processor (Handshake and 0-RTT cannot
+   decode PATH_RESPONSE). Route mutation remains solely in the
+   UpdatePath implementations, authorized only by a decrease of the
+   candidate path's own bound-challenge count. In-fork per-root tests
+   prove each root consumes a bound response only from the bound path;
+   1906/1906 at the pin.
+2. **No test-only fns in the production API** (quicz `7093988`):
+   `processDecodedFramesForTest` is removed; the null-hint proof — in
+   fork and spike alike — drives a crafted protected PATH_RESPONSE
+   through the connection-level entry
+   `processProtectedShortDatagramWithInstalledKeys`, a real production
+   packet entry that is hint-free by design (lifecycle layers bracket
+   around it).
+3. **False-positive coverage closed** (spike `b698c76`): every crafted
+   injection draws its packet number from
+   `server.nextPeerPacketNumber(.application)` — genuinely fresh after
+   the handshake and seeded traffic — so packet-number dedup can no
+   longer pass a wrong-path or stale case; only the exact-replay case
+   reuses a datagram. The stale and wrong-data cases run on separate
+   fresh pairs.
+4. **Secret wipes complete** (spike `b698c76`): the token-secret tests
+   wipe the actual mutable ORIGINAL in place (the `secret_original`
+   copies are gone), and both `derivePsk` implementations wipe the
+   HKDF PRK with an immediate `defer`. Round-3's pointer-PSK rule,
+   in-place derivation, wipe-then-destroy backends, and
+   locals-with-adjacent-errdefer constructors are unchanged.
+5. **Real state, not counters** (spike `b698c76`): `AllocCounters` is
+   deleted; the bounded-candidate assertions use
+   `policy.replayFilterEntryCount()` and `router.routeCount()`.
+6. **Bats gate amended, evidence-first** (see the Bats section below):
+   the flake is proven pre-existing at the frozen baseline `6f4c4d1`,
+   tracked as `zmosh-r3b` blocking `zmosh-pnf`, and Q1's criterion is
+   no-regression-versus-baseline — not silently waived.
+
+The round-3 adoption-transaction rollback (spike `412e04b`) is
+unchanged and remains the strongest evidence; see its section below.
+The canonical plan is synced from `replant-zmx0.7` at `ad86781`
+(round-4 frozen rules + the amended Bats criterion).
 
 ## Fail-closed path-validation matrix (frozen, all asserted)
 
-Fresh pairs wherever the `OrClose` entry could queue a close:
+Every crafted datagram carries a fresh packet number from
+`server.nextPeerPacketNumber(.application)`; only the exact-replay
+case reuses a datagram. Fresh pairs wherever the `OrClose` entry
+could queue a close (the stale and wrong-data cases each get their
+own):
 
-1. bound challenge + **null hint** (decoded frames driven directly on
-   the connection, no feed) — ignored, still outstanding;
+1. bound challenge + **null hint** (a crafted protected response
+   driven through the connection-level packet entry — no lifecycle
+   feed, so no arrival hint can be recorded) — ignored, still
+   outstanding;
 2. **wrong path** — ignored, still outstanding, no commit;
 3. **correct candidate path** — consumed, route committed exactly once;
 4. **exact-datagram replay including the packet number** —
@@ -116,11 +136,12 @@ exact stored-exchange validation without consuming replay state → ONE
 unpublished bounded candidate (Connection + TLS backend) →
 authentication of the follow-up Initial → publication (one route under
 the Retry-SCID DCID) + token consumption + slot cleared → PSK handshake
-→ 1-RTT echo. Baseline-relative counters: every malformed/expired/
-replayed/wrong-path/unrelated/unauthenticated attempt leaves
-Connection/TLS/stream/route counts at zero delta; one valid follow-up
-creates exactly one candidate (2 total connections including the client,
-2 backends, 1 route).
+→ 1-RTT echo. Real state, not self-reported counters: every
+malformed/expired/replayed/wrong-path/unrelated/unauthenticated
+attempt leaves the token's replay filter unconsumed and no server
+lifecycle or route in existence; one valid follow-up publishes exactly
+one route (`router.routeCount()` == 1) and consumes the replay filter
+exactly once.
 
 ## Gate 1 — Ghostty public snapshot API: PASS
 
@@ -157,13 +178,15 @@ traffic, and resumes after drain; datagrams respect the fixed
 1200-byte payload. Migration coverage lives in the frozen fail-closed
 matrix above.
 
-## Real-socket proofs: PASS (5)
+## Real-socket proofs: PASS (4) plus one sans-I/O adoption proof
 
-IPv4 loopback; native IPv6 loopback; dual-stack (IPv6 `::` server
-serving an IPv4-mapped peer with the kernel-reported mapped route); the
-full native-IPv6 Retry/bounded-candidate/handshake/echo proof; and the
-adoption-transaction rollback proof (sans-I/O, listed above). Client
-Initials padded to exactly 1200 bytes; nothing exceeds the cap.
+Four proofs run over actual UDP: IPv4 loopback; native IPv6 loopback;
+dual-stack (IPv6 `::` server serving an IPv4-mapped peer with the
+kernel-reported mapped route); and the full native-IPv6
+Retry/bounded-candidate/handshake/echo proof. Client Initials are
+padded to exactly 1200 bytes; nothing exceeds the cap. The
+adoption-transaction rollback proof is sans-I/O by design and is NOT
+counted as a real-socket test.
 
 ## Verification commands
 
@@ -171,23 +194,51 @@ Initials padded to exactly 1200 bytes; nothing exceeds the cap.
 cd spike
 zig build test --summary all                            # 24/24 (Debug)
 zig build test -Doptimize=ReleaseSafe --summary all     # 24/24
-zig build quicz-suite --summary all                     # 1904/1904 at the pin
+zig build quicz-suite --summary all                     # at the pin
 zig build size-probe -Doptimize=ReleaseSafe
 zig build size-probe -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
 zig fmt --check build.zig build.zig.zon src/*.zig
-cd .. && zig build check && zig build test && bats test
+cd .. && zig build && zig build check && zig build test
 ```
 
+## Bats gate: no regression versus the frozen baseline
+
+The exact-128 KiB boundary test in `test/write.bats` ("write accepts
+exactly 128 KiB and rejects one byte more") flakes in the daemon
+chunked-PTY-write path, which Q1 never touches. Evidence-first
+amendment (Q1 criterion 5, `zmosh-8sd.1`):
+
+- **Baseline first**: temp worktree at `6f4c4d1` (the last commit
+  touching `src/`, `test/`, or build inputs — every later
+  `replant-zmx0.7` commit is plans-only), fresh `zig build`, then 20
+  isolated runs of
+  `bats --filter '^write accepts exactly 128 KiB and rejects one byte more$' test/write.bats`
+  on Linux 7.1.7+deb14-amd64, Zig 0.16.0, baseline binary sha256
+  `186817f403d6908e78ae7647fc1508b1e75e3cc7c3b2ebcbe5402a4e01d6075d`.
+  **10/20 failed**: 9× the drain-stall signature (`write.bats:96`,
+  size ≠ 131072, stuck around 90 KiB) and 1× the rejection signature
+  (`write.bats:75`, the capped write itself returned nonzero). The
+  flake is proven pre-existing and outside Q1.
+- **Tracked, not waived**: bead `zmosh-r3b` (labels bug, write,
+  replant) carries the fix — its acceptance requires a real daemon
+  fix, repeated boundary-test success, and full Bats green — and it
+  BLOCKS the final replant verification bead `zmosh-pnf`
+  (`bd dep zmosh-r3b --blocks zmosh-pnf`), so replant cannot verify
+  with the flake outstanding.
+- **Candidate protocol**: `candidate_sha` is frozen immediately after
+  the round-4 plan commit (`ad86781…`, recorded here and in the Bead
+  comment — the plan commit cannot contain its own SHA);
+  `git diff --exit-code 6f4c4d1..<candidate_sha> -- src test
+  build.zig build.zig.zon flake.nix` is empty (`build_support` does
+  not exist in this tree). The candidate runs execute exactly that
+  SHA: fresh build, the same 20 filtered runs (no NEW failure
+  signature; the two baseline signatures above may recur), and one
+  complete `bats test` in which only those tracked signatures are
+  permitted. Candidate results are recorded in the round-4 gate
+  evidence comment on the bead.
+
 zmosh gates: `zig build check` green; `zig build test` 134/134;
-`zig fmt --check` and `git diff --check` clean. **`bats test` has one
-intermittent pre-existing failure** outside Q1 scope:
-`test/write.bats` test 4 ("write accepts exactly 128 KiB and rejects
-one byte more") failed 1 of 6 isolated runs plus the full-suite run —
-the chunked PTY drain of an exactly-at-cap write occasionally stalls
-around 90 KiB. The daemon write path is untouched since `6f4c4d1`
-(all later `replant-zmx0.7` commits are plans-only, and the Q1 spike
-never modifies zmosh `src/`); flagged for a follow-up bead rather
-than silently re-run until green.
+`zig fmt --check` and `git diff --check` clean.
 
 Dependencies reproduce from the exact URLs and hashes in
 `spike/build.zig.zon`; no local trees or patch files remain.
@@ -201,7 +252,7 @@ entirely — v1 fixes the 1200-byte payload).
 
 ## Recommendation
 
-Proceed to the round-3 re-review. On approval only: create the
+Proceed to the round-4 re-review. On approval only: create the
 immutable `zmosh-quic-q1-5` tag at the reviewed quicz SHA (verify the
 tag object peels to the pinned commit), land the pin-only plan/report
 commit recording SHA + hash, rerun the exact-pin gates, and close Q1.
