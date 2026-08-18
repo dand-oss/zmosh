@@ -580,7 +580,7 @@ test "emitted datagrams respect the configured maximum size" {
     }
     // In-process the wire is unbounded, but quicz never emits a datagram
     // larger than the configured max_datagram_size (8192 here; the
-    // real-socket proofs pin 1200/1350 against actual UDP payloads).
+    // real-socket proofs pin the fixed 1200-byte payload).
     try testing.expect(p.wire.max_datagram_seen <= 8192);
     try testing.expect(p.wire.max_datagram_seen >= 1200);
 }
@@ -607,7 +607,16 @@ fn makeResponse(
 test "fail-closed: null hint, wrong path, one commit, replay, stale" {
     const alloc = testing.allocator;
 
-    // ── (1) NULL HINT on its own fresh pair ──────────────────────────
+    // Every crafted injection uses a packet number drawn from the
+    // receiving connection's own peer-packet-number expectation, so each
+    // datagram is genuinely fresh — only the exact-replay case reuses a
+    // datagram. A hard-coded number after a completed handshake plus
+    // seeded traffic could already be a duplicate, letting packet-number
+    // dedup pass a case that path validation should decide.
+
+    // ── (1) NULL HINT on its own fresh pair, through the real
+    //       connection-level packet entry (no lifecycle feed runs, so no
+    //       arrival hint can be recorded). ─────────────────────────────
     {
         var sec = try ProofSecrets.create(alloc);
         defer sec.destroy(alloc);
@@ -623,13 +632,13 @@ test "fail-closed: null hint, wrong path, one commit, replay, stale" {
         try p.deliver(false, ch);
         try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(bound.toUdp()));
 
-        // Decoded frames driven directly on the connection: no feed, no
-        // arrival hint — the bound challenge must NOT be consumed.
-        try p.driveDecodedFramesNoHint(true, data1);
+        const nohint_dg = try makeResponse(alloc, p.server.nextPeerPacketNumber(.application), data1, p.clientKeyForTest());
+        defer alloc.free(nohint_dg);
+        try p.processShortNoHintForTest(true, nohint_dg);
         try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(bound.toUdp()));
     }
 
-    // ── (2)–(5) the wire-level matrix on a second fresh pair ────────
+    // ── (2)–(4) the wire-level matrix on a second fresh pair. ────────
     var sec: ProofSecrets = undefined;
     try sec.init();
     defer sec.deinit();
@@ -660,56 +669,73 @@ test "fail-closed: null hint, wrong path, one commit, replay, stale" {
     try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(candidate.toUdp()));
 
     // (2) WRONG PATH: ignored, still outstanding, no commit.
-    const wrong_dg = try makeResponse(alloc, 1, data2, client_keys);
+    const wrong_dg = try makeResponse(alloc, p.server.nextPeerPacketNumber(.application), data2, client_keys);
     defer alloc.free(wrong_dg);
     try testing.expect((try p.deliverViaUpdatePathForTest(true, other, wrong_dg)) == null);
     try testing.expectEqual(@as(usize, 1), p.server.outstandingPathChallengeCountForPath(candidate.toUdp()));
 
     // (3) CANDIDATE PATH: consumed once, committed exactly once.
-    const good_dg = try makeResponse(alloc, 2, data2, client_keys);
+    const good_dg = try makeResponse(alloc, p.server.nextPeerPacketNumber(.application), data2, client_keys);
     defer alloc.free(good_dg);
     try testing.expect((try p.deliverViaUpdatePathForTest(true, candidate, good_dg)) != null);
     try testing.expectEqual(@as(usize, 0), p.server.outstandingPathChallengeCountForPath(candidate.toUdp()));
 
-    // (4) EXACT-DATAGRAM REPLAY (same packet number): dedup, no commit.
+    // (4) EXACT-DATAGRAM REPLAY — the ONE case that reuses a datagram
+    //     and its packet number: packet-number dedup, no second commit.
     try testing.expect((try p.deliverViaUpdatePathForTest(true, candidate, good_dg)) == null);
 
-    // (5) FRESH STALE and WRONG-DATA responses (fresh packet numbers)
-    //     on a FRESH pair: the OrClose entry queues a close on frame
-    //     errors, so this pair is isolated per the frozen rule.
+    // ── (5a) FRESH STALE response on its own fresh pair: no challenge
+    //         exists — rejected, nothing committed. The OrClose entry
+    //         queues a close on the frame error, so this pair is
+    //         isolated. ────────────────────────────────────────────────
     {
-        var sec5 = try ProofSecrets.create(alloc);
-        defer sec5.destroy(alloc);
-        var opts5 = sec5.opts();
-        opts5.migration_disabled = false;
-        var p5 = try Pair.create(alloc, opts5);
-        defer p5.destroy();
-        try p5.completeHandshake();
-        const s5 = try p5.client.openStream();
-        if (try p5.clientToServer(s5, "seed5", false)) |x| alloc.free(x);
-        const cand5 = quicz.endpoint.Udp4Tuple{
-            .local = p5.server_path.local,
+        var sec5a = try ProofSecrets.create(alloc);
+        defer sec5a.destroy(alloc);
+        var opts5a = sec5a.opts();
+        opts5a.migration_disabled = false;
+        var p5a = try Pair.create(alloc, opts5a);
+        defer p5a.destroy();
+        try p5a.completeHandshake();
+        const s5a = try p5a.client.openStream();
+        if (try p5a.clientToServer(s5a, "seed5a", false)) |x| alloc.free(x);
+        const cand5a = quicz.endpoint.Udp4Tuple{
+            .local = p5a.server_path.local,
             .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 2 }, 50_001),
         };
-        const keys5 = p5.clientKeyForTest();
-
-        // STALE: no challenge exists — rejected, nothing committed.
-        const stale_dg = try makeResponse(alloc, 1, [_]u8{1} ** 8, keys5);
+        const stale_dg = try makeResponse(alloc, p5a.server.nextPeerPacketNumber(.application), [_]u8{1} ** 8, p5a.clientKeyForTest());
         defer alloc.free(stale_dg);
-        try testing.expect((p5.deliverViaUpdatePathForTest(true, cand5, stale_dg) catch null) == null);
+        try testing.expect((p5a.deliverViaUpdatePathForTest(true, cand5a, stale_dg) catch null) == null);
+    }
 
-        // WRONG DATA with a live bound challenge: frame-level rejection
-        // and the challenge stays outstanding.
+    // ── (5b) WRONG DATA with a live bound challenge, on another fresh
+    //         pair: frame-level rejection, the challenge stays
+    //         outstanding. ─────────────────────────────────────────────
+    {
+        var sec5b = try ProofSecrets.create(alloc);
+        defer sec5b.destroy(alloc);
+        var opts5b = sec5b.opts();
+        opts5b.migration_disabled = false;
+        var p5b = try Pair.create(alloc, opts5b);
+        defer p5b.destroy();
+        try p5b.completeHandshake();
+        const s5b = try p5b.client.openStream();
+        if (try p5b.clientToServer(s5b, "seed5b", false)) |x| alloc.free(x);
+        const cand5b = quicz.endpoint.Udp4Tuple{
+            .local = p5b.server_path.local,
+            .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 2 }, 50_001),
+        };
+        const keys5b = p5b.clientKeyForTest();
+
         const wrong2 = [_]u8{ 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 };
-        try p5.server.sendPathChallengeForPath(wrong2, cand5.toUdp());
-        const ch3 = (try p5.pollShortTolerantForTest(false)) orelse return error.NoChallenge;
+        try p5b.server.sendPathChallengeForPath(wrong2, cand5b.toUdp());
+        const ch3 = (try p5b.pollShortTolerantForTest(false)) orelse return error.NoChallenge;
         defer alloc.free(ch3);
-        try p5.deliver(false, ch3);
-        try testing.expectEqual(@as(usize, 1), p5.server.outstandingPathChallengeCountForPath(cand5.toUdp()));
-        const wrongdata_dg = try makeResponse(alloc, 2, [_]u8{9} ** 8, keys5);
+        try p5b.deliver(false, ch3);
+        try testing.expectEqual(@as(usize, 1), p5b.server.outstandingPathChallengeCountForPath(cand5b.toUdp()));
+        const wrongdata_dg = try makeResponse(alloc, p5b.server.nextPeerPacketNumber(.application), [_]u8{9} ** 8, keys5b);
         defer alloc.free(wrongdata_dg);
-        try testing.expect((p5.deliverViaUpdatePathForTest(true, cand5, wrongdata_dg) catch null) == null);
-        try testing.expectEqual(@as(usize, 1), p5.server.outstandingPathChallengeCountForPath(cand5.toUdp()));
+        try testing.expect((p5b.deliverViaUpdatePathForTest(true, cand5b, wrongdata_dg) catch null) == null);
+        try testing.expectEqual(@as(usize, 1), p5b.server.outstandingPathChallengeCountForPath(cand5b.toUdp()));
     }
 }
 

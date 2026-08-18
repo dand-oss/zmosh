@@ -481,15 +481,6 @@ test "real sockets: IPv6 dual-stack server serves an IPv4-mapped client" {
     try assertSocketHandshakeAndEcho(alloc, io, .dual_stack_v4_peer, "dual-stack-echo");
 }
 
-/// Baseline-relative allocation counters for the bounded-candidate
-/// assertions: how many connection-sized objects this test itself created.
-const AllocCounters = struct {
-    connections: usize = 0,
-    backends: usize = 0,
-    streams: usize = 0,
-    routes: usize = 0,
-};
-
 /// Drive one space unless its packet-number space is already discarded.
 fn driveSpaceUnlessDiscarded(
     lifecycle: *quicz.EndpointConnectionLifecycle,
@@ -538,8 +529,6 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
     const client_path = quicz.endpoint.UdpTuple{ .local = client_local, .remote = server_local };
     const server_path = quicz.endpoint.UdpTuple{ .local = server_local, .remote = client_local };
 
-    var baseline = AllocCounters{};
-
     // The CLIENT registers its own route (its outbound address choice);
     // the SERVER allocates nothing until the candidate is authenticated.
     var client_lifecycle = quicz.EndpointConnectionLifecycle.init(alloc);
@@ -550,7 +539,6 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
         client_path,
         .{ .active_migration_disabled = true },
     );
-    baseline.routes += 1;
 
     const conn_cfg = quicz.Config{
         .initial_max_data = 8192,
@@ -564,7 +552,6 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
         client.deinit();
         alloc.destroy(client);
     }
-    baseline.connections += 1;
     try client.setLocalInitialSourceConnectionId(&harness.client_scid);
 
     const client_backend = try alloc.create(Tls13Backend);
@@ -577,7 +564,6 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
     // (defers run LIFO: destroy is registered first, wipe runs first).
     defer alloc.destroy(client_backend);
     defer client_backend.secureWipe();
-    baseline.backends += 1;
     try client_backend.setClientPskIdentity(psk_identity);
 
     const secrets = try quicz.protection.deriveInitialSecrets(.v1, &harness.original_dcid);
@@ -589,9 +575,9 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
     const supported = [_]quicz.packet.Version{.v1};
 
     // Token policy + pending-Retry slot: the ONLY server state so far.
-    const secret: quicz.address_validation_token.Secret = [_]u8{0x71} ** quicz.address_validation_token.secret_len;
-    var secret_original = secret;
-    defer std.crypto.secureZero(u8, &secret_original);
+    // The mutable ORIGINAL is wiped in place — no wiped-copy stand-in.
+    var secret: quicz.address_validation_token.Secret = [_]u8{0x71} ** quicz.address_validation_token.secret_len;
+    defer std.crypto.secureZero(u8, &secret);
     var policy = quicz.endpoint.AddressValidationPolicy.init(alloc, secret, .{});
     defer policy.deinit();
     var slot = quicz.pending_retry_slot.PendingRetrySlot{};
@@ -693,10 +679,9 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
         }
     };
     try failAttempts.run(&slot, &policy, now + 1, server_path, first_odcid, first_scid, &retry_scid, token);
-    // No server connection, backend, stream, or route exists yet.
-    try testing.expectEqual(baseline.connections, 1);
-    try testing.expectEqual(baseline.backends, 1);
-    try testing.expectEqual(baseline.routes, 1);
+    // No server-side state exists yet: no lifecycle has been created,
+    // and the token's replay state is unconsumed (nothing published).
+    try testing.expectEqual(@as(usize, 0), policy.replayFilterEntryCount());
 
     // ── 4. The CLIENT receives the Retry on its real socket and performs
     //       the true quicz Retry sequence: processRetryDatagram records
@@ -837,11 +822,10 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
     const r_retr = try server_sock.receive(io, &recv_buf);
     _ = r_retr;
 
-    // Exactly one candidate was created: one server Connection, one
-    // backend, and one route (the Retry-SCID DCID of the follow-up).
-    try testing.expectEqual(baseline.connections + 1, 2);
-    try testing.expectEqual(baseline.backends + 1, 2);
-    try testing.expectEqual(server_lifecycle.router.routeCount(), 1);
+    // Exactly one published candidate: one route under the Retry-SCID
+    // DCID, and the token's replay state consumed exactly once.
+    try testing.expectEqual(@as(usize, 1), server_lifecycle.router.routeCount());
+    try testing.expectEqual(@as(usize, 1), policy.replayFilterEntryCount());
 
     // ── 6. Complete the certificate-free PSK handshake over the SAME
     //       sockets and finish with a 1-RTT echo. ──────────────────────
@@ -1109,9 +1093,9 @@ test "adoption transaction: binder failure and commit failure roll back to basel
     try testing.expect(first_initial.len >= 1200);
 
     // ── SERVER pre-adoption state: token policy + slot, nothing else. ─
-    const secret: quicz.address_validation_token.Secret = [_]u8{0x73} ** quicz.address_validation_token.secret_len;
-    var secret_original = secret;
-    defer std.crypto.secureZero(u8, &secret_original);
+    // The mutable ORIGINAL is wiped in place — no wiped-copy stand-in.
+    var secret: quicz.address_validation_token.Secret = [_]u8{0x73} ** quicz.address_validation_token.secret_len;
+    defer std.crypto.secureZero(u8, &secret);
     var policy = quicz.endpoint.AddressValidationPolicy.init(alloc, secret, .{});
     defer policy.deinit();
     var slot = quicz.pending_retry_slot.PendingRetrySlot{};

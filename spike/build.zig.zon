@@ -10,12 +10,12 @@
             .url = "git+https://github.com/dand-oss/ghostty#6361b2eac73e8243a7042f517ea95ab87165f105",
             .hash = "ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD",
         },
-        // dand-oss untagged review dependency: the fail-closed
-        // candidate-path validation tip. No production tag until
-        // re-review approval (zmosh-quic-q1-4 superseded).
+        // dand-oss untagged review dependency: the guarded
+        // PATH_RESPONSE-capable receive roots tip. No production tag
+        // until re-review approval (zmosh-quic-q1-4 superseded).
         .quicz = .{
-            .url = "git+https://github.com/dand-oss/quicz#470c4bddb55d5f6978a612b46104df9edcf8d2f6",
-            .hash = "quicz-0.1.0-g2J978KqlgDLjnnKtgUqCIwprxe2Tqx1AMBF1PkacaC3",
+            .url = "git+https://github.com/dand-oss/quicz#7093988534e16582e0c3c53c6aebd52795777acd",
+            .hash = "quicz-0.1.0-g2J975z1lgA8gwMenw6IhH9FWVTT6wVnWGSpTQ9m-AIg",
         },
     },
     .paths = .{

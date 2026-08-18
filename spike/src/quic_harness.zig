@@ -32,7 +32,10 @@ pub const psk_identity = "zmosh-ssh-bootstrap-v1";
 /// eliminate).
 pub fn derivePsk(out: *[32]u8, bootstrap_secret: *const [32]u8) void {
     const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-    const prk = HkdfSha256.extract("zmosh quic psk v1", bootstrap_secret);
+    var prk = HkdfSha256.extract("zmosh quic psk v1", bootstrap_secret);
+    // The extracted PRK is key material: wiped by an immediate defer so
+    // every exit path scrubs it, not just the fall-through.
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prk));
     HkdfSha256.expand(out, psk_identity, prk);
 }
 
@@ -708,19 +711,19 @@ pub const Pair = struct {
         return res.updated_route;
     }
 
-    /// Drive decoded frame bytes directly on a connection with NO
-    /// arrival hint (fail-closed null-hint proof).
-    pub fn driveDecodedFramesNoHint(
+    /// Deliver one already-protected short datagram through the
+    /// CONNECTION-LEVEL packet entry with no arrival hint — no
+    /// lifecycle feed runs, so no hint can be recorded (fail-closed
+    /// null-hint proof through a real production packet entry).
+    pub fn processShortNoHintForTest(
         self: *Pair,
         server_side: bool,
-        data: [8]u8,
+        datagram: []const u8,
     ) !void {
         const conn = if (server_side) self.server else self.client;
-        var frame_buf: [64]u8 = undefined;
-        var w = std.Io.Writer.fixed(&frame_buf);
-        try quicz.frame.encodeFrame(&w, .{ .path_response = .{ .data = data } });
+        const dcid_len = if (server_side) server_scid.len else client_scid.len;
         conn.setReceivePathHint(null);
-        try conn.processDecodedFramesForTest(w.buffered());
+        try conn.processProtectedShortDatagramWithInstalledKeys(self.now_nanos, dcid_len, datagram);
     }
 
     /// Opportunistic 1-RTT short-datagram poll with the same tolerance.

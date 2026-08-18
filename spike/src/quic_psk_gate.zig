@@ -44,7 +44,10 @@ const psk_identity = "zmosh-ssh-bootstrap-v1";
 /// the fixed derivation context `zmosh quic psk v1`. In place; the caller
 /// owns and wipes the mutable bootstrap original.
 fn derivePsk(out: *[32]u8, bootstrap_secret: *const [32]u8) void {
-    const prk = std.crypto.kdf.hkdf.HkdfSha256.extract("zmosh quic psk v1", bootstrap_secret);
+    var prk = std.crypto.kdf.hkdf.HkdfSha256.extract("zmosh quic psk v1", bootstrap_secret);
+    // The extracted PRK is key material: wiped by an immediate defer so
+    // every exit path scrubs it, not just the fall-through.
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prk));
     std.crypto.kdf.hkdf.HkdfSha256.expand(out, psk_identity, prk);
 }
 
