@@ -286,7 +286,9 @@ fn socketPairOver(alloc: std.mem.Allocator, io: std.Io, family: Family) !*Socket
     };
 
     const client_sock = try client_ip.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    errdefer client_sock.close(io);
     const server_sock = try server_ip.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    errdefer server_sock.close(io);
     const server_addr = server_sock.address;
     const client_addr = client_sock.address;
     // The client sends to the server's reachable form: the IPv4 mapping
@@ -296,34 +298,26 @@ fn socketPairOver(alloc: std.mem.Allocator, io: std.Io, family: Family) !*Socket
     else
         server_addr;
 
+    // PSK derivation in place; the mutable bootstrap original and the
+    // derived PSK are wiped by defers the moment this constructor exits
+    // (success or failure). The backends' retained copies are wiped by
+    // their secureWipe.
     var bootstrap: [32]u8 = undefined;
     try io.randomSecure(&bootstrap);
-    const psk = harness.derivePsk(bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    var psk: [32]u8 = undefined;
+    harness.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
 
-    const p = try alloc.create(SocketPair);
-    errdefer alloc.destroy(p);
-    p.* = .{
-        .alloc = alloc,
-        .io = io,
-        .client_lifecycle = undefined,
-        .server_lifecycle = undefined,
-        .client = undefined,
-        .server = undefined,
-        .client_backend = undefined,
-        .server_backend = undefined,
-        .client_path = undefined,
-        .server_path = undefined,
-        .secrets = undefined,
-        .client_sock = client_sock,
-        .server_sock = server_sock,
-        .server_addr = client_send_addr,
-        .client_addr = client_addr,
-    };
+    const client_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
+    errdefer alloc.destroy(client_lifecycle);
+    client_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
+    errdefer client_lifecycle.deinit();
 
-    p.client_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
-    p.server_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
-    p.client_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
-    p.server_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
+    const server_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
+    errdefer alloc.destroy(server_lifecycle);
+    server_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
+    errdefer server_lifecycle.deinit();
 
     // Address-neutral paths: native IPv6 stays IPv6; IPv4 widens.
     const client_local: quicz.endpoint.UdpAddress = switch (client_addr) {
@@ -345,27 +339,27 @@ fn socketPairOver(alloc: std.mem.Allocator, io: std.Io, family: Family) !*Socket
         mapped[12..16].* = client_addr.ip4.bytes;
         break :blk quicz.endpoint.UdpAddress.init6(mapped, client_addr.ip4.port);
     };
-    p.client_path = .{ .local = client_local, .remote = server_local };
-    p.server_path = .{ .local = server_local, .remote = server_view_of_client };
+    const client_path = quicz.endpoint.UdpTuple{ .local = client_local, .remote = server_local };
+    const server_path = quicz.endpoint.UdpTuple{ .local = server_local, .remote = server_view_of_client };
 
     // Route registration goes through the fork's neutral endpoints so
     // every family works identically.
-    try p.client_lifecycle.router.registerConnectionIdAddress(
+    try client_lifecycle.router.registerConnectionIdAddress(
         harness.client_handle,
         &harness.client_scid,
-        p.client_path,
+        client_path,
         .{ .active_migration_disabled = true },
     );
-    try p.server_lifecycle.router.registerConnectionIdAddress(
+    try server_lifecycle.router.registerConnectionIdAddress(
         harness.server_handle,
         &harness.original_dcid,
-        p.server_path,
+        server_path,
         .{ .active_migration_disabled = true },
     );
-    try p.server_lifecycle.router.registerConnectionIdAddress(
+    try server_lifecycle.router.registerConnectionIdAddress(
         harness.server_handle,
         &harness.server_scid,
-        p.server_path,
+        server_path,
         .{ .active_migration_disabled = true },
     );
 
@@ -375,30 +369,64 @@ fn socketPairOver(alloc: std.mem.Allocator, io: std.Io, family: Family) !*Socket
         .initial_max_streams_bidi = 8,
         .max_datagram_size = 1200,
     };
-    p.client = try alloc.create(Connection);
-    p.server = try alloc.create(Connection);
-    p.client.* = try Connection.init(alloc, .client, conn_cfg);
-    p.server.* = try Connection.init(alloc, .server, conn_cfg);
-    try p.server.validatePeerAddress();
-    try p.client.setLocalInitialSourceConnectionId(&harness.client_scid);
-    try p.server.setLocalInitialSourceConnectionId(&harness.server_scid);
+    const client = try alloc.create(Connection);
+    errdefer alloc.destroy(client);
+    client.* = try Connection.init(alloc, .client, conn_cfg);
+    errdefer client.deinit();
 
-    p.client_backend = try alloc.create(Tls13Backend);
-    p.client_backend.* = Tls13Backend.initClientWithPsk(.{
+    const server = try alloc.create(Connection);
+    errdefer alloc.destroy(server);
+    server.* = try Connection.init(alloc, .server, conn_cfg);
+    errdefer server.deinit();
+
+    try server.validatePeerAddress();
+    try client.setLocalInitialSourceConnectionId(&harness.client_scid);
+    try server.setLocalInitialSourceConnectionId(&harness.server_scid);
+
+    const client_backend = try alloc.create(Tls13Backend);
+    errdefer alloc.destroy(client_backend);
+    client_backend.* = Tls13Backend.initClientWithPsk(.{
         .alpn = &alpn_zmosh,
         .server_name = "zmosh",
         .disable_session_resumption = true,
     }, psk);
-    try p.client_backend.setClientPskIdentity(psk_identity);
+    errdefer client_backend.secureWipe();
+    try client_backend.setClientPskIdentity(psk_identity);
 
-    p.server_backend = try alloc.create(Tls13Backend);
-    p.server_backend.* = Tls13Backend.initServerWithPsk(.{
+    const server_backend = try alloc.create(Tls13Backend);
+    errdefer alloc.destroy(server_backend);
+    server_backend.* = Tls13Backend.initServerWithPsk(.{
         .alpn = &alpn_zmosh,
         .disable_session_resumption = true,
     }, psk);
-    try p.server_backend.setServerPskIdentity(psk_identity);
+    errdefer server_backend.secureWipe();
+    try server_backend.setServerPskIdentity(psk_identity);
 
-    p.secrets = try protection.deriveInitialSecrets(.v1, &harness.original_dcid);
+    // Initial secrets derived last; ownership transfers in the single
+    // assignment below, so exactly one live copy exists from here on.
+    const secrets = try protection.deriveInitialSecrets(.v1, &harness.original_dcid);
+
+    // All steps succeeded: ownership transfers into the pair in ONE
+    // assignment; no partially initialized pair is ever observable.
+    const p = try alloc.create(SocketPair);
+    errdefer alloc.destroy(p);
+    p.* = .{
+        .alloc = alloc,
+        .io = io,
+        .client_lifecycle = client_lifecycle,
+        .server_lifecycle = server_lifecycle,
+        .client = client,
+        .server = server,
+        .client_backend = client_backend,
+        .server_backend = server_backend,
+        .client_path = client_path,
+        .server_path = server_path,
+        .secrets = secrets,
+        .client_sock = client_sock,
+        .server_sock = server_sock,
+        .server_addr = client_send_addr,
+        .client_addr = client_addr,
+    };
     return p;
 }
 
@@ -497,10 +525,12 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
 
     var bootstrap: [32]u8 = undefined;
     try io.randomSecure(&bootstrap);
-    const psk = harness.derivePsk(bootstrap);
-    // The bootstrap secret and every derived copy are wiped on ALL paths.
-    var bootstrap_copy = bootstrap;
-    defer std.crypto.secureZero(u8, &bootstrap_copy);
+    // Wipe the MUTABLE ORIGINALS on all paths (success, failure, and
+    // initialization-error alike); the socket pair holds no copies.
+    var psk: [32]u8 = undefined;
+    harness.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
 
     // Address-neutral routing for a native IPv6 path end to end.
     const client_local = quicz.endpoint.UdpAddress.init6(client_addr.ip6.bytes, client_addr.ip6.port);
@@ -543,11 +573,12 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
         .server_name = "zmosh",
         .disable_session_resumption = true,
     }, psk);
+    // Wipe the backend's key material BEFORE the storage is freed
+    // (defers run LIFO: destroy is registered first, wipe runs first).
     defer alloc.destroy(client_backend);
+    defer client_backend.secureWipe();
     baseline.backends += 1;
     try client_backend.setClientPskIdentity(psk_identity);
-    var psk_copy = psk;
-    defer std.crypto.secureZero(u8, &psk_copy);
 
     const secrets = try quicz.protection.deriveInitialSecrets(.v1, &harness.original_dcid);
     defer quicz.protection.secureWipeInitialSecrets(@constCast(&secrets));
@@ -559,8 +590,8 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
 
     // Token policy + pending-Retry slot: the ONLY server state so far.
     const secret: quicz.address_validation_token.Secret = [_]u8{0x71} ** quicz.address_validation_token.secret_len;
-    var token_secret_copy = secret;
-    defer std.crypto.secureZero(u8, &token_secret_copy);
+    var secret_original = secret;
+    defer std.crypto.secureZero(u8, &secret_original);
     var policy = quicz.endpoint.AddressValidationPolicy.init(alloc, secret, .{});
     defer policy.deinit();
     var slot = quicz.pending_retry_slot.PendingRetrySlot{};
@@ -754,7 +785,10 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
         .alpn = &alpn_zmosh,
         .disable_session_resumption = true,
     }, psk);
+    // Wipe the backend's key material BEFORE the storage is freed
+    // (defers run LIFO: destroy is registered first, wipe runs first).
     defer alloc.destroy(server_backend);
+    defer server_backend.secureWipe();
     try server_backend.setServerPskIdentity(psk_identity);
 
     // Authenticate: deliver the follow-up Initial to the candidate and
@@ -902,4 +936,406 @@ test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT e
     var echo_buf: [128]u8 = undefined;
     const n = (try server.recvOnStream(stream_id, &echo_buf)) orelse return error.NoEchoData;
     try testing.expectEqualStrings("v6-retry-echo", echo_buf[0..n]);
+}
+
+/// One adopted bounded candidate: a server Connection plus its PSK
+/// backend, owned by a PRIVATE capacity-one registry. The registry's
+/// `deinit_record` callback wipes the backend's key material (asserting
+/// the wipe landed) BEFORE any storage is freed, so every rollback and
+/// teardown path scrubs secrets first.
+const CandidateRecord = struct {
+    alloc: std.mem.Allocator,
+    conn: *Connection,
+    backend: *Tls13Backend,
+
+    fn connectionOf(record: *CandidateRecord) *Connection {
+        return record.conn;
+    }
+
+    /// Release the record's CONTENTS only — the registry destroys the
+    /// record allocation itself after this callback returns.
+    fn deinit(record: *CandidateRecord) void {
+        record.backend.secureWipe();
+        // The wipe must land before the storage is freed; assert it while
+        // the object still exists, never after destruction.
+        std.debug.assert(std.mem.allEqual(u8, &record.backend.hs.key_schedule.early_secret, 0));
+        record.conn.deinit();
+        record.alloc.destroy(record.conn);
+        record.alloc.destroy(record.backend);
+    }
+};
+
+const CandidateRegistry = quicz.EndpointConnectionRegistry(
+    CandidateRecord,
+    CandidateRecord.connectionOf,
+    CandidateRecord.deinit,
+);
+
+/// Build one bounded candidate: server Connection brought into the exact
+/// post-Retry state (recorded original DCID exchange and pending token)
+/// plus a PSK backend. Locals with adjacent errdefers; the record is
+/// returned only after every step succeeds. The PSK is a pointer: the
+/// caller owns and wipes the mutable original.
+fn buildCandidate(
+    alloc: std.mem.Allocator,
+    psk: *const [32]u8,
+    conn_cfg: quicz.Config,
+    now: i64,
+    first_odcid: []const u8,
+    first_scid: []const u8,
+    retry_scid: []const u8,
+    token: []const u8,
+) !*CandidateRecord {
+    const conn = try alloc.create(Connection);
+    errdefer alloc.destroy(conn);
+    conn.* = try Connection.init(alloc, .server, conn_cfg);
+    errdefer conn.deinit();
+
+    try conn.validatePeerAddress();
+    try conn.setLocalInitialSourceConnectionId(retry_scid);
+    const candidate_retry = try conn.issueRetryDatagram(now, first_odcid, first_scid, retry_scid, token);
+    defer alloc.free(candidate_retry);
+    try testing.expectEqual(@as(usize, 1), conn.pendingRetryTokenCount());
+
+    const backend = try alloc.create(Tls13Backend);
+    errdefer alloc.destroy(backend);
+    backend.* = Tls13Backend.initServerWithPsk(.{
+        .alpn = &alpn_zmosh,
+        .disable_session_resumption = true,
+        // No certificate material: PSK-only or fail.
+    }, psk.*);
+    errdefer backend.secureWipe();
+    try backend.setServerPskIdentity(psk_identity);
+
+    const record = try alloc.create(CandidateRecord);
+    errdefer alloc.destroy(record);
+    record.* = .{ .alloc = alloc, .conn = conn, .backend = backend };
+    return record;
+}
+
+/// The adoption half of the transaction: transfer the candidate into the
+/// private registry and install its candidate route. If the route install
+/// fails the adoption is undone, so ownership never half-transfers.
+/// Private-registry ownership is NOT publication: endpoint dispatch never
+/// consults this registry until the caller publishes.
+fn adoptCandidate(
+    registry: *CandidateRegistry,
+    lifecycle: *quicz.EndpointConnectionLifecycle,
+    handle: u64,
+    record: *CandidateRecord,
+    dcid: []const u8,
+    path: quicz.endpoint.UdpTuple,
+) !void {
+    try registry.adopt(handle, record);
+    errdefer registry.remove(handle) catch {};
+    try lifecycle.router.registerConnectionIdAddress(handle, dcid, path, .{ .active_migration_disabled = true });
+}
+
+test "adoption transaction: binder failure and commit failure roll back to baseline" {
+    const alloc = testing.allocator;
+    var now: i64 = 1000;
+    var scratch: [16384]u8 = undefined;
+    const supported = [_]quicz.packet.Version{.v1};
+
+    // Secrets derived in place; every mutable original wiped by defer.
+    var bootstrap: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    var psk: [32]u8 = undefined;
+    harness.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+    var attacker: [32]u8 = undefined;
+    try testing.io.randomSecure(&attacker);
+    defer std.crypto.secureZero(u8, &attacker);
+    var wrong_psk: [32]u8 = undefined;
+    harness.derivePsk(&wrong_psk, &attacker);
+    defer std.crypto.secureZero(u8, &wrong_psk);
+
+    const client_path = (quicz.endpoint.Udp4Tuple{
+        .local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40000),
+        .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 41000),
+    }).toUdp();
+    const server_path = (quicz.endpoint.Udp4Tuple{
+        .local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 41000),
+        .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40000),
+    }).toUdp();
+
+    // ── CLIENT scaffolding: produce one genuine follow-up Initial. ────
+    var client_lifecycle = quicz.EndpointConnectionLifecycle.init(alloc);
+    defer client_lifecycle.deinit();
+    try client_lifecycle.router.registerConnectionIdAddress(
+        harness.client_handle,
+        &harness.client_scid,
+        client_path,
+        .{ .active_migration_disabled = true },
+    );
+    const conn_cfg = quicz.Config{
+        .initial_max_data = 8192,
+        .initial_max_stream_data = 2048,
+        .initial_max_streams_bidi = 8,
+        .max_datagram_size = 1200,
+    };
+    // Test-owned for the whole body: plain defers, wipe before free
+    // (LIFO: each destroy is registered before its wipe).
+    const client = try alloc.create(Connection);
+    defer alloc.destroy(client);
+    client.* = try Connection.init(alloc, .client, conn_cfg);
+    defer client.deinit();
+    try client.setLocalInitialSourceConnectionId(&harness.client_scid);
+    const client_backend = try alloc.create(Tls13Backend);
+    defer alloc.destroy(client_backend);
+    client_backend.* = Tls13Backend.initClientWithPsk(.{
+        .alpn = &alpn_zmosh,
+        .server_name = "zmosh",
+        .disable_session_resumption = true,
+    }, psk);
+    defer client_backend.secureWipe();
+    try client_backend.setClientPskIdentity(psk_identity);
+    var secrets = try quicz.protection.deriveInitialSecrets(.v1, &harness.original_dcid);
+    defer quicz.protection.secureWipeInitialSecrets(&secrets);
+
+    now += 1_000_000;
+    try driveSpaceUnlessDiscarded(&client_lifecycle, harness.client_handle, client, .initial, client_backend, &scratch);
+    const first_initial = (try client_lifecycle.pollProtectedLongDatagram(
+        harness.client_handle,
+        client,
+        now,
+        &harness.original_dcid,
+        &harness.client_scid,
+        &[_]u8{},
+        .{ .initial = secrets.client },
+    )) orelse return error.NoInitial;
+    defer alloc.free(first_initial);
+    try testing.expect(first_initial.len >= 1200);
+
+    // ── SERVER pre-adoption state: token policy + slot, nothing else. ─
+    const secret: quicz.address_validation_token.Secret = [_]u8{0x73} ** quicz.address_validation_token.secret_len;
+    var secret_original = secret;
+    defer std.crypto.secureZero(u8, &secret_original);
+    var policy = quicz.endpoint.AddressValidationPolicy.init(alloc, secret, .{});
+    defer policy.deinit();
+    var slot = quicz.pending_retry_slot.PendingRetrySlot{};
+    const nonce: quicz.address_validation_token.Nonce = [_]u8{0x43} ** quicz.address_validation_token.nonce_len;
+    const token = try policy.issueTokenForPath(alloc, .retry, now, 10 * std.time.ns_per_s, server_path, nonce);
+    defer alloc.free(token);
+    const retry_scid = [_]u8{ 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x39 };
+    const first_odcid = harness.original_dcid;
+    const first_scid = harness.client_scid;
+
+    _ = try slot.open(alloc, now, 10 * std.time.ns_per_s, server_path, .v1, &first_odcid, &first_scid, &retry_scid, token);
+
+    // ── Pre-adoption failure matrix: zero candidates exist at all. ────
+    const other_path = (quicz.endpoint.Udp4Tuple{
+        .local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 41000),
+        .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40001),
+    }).toUdp();
+    var mutated_token = try alloc.dupe(u8, token);
+    defer alloc.free(mutated_token);
+    mutated_token[0] ^= 0xff;
+    const wrong_scid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    // Wrong tuple.
+    try testing.expectError(error.TokenInvalid, slot.classify(&policy, now + 1, other_path, .v1, &first_odcid, &first_scid, &retry_scid, token, 1200, true));
+    // Wrong token bytes.
+    try testing.expectError(error.TokenInvalid, slot.classify(&policy, now + 1, server_path, .v1, &first_odcid, &first_scid, &retry_scid, mutated_token, 1200, true));
+    // Wrong client SCID on the follow-up.
+    try testing.expectError(error.TokenInvalid, slot.classify(&policy, now + 1, server_path, .v1, &first_odcid, &wrong_scid, &retry_scid, token, 1200, true));
+    // Expired slot: a second slot with a 1-nanosecond lifetime refuses
+    // both tokenless reissue and token-bearing follow-up.
+    {
+        var expired_slot = quicz.pending_retry_slot.PendingRetrySlot{};
+        _ = try expired_slot.open(alloc, now, 1, server_path, .v1, &first_odcid, &first_scid, &retry_scid, token);
+        try testing.expectError(error.RetryExpired, expired_slot.classify(&policy, now + 2, server_path, .v1, &first_odcid, &first_scid, &retry_scid, &.{}, 1200, true));
+        try testing.expectError(error.UnrelatedInitial, expired_slot.classify(&policy, now + 2, server_path, .v1, &first_odcid, &first_scid, &retry_scid, token, 1200, true));
+    }
+
+    // ── CLIENT performs the true Retry sequence → follow-up Initial. ──
+    const retry_datagram = slot.retry_datagram[0..slot.retry_datagram_len];
+    now += 1_000_000;
+    try client.processRetryDatagram(now, &harness.original_dcid, retry_datagram);
+    const conn_retry_scid = client.retrySourceConnectionId() orelse return error.NoRetryScid;
+    try testing.expectEqualSlices(u8, &retry_scid, conn_retry_scid);
+    var retry_keys = try quicz.protection.deriveInitialSecrets(.v1, conn_retry_scid);
+    defer quicz.protection.secureWipeInitialSecrets(&retry_keys);
+    client_backend.retryReceived();
+    try client.resetInitialCryptoSendForRetry();
+    _ = try client.driveCryptoBackendInSpace(.initial, client_backend.cryptoBackend(), &scratch);
+    const second_initial = (try client.pollProtectedLongCryptoDatagramInSpace(
+        .initial,
+        now,
+        conn_retry_scid,
+        &harness.client_scid,
+        &[_]u8{},
+        retry_keys.client,
+    )) orelse return error.NoSecondInitial;
+    defer alloc.free(second_initial);
+    try testing.expect(second_initial.len >= 1200);
+
+    const accept2 = (try quicz.endpoint.peekInitialAcceptDatagram(
+        server_path,
+        second_initial,
+        &supported,
+    )) orelse return error.SecondNotAccepted;
+    try testing.expectEqualSlices(u8, &retry_scid, accept2.original_destination_connection_id);
+
+    // ── Frozen replay semantics around classify/commit. ───────────────
+    // Repeated classify before commit is idempotent and non-consuming.
+    for (0..2) |_| {
+        const decision = try slot.classify(
+            &policy,
+            now + 1,
+            server_path,
+            .v1,
+            accept2.original_destination_connection_id,
+            accept2.source_connection_id,
+            conn_retry_scid,
+            accept2.token,
+            second_initial.len,
+            true,
+        );
+        switch (decision) {
+            .validated => {},
+            else => return error.ExpectedValidated,
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), policy.replayFilterEntryCount());
+
+    // ── The private registry + lifecycle: adoption targets. ───────────
+    var registry = try CandidateRegistry.initWithCapacity(alloc, 1);
+    defer registry.deinit();
+    var cand_lifecycle = quicz.EndpointConnectionLifecycle.init(alloc);
+    defer cand_lifecycle.deinit();
+    const baseline_count = registry.count();
+    const baseline_active = registry.activeCount();
+    const baseline_routes = cand_lifecycle.routeCount();
+    try testing.expectEqual(@as(usize, 0), baseline_count);
+    try testing.expectEqual(@as(usize, 0), baseline_active);
+    try testing.expectEqual(@as(usize, 0), baseline_routes);
+
+    // ── Scenario A: WRONG PSK — binder failure after adoption rolls
+    //    the whole transaction back to baseline. ────────────────────────
+    {
+        const record = try buildCandidate(alloc, &wrong_psk, conn_cfg, now + 1, &first_odcid, &first_scid, &retry_scid, token);
+        try adoptCandidate(&registry, &cand_lifecycle, harness.server_handle, record, accept2.original_destination_connection_id, server_path);
+        // Adopted and routed, but PRIVATE: nothing is published.
+        try testing.expectEqual(baseline_count + 1, registry.count());
+        try testing.expectEqual(baseline_active + 1, registry.activeCount());
+        try testing.expectEqual(baseline_routes + 1, cand_lifecycle.routeCount());
+
+        // Authenticate the follow-up Initial: the PSK binder check fails.
+        _ = try cand_lifecycle.processRoutedProtectedInitialDatagramAddress(
+            harness.server_handle,
+            record.conn,
+            server_path,
+            now + 2,
+            conn_retry_scid,
+            second_initial,
+        );
+        try testing.expectError(
+            error.CryptoError,
+            driveSpaceUnlessDiscarded(&cand_lifecycle, harness.server_handle, record.conn, .initial, record.backend, &scratch),
+        );
+
+        // Rollback: retire returns records, activity, and routes to the
+        // pre-adoption baseline; deinit_record wipes the backend first.
+        _ = try registry.retire(&cand_lifecycle, harness.server_handle);
+        try testing.expectEqual(baseline_count, registry.count());
+        try testing.expectEqual(baseline_active, registry.activeCount());
+        try testing.expectEqual(baseline_routes, cand_lifecycle.routeCount());
+        // The slot was never committed: replay state unconsumed.
+        try testing.expectEqual(@as(usize, 0), policy.replayFilterEntryCount());
+        try testing.expect(slot.occupied);
+    }
+
+    // ── Scenario B: COMMIT FAILURE after successful authentication —
+    //    rollback stays armed through commit(). ─────────────────────────
+    {
+        const record = try buildCandidate(alloc, &psk, conn_cfg, now + 1, &first_odcid, &first_scid, &retry_scid, token);
+        try adoptCandidate(&registry, &cand_lifecycle, harness.server_handle, record, accept2.original_destination_connection_id, server_path);
+        try testing.expectEqual(baseline_count + 1, registry.count());
+        try testing.expectEqual(baseline_routes + 1, cand_lifecycle.routeCount());
+
+        // The candidate authenticates (ServerHello exists)...
+        _ = try cand_lifecycle.processRoutedProtectedInitialDatagramAddress(
+            harness.server_handle,
+            record.conn,
+            server_path,
+            now + 2,
+            conn_retry_scid,
+            second_initial,
+        );
+        try driveSpaceUnlessDiscarded(&cand_lifecycle, harness.server_handle, record.conn, .initial, record.backend, &scratch);
+        const sh = (try cand_lifecycle.pollProtectedLongDatagram(
+            harness.server_handle,
+            record.conn,
+            now + 3,
+            &harness.client_scid,
+            &retry_scid,
+            &[_]u8{},
+            .{ .initial = retry_keys.server },
+        )) orelse return error.NoServerHello;
+        defer alloc.free(sh);
+
+        // ...but commit() fails (token mismatch): the adoption rolls back.
+        try testing.expectError(error.InvalidToken, slot.commit(&policy, now + 4, mutated_token));
+        try testing.expectEqual(@as(usize, 0), policy.replayFilterEntryCount());
+        try testing.expect(slot.occupied);
+        _ = try registry.retire(&cand_lifecycle, harness.server_handle);
+        try testing.expectEqual(baseline_count, registry.count());
+        try testing.expectEqual(baseline_active, registry.activeCount());
+        try testing.expectEqual(baseline_routes, cand_lifecycle.routeCount());
+    }
+
+    // ── Scenario C: VALID — exactly one record and one route are
+    //    retained, then commit() publishes. ─────────────────────────────
+    {
+        const record = try buildCandidate(alloc, &psk, conn_cfg, now + 1, &first_odcid, &first_scid, &retry_scid, token);
+        try adoptCandidate(&registry, &cand_lifecycle, harness.server_handle, record, accept2.original_destination_connection_id, server_path);
+        _ = try cand_lifecycle.processRoutedProtectedInitialDatagramAddress(
+            harness.server_handle,
+            record.conn,
+            server_path,
+            now + 2,
+            conn_retry_scid,
+            second_initial,
+        );
+        try driveSpaceUnlessDiscarded(&cand_lifecycle, harness.server_handle, record.conn, .initial, record.backend, &scratch);
+        const sh = (try cand_lifecycle.pollProtectedLongDatagram(
+            harness.server_handle,
+            record.conn,
+            now + 3,
+            &harness.client_scid,
+            &retry_scid,
+            &[_]u8{},
+            .{ .initial = retry_keys.server },
+        )) orelse return error.NoServerHello;
+        defer alloc.free(sh);
+
+        // Commit consumes exactly once and clears the slot.
+        try slot.commit(&policy, now + 4, accept2.token);
+        try testing.expectEqual(@as(usize, 1), policy.replayFilterEntryCount());
+        try testing.expect(!slot.occupied);
+        // A second commit of the same token is refused.
+        try testing.expectError(error.InvalidToken, slot.commit(&policy, now + 5, accept2.token));
+        try testing.expectEqual(@as(usize, 1), policy.replayFilterEntryCount());
+
+        // Retention: exactly one record and one route, still private
+        // until the endpoint owner publishes.
+        try testing.expectEqual(baseline_count + 1, registry.count());
+        try testing.expectEqual(baseline_active + 1, registry.activeCount());
+        try testing.expectEqual(baseline_routes + 1, cand_lifecycle.routeCount());
+
+        // Classification after commit is rejected with zero delta
+        // against the retained candidate.
+        try testing.expectError(
+            error.UnrelatedInitial,
+            slot.classify(&policy, now + 6, server_path, .v1, accept2.original_destination_connection_id, accept2.source_connection_id, conn_retry_scid, accept2.token, second_initial.len, true),
+        );
+        try testing.expectEqual(baseline_count + 1, registry.count());
+        try testing.expectEqual(baseline_routes + 1, cand_lifecycle.routeCount());
+
+        // Test teardown retires the retained record (wiping first).
+        _ = try registry.retire(&cand_lifecycle, harness.server_handle);
+        try testing.expectEqual(baseline_count, registry.count());
+        try testing.expectEqual(baseline_routes, cand_lifecycle.routeCount());
+    }
 }

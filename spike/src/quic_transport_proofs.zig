@@ -12,19 +12,47 @@ const quicz = @import("quicz");
 
 const Pair = harness.Pair;
 
-fn stdOpts(psk: [32]u8) harness.PairOptions {
-    return .{ .client_psk = psk, .server_psk = psk };
-}
+/// One proof-scoped secret store: bootstrap original + derived PSK, both
+/// wiped by the defer installed at creation. Pairs receive pointers.
+const ProofSecrets = struct {
+    bootstrap: [32]u8,
+    psk: [32]u8,
 
-fn randomPsk() !harness.PairOptions {
-    var bootstrap: [32]u8 = undefined;
-    try testing.io.randomSecure(&bootstrap);
-    return stdOpts(harness.derivePsk(bootstrap));
-}
+    fn init(self: *ProofSecrets) !void {
+        try testing.io.randomSecure(&self.bootstrap);
+        harness.derivePsk(&self.psk, &self.bootstrap);
+    }
+
+    fn deinit(self: *ProofSecrets) void {
+        std.crypto.secureZero(u8, &self.bootstrap);
+        std.crypto.secureZero(u8, &self.psk);
+    }
+
+    fn opts(self: *const ProofSecrets) harness.PairOptions {
+        return .{ .client_psk = &self.psk, .server_psk = &self.psk };
+    }
+
+    /// Heap-held so pointer options outlive the statement; destroy wipes
+    /// both originals before freeing.
+    fn create(alloc: std.mem.Allocator) !*ProofSecrets {
+        const self = try alloc.create(ProofSecrets);
+        errdefer alloc.destroy(self);
+        try self.init();
+        return self;
+    }
+
+    fn destroy(self: *ProofSecrets, alloc: std.mem.Allocator) void {
+        self.deinit();
+        alloc.destroy(self);
+    }
+};
 
 test "negotiated connection bounds: 4 MiB credit, 4 bidi / 8 uni streams" {
     const alloc = testing.allocator;
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.max_data = 4 * 1024 * 1024;
     opts.max_streams_bidi = 4;
     opts.max_streams_uni = 8;
@@ -54,7 +82,9 @@ test "negotiated connection bounds: 4 MiB credit, 4 bidi / 8 uni streams" {
 
 test "RESET_STREAM is observable by the application" {
     const alloc = testing.allocator;
-    var p = try Pair.create(alloc, try randomPsk());
+    var sec = try ProofSecrets.create(alloc);
+    defer sec.destroy(alloc);
+    var p = try Pair.create(alloc, sec.opts());
     defer p.destroy();
     try p.completeHandshake();
 
@@ -70,7 +100,9 @@ test "RESET_STREAM is observable by the application" {
 
 test "STOP_SENDING produces RESET_STREAM with the same code at the peer" {
     const alloc = testing.allocator;
-    var p = try Pair.create(alloc, try randomPsk());
+    var sec = try ProofSecrets.create(alloc);
+    defer sec.destroy(alloc);
+    var p = try Pair.create(alloc, sec.opts());
     defer p.destroy();
     try p.completeHandshake();
 
@@ -98,7 +130,10 @@ test "24h idle lifetime negotiated; scaled idle expiry closes" {
 
     // Negotiation: both sides advertise 24h; effective timeout = 24h.
     {
-        var opts = try randomPsk();
+        var sec: ProofSecrets = undefined;
+        try sec.init();
+        defer sec.deinit();
+        var opts = sec.opts();
         opts.idle_timeout_ms = 24 * 60 * 60 * 1000;
         var p = try Pair.create(alloc, opts);
         defer p.destroy();
@@ -111,7 +146,10 @@ test "24h idle lifetime negotiated; scaled idle expiry closes" {
     // Scaled timer proof: 100 ms negotiated idle closes after the
     // deadline passes with no authenticated packets.
     {
-        var opts = try randomPsk();
+        var sec: ProofSecrets = undefined;
+        try sec.init();
+        defer sec.deinit();
+        var opts = sec.opts();
         opts.idle_timeout_ms = 100;
         var p = try Pair.create(alloc, opts);
         defer p.destroy();
@@ -134,7 +172,10 @@ test "keepalive stays active across multiple original idle deadlines" {
     // survive 1.2 s — well past two original idle deadlines — and then
     // actually close once keepalives stop, proving the deadlines were
     // real all along.
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.idle_timeout_ms = 500;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();
@@ -158,7 +199,9 @@ test "keepalive stays active across multiple original idle deadlines" {
 
 test "streamSendProgress end-to-end across an ACK round trip" {
     const alloc = testing.allocator;
-    var p = try Pair.create(alloc, try randomPsk());
+    var sec = try ProofSecrets.create(alloc);
+    defer sec.destroy(alloc);
+    var p = try Pair.create(alloc, sec.opts());
     defer p.destroy();
     try p.completeHandshake();
 
@@ -188,7 +231,9 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
     // Loss of the first client Initial (handshake packet loss): the
     // handshake still completes after PTO retransmission.
     {
-        var p = try Pair.create(alloc, try randomPsk());
+        var sec = try ProofSecrets.create(alloc);
+        defer sec.destroy(alloc);
+        var p = try Pair.create(alloc, sec.opts());
         defer p.destroy();
         p.wire.drop_first_client = 1;
         try p.completeHandshakeWithRecovery();
@@ -201,7 +246,9 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
     // lets stream-b's overtake it. Both still arrive exactly once, in
     // order within each stream.
     {
-        var p = try Pair.create(alloc, try randomPsk());
+        var sec = try ProofSecrets.create(alloc);
+        defer sec.destroy(alloc);
+        var p = try Pair.create(alloc, sec.opts());
         defer p.destroy();
         try p.completeHandshake();
         p.wire.reorder_swap_once = true;
@@ -223,7 +270,9 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
     // Duplication: every delivered datagram is sent twice; packet-number
     // dedup delivers each stream byte exactly once.
     {
-        var p = try Pair.create(alloc, try randomPsk());
+        var sec = try ProofSecrets.create(alloc);
+        defer sec.destroy(alloc);
+        var p = try Pair.create(alloc, sec.opts());
         defer p.destroy();
         try p.completeHandshake();
         p.wire.duplicate = true;
@@ -241,7 +290,9 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
     // the surviving traffic's ACKs reveal the lost packet and QUIC
     // retransmits it, in order before the later data.
     {
-        var p = try Pair.create(alloc, try randomPsk());
+        var sec = try ProofSecrets.create(alloc);
+        defer sec.destroy(alloc);
+        var p = try Pair.create(alloc, sec.opts());
         defer p.destroy();
         try p.completeHandshake();
         // Flush any post-handshake stragglers first so the corruptor
@@ -280,7 +331,9 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
     // blackout; afterwards the connection recovers AND the bytes lost
     // inside the blackout are delivered exactly once.
     {
-        var p = try Pair.create(alloc, try randomPsk());
+        var sec = try ProofSecrets.create(alloc);
+        defer sec.destroy(alloc);
+        var p = try Pair.create(alloc, sec.opts());
         defer p.destroy();
         try p.completeHandshake();
         p.wire.blackout_until_nanos = p.now_nanos + 100 * std.time.ns_per_ms;
@@ -308,7 +361,9 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
     // Delay: datagrams held for two pump cycles still deliver exactly
     // once; the connection stays healthy.
     {
-        var p = try Pair.create(alloc, try randomPsk());
+        var sec = try ProofSecrets.create(alloc);
+        defer sec.destroy(alloc);
+        var p = try Pair.create(alloc, sec.opts());
         defer p.destroy();
         try p.completeHandshake();
         p.wire.delay_client_cycles = 2;
@@ -334,7 +389,10 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
 
 test "migration: PATH_CHALLENGE/RESPONSE commits the route; wrong responses cannot" {
     const alloc = testing.allocator;
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.migration_disabled = false;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();
@@ -394,7 +452,10 @@ test "migration: PATH_CHALLENGE/RESPONSE commits the route; wrong responses cann
 
 test "migration: stale, wrong, and old-path responses cannot commit" {
     const alloc = testing.allocator;
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.migration_disabled = false;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();
@@ -451,7 +512,10 @@ test "migration: stale, wrong, and old-path responses cannot commit" {
 
 test "slow reader: backpressure blocks writes, spares control, then resumes" {
     const alloc = testing.allocator;
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.max_stream_data = 256;
     opts.max_data = 4 * 1024;
     var p = try Pair.create(alloc, opts);
@@ -495,7 +559,10 @@ test "slow reader: backpressure blocks writes, spares control, then resumes" {
 
 test "emitted datagrams respect the configured maximum size" {
     const alloc = testing.allocator;
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.max_data = 4 * 1024 * 1024;
     opts.max_stream_data = 64 * 1024;
     var p = try Pair.create(alloc, opts);
@@ -542,7 +609,9 @@ test "fail-closed: null hint, wrong path, one commit, replay, stale" {
 
     // ── (1) NULL HINT on its own fresh pair ──────────────────────────
     {
-        var p = try Pair.create(alloc, try randomPsk());
+        var sec = try ProofSecrets.create(alloc);
+        defer sec.destroy(alloc);
+        var p = try Pair.create(alloc, sec.opts());
         defer p.destroy();
         try p.completeHandshake();
 
@@ -561,7 +630,10 @@ test "fail-closed: null hint, wrong path, one commit, replay, stale" {
     }
 
     // ── (2)–(5) the wire-level matrix on a second fresh pair ────────
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.migration_disabled = false;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();
@@ -606,7 +678,9 @@ test "fail-closed: null hint, wrong path, one commit, replay, stale" {
     //     on a FRESH pair: the OrClose entry queues a close on frame
     //     errors, so this pair is isolated per the frozen rule.
     {
-        var opts5 = try randomPsk();
+        var sec5 = try ProofSecrets.create(alloc);
+        defer sec5.destroy(alloc);
+        var opts5 = sec5.opts();
         opts5.migration_disabled = false;
         var p5 = try Pair.create(alloc, opts5);
         defer p5.destroy();
@@ -641,7 +715,10 @@ test "fail-closed: null hint, wrong path, one commit, replay, stale" {
 
 test "migration: source-ADDRESS change commits only the bound path" {
     const alloc = testing.allocator;
-    var opts = try randomPsk();
+    var sec: ProofSecrets = undefined;
+    try sec.init();
+    defer sec.deinit();
+    var opts = sec.opts();
     opts.migration_disabled = false;
     var p = try Pair.create(alloc, opts);
     defer p.destroy();

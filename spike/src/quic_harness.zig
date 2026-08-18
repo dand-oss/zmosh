@@ -25,13 +25,15 @@ pub const alpn_zmosh = [_][]const u8{"zmosh/1"};
 pub const psk_identity = "zmosh-ssh-bootstrap-v1";
 
 /// Plan Q1: PSK = HKDF-SHA256(bootstrap secret) with the fixed context
-/// `zmosh quic psk v1`.
-pub fn derivePsk(bootstrap_secret: [32]u8) [32]u8 {
+/// `zmosh quic psk v1`. Writes the derived PSK into `out` in place; the
+/// caller owns the mutable bootstrap original and wipes it (the backend's
+/// retained copy is wiped by its secureWipe; quicz's by-value PSK
+/// constructors still make a transient ABI copy we do not claim to
+/// eliminate).
+pub fn derivePsk(out: *[32]u8, bootstrap_secret: *const [32]u8) void {
     const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-    const prk = HkdfSha256.extract("zmosh quic psk v1", &bootstrap_secret);
-    var psk: [32]u8 = undefined;
-    HkdfSha256.expand(&psk, psk_identity, prk);
-    return psk;
+    const prk = HkdfSha256.extract("zmosh quic psk v1", bootstrap_secret);
+    HkdfSha256.expand(out, psk_identity, prk);
 }
 
 /// Deterministic impairment applied on the client->server and
@@ -131,8 +133,10 @@ pub const PairOptions = struct {
     /// Disable active migration in transport parameters.
     migration_disabled: bool = true,
     /// Wrong PSK / wrong identity / wrong ALPN failure variants.
-    client_psk: [32]u8,
-    server_psk: [32]u8,
+    /// Pointers: callers own the mutable originals and wipe them; the
+    /// Pair retains no redundant PSK copies.
+    client_psk: *const [32]u8,
+    server_psk: *const [32]u8,
     server_identity: ?[]const u8 = psk_identity,
     server_alpn: []const []const u8 = &alpn_zmosh,
 };
@@ -151,8 +155,6 @@ pub const Pair = struct {
     client_path: quicz.endpoint.Udp4Tuple,
     server_path: quicz.endpoint.Udp4Tuple,
     secrets: protection.InitialSecrets,
-    client_psk_copy: [32]u8 = .{0} ** 32,
-    server_psk_copy: [32]u8 = .{0} ** 32,
     scratch: [16384]u8 = undefined,
     pkt: u64 = 10,
     /// Handshake-space datagrams that arrived before the receiver had
@@ -178,12 +180,15 @@ pub const Pair = struct {
         self.client_backend.secureWipe();
         self.server_backend.secureWipe();
         protection.secureWipeInitialSecrets(&self.secrets);
-        std.crypto.secureZero(u8, &self.client_psk_copy);
-        std.crypto.secureZero(u8, &self.server_psk_copy);
         self.deinit();
         alloc.destroy(self);
     }
 
+    /// Build every resource as a local with an adjacent errdefer that
+    /// releases exactly what exists at that point (LIFO), then transfer
+    /// ownership into the pair in ONE assignment on success. No partially
+    /// initialized pair is ever observable, and every failure path wipes
+    /// or deinits precisely the resources already constructed.
     fn initInto(p: *Pair, alloc: std.mem.Allocator, opts: PairOptions) !void {
         const client_path = quicz.endpoint.Udp4Tuple{
             .local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40000),
@@ -194,20 +199,19 @@ pub const Pair = struct {
             .remote = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40000),
         };
 
-        p.alloc = alloc;
-        p.now_nanos = 1000;
-        p.pkt = 10;
-        p.pending_handshake = .empty;
-        p.pending_from = .empty;
-        p.wire = .{ .now_nanos = &p.now_nanos };
+        const client_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
+        errdefer alloc.destroy(client_lifecycle);
+        client_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
+        errdefer client_lifecycle.deinit();
 
-        p.client_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
-        p.server_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
-        p.client_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
-        p.server_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
-        try p.client_lifecycle.registerConnectionId(client_handle, &client_scid, client_path, .{ .active_migration_disabled = opts.migration_disabled });
-        try p.server_lifecycle.registerConnectionId(server_handle, &original_dcid, server_path, .{ .active_migration_disabled = opts.migration_disabled });
-        try p.server_lifecycle.registerConnectionId(server_handle, &server_scid, server_path, .{ .active_migration_disabled = opts.migration_disabled });
+        const server_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
+        errdefer alloc.destroy(server_lifecycle);
+        server_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
+        errdefer server_lifecycle.deinit();
+
+        try client_lifecycle.registerConnectionId(client_handle, &client_scid, client_path, .{ .active_migration_disabled = opts.migration_disabled });
+        try server_lifecycle.registerConnectionId(server_handle, &original_dcid, server_path, .{ .active_migration_disabled = opts.migration_disabled });
+        try server_lifecycle.registerConnectionId(server_handle, &server_scid, server_path, .{ .active_migration_disabled = opts.migration_disabled });
 
         const conn_cfg = quicz.Config{
             .initial_max_data = opts.max_data,
@@ -217,37 +221,63 @@ pub const Pair = struct {
             .max_datagram_size = 8192,
             .max_idle_timeout_ms = opts.idle_timeout_ms,
         };
-        p.client = try alloc.create(Connection);
-        p.server = try alloc.create(Connection);
-        p.client.* = try Connection.init(alloc, .client, conn_cfg);
-        p.server.* = try Connection.init(alloc, .server, conn_cfg);
+        const client = try alloc.create(Connection);
+        errdefer alloc.destroy(client);
+        client.* = try Connection.init(alloc, .client, conn_cfg);
+        errdefer client.deinit();
+
+        const server = try alloc.create(Connection);
+        errdefer alloc.destroy(server);
+        server.* = try Connection.init(alloc, .server, conn_cfg);
+        errdefer server.deinit();
+
         // The zmosh gateway validates the peer address out-of-band (SSH
         // bootstrap + Retry) before allocating per-client state.
-        try p.server.validatePeerAddress();
-        try p.client.setLocalInitialSourceConnectionId(&client_scid);
-        try p.server.setLocalInitialSourceConnectionId(&server_scid);
+        try server.validatePeerAddress();
+        try client.setLocalInitialSourceConnectionId(&client_scid);
+        try server.setLocalInitialSourceConnectionId(&server_scid);
 
-        p.client_backend = try alloc.create(Tls13Backend);
-        p.client_psk_copy = opts.client_psk;
-        p.server_psk_copy = opts.server_psk;
-        p.client_backend.* = Tls13Backend.initClientWithPsk(.{
+        const client_backend = try alloc.create(Tls13Backend);
+        errdefer alloc.destroy(client_backend);
+        client_backend.* = Tls13Backend.initClientWithPsk(.{
             .alpn = &alpn_zmosh,
             .server_name = "zmosh",
             .disable_session_resumption = true,
-        }, opts.client_psk);
-        try p.client_backend.setClientPskIdentity(psk_identity);
+        }, opts.client_psk.*);
+        errdefer client_backend.secureWipe();
+        try client_backend.setClientPskIdentity(psk_identity);
 
-        p.server_backend = try alloc.create(Tls13Backend);
-        p.server_backend.* = Tls13Backend.initServerWithPsk(.{
+        const server_backend = try alloc.create(Tls13Backend);
+        errdefer alloc.destroy(server_backend);
+        server_backend.* = Tls13Backend.initServerWithPsk(.{
             .alpn = opts.server_alpn,
             .disable_session_resumption = true,
             // No certificate material: PSK-only or fail.
-        }, opts.server_psk);
-        if (opts.server_identity) |identity| try p.server_backend.setServerPskIdentity(identity);
+        }, opts.server_psk.*);
+        errdefer server_backend.secureWipe();
+        if (opts.server_identity) |identity| try server_backend.setServerPskIdentity(identity);
 
-        p.client_path = client_path;
-        p.server_path = server_path;
-        p.secrets = try protection.deriveInitialSecrets(.v1, &original_dcid);
+        var secrets = try protection.deriveInitialSecrets(.v1, &original_dcid);
+        errdefer protection.secureWipeInitialSecrets(&secrets);
+
+        // All steps succeeded: ownership transfers in one assignment. The
+        // constructor's stack original of the Initial secrets is dead from
+        // here on — wipe it so exactly one live copy remains (the pair's,
+        // wiped again in destroy()).
+        p.* = .{
+            .alloc = alloc,
+            .wire = .{ .now_nanos = &p.now_nanos },
+            .client_lifecycle = client_lifecycle,
+            .server_lifecycle = server_lifecycle,
+            .client = client,
+            .server = server,
+            .client_backend = client_backend,
+            .server_backend = server_backend,
+            .client_path = client_path,
+            .server_path = server_path,
+            .secrets = secrets,
+        };
+        protection.secureWipeInitialSecrets(&secrets);
     }
 
     pub fn deinit(self: *Pair) void {

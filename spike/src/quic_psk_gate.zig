@@ -41,12 +41,11 @@ const alpn_zmosh = [_][]const u8{"zmosh/1"};
 const psk_identity = "zmosh-ssh-bootstrap-v1";
 
 /// Plan Q1 authentication proof: PSK = HKDF-SHA256(bootstrap secret) with
-/// the fixed derivation context `zmosh quic psk v1`.
-fn derivePsk(bootstrap_secret: [32]u8) [32]u8 {
-    const prk = std.crypto.kdf.hkdf.HkdfSha256.extract("zmosh quic psk v1", &bootstrap_secret);
-    var psk: [32]u8 = undefined;
-    std.crypto.kdf.hkdf.HkdfSha256.expand(&psk, psk_identity, prk);
-    return psk;
+/// the fixed derivation context `zmosh quic psk v1`. In place; the caller
+/// owns and wipes the mutable bootstrap original.
+fn derivePsk(out: *[32]u8, bootstrap_secret: *const [32]u8) void {
+    const prk = std.crypto.kdf.hkdf.HkdfSha256.extract("zmosh quic psk v1", bootstrap_secret);
+    std.crypto.kdf.hkdf.HkdfSha256.expand(out, psk_identity, prk);
 }
 
 /// One client/server pair, heap-held so nothing is moved after
@@ -63,14 +62,12 @@ const Pair = struct {
     client_path: quicz.endpoint.Udp4Tuple,
     server_path: quicz.endpoint.Udp4Tuple,
     secrets: protection.InitialSecrets,
-    client_psk_copy: [32]u8 = .{0} ** 32,
-    server_psk_copy: [32]u8 = .{0} ** 32,
     scratch: [8192]u8 = undefined,
 
     fn init(
         alloc: std.mem.Allocator,
-        client_psk: [32]u8,
-        server_psk: [32]u8,
+        client_psk: *const [32]u8,
+        server_psk: *const [32]u8,
         server_identity: ?[]const u8,
         server_alpn: []const []const u8,
     ) !Pair {
@@ -84,15 +81,15 @@ const Pair = struct {
         };
 
         const client_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
-        const server_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
+        errdefer alloc.destroy(client_lifecycle);
         client_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
+        errdefer client_lifecycle.deinit();
+
+        const server_lifecycle = try alloc.create(quicz.EndpointConnectionLifecycle);
+        errdefer alloc.destroy(server_lifecycle);
         server_lifecycle.* = quicz.EndpointConnectionLifecycle.init(alloc);
-        errdefer {
-            client_lifecycle.deinit();
-            server_lifecycle.deinit();
-            alloc.destroy(client_lifecycle);
-            alloc.destroy(server_lifecycle);
-        }
+        errdefer server_lifecycle.deinit();
+
         try client_lifecycle.registerConnectionId(client_handle, &client_scid, client_path, .{ .active_migration_disabled = true });
         try server_lifecycle.registerConnectionId(server_handle, &original_dcid, server_path, .{ .active_migration_disabled = true });
         try server_lifecycle.registerConnectionId(server_handle, &server_scid, server_path, .{ .active_migration_disabled = true });
@@ -104,17 +101,15 @@ const Pair = struct {
             .max_datagram_size = 8192,
         };
         const client = try alloc.create(Connection);
-        const server = try alloc.create(Connection);
+        errdefer alloc.destroy(client);
         client.* = try Connection.init(alloc, .client, conn_cfg);
-        errdefer {
-            client.deinit();
-            alloc.destroy(client);
-        }
+        errdefer client.deinit();
+
+        const server = try alloc.create(Connection);
+        errdefer alloc.destroy(server);
         server.* = try Connection.init(alloc, .server, conn_cfg);
-        errdefer {
-            server.deinit();
-            alloc.destroy(server);
-        }
+        errdefer server.deinit();
+
         // The zmosh gateway validates the peer address out-of-band (SSH
         // bootstrap + Retry) before allocating per-client state.
         try server.validatePeerAddress();
@@ -122,28 +117,34 @@ const Pair = struct {
         try server.setLocalInitialSourceConnectionId(&server_scid);
 
         const client_backend = try alloc.create(Tls13Backend);
+        errdefer alloc.destroy(client_backend);
         client_backend.* = Tls13Backend.initClientWithPsk(.{
             .alpn = &alpn_zmosh,
             .server_name = "zmosh",
             // zmosh never resumes: tickets are rejected, 0-RTT never
             // offered, no resumption state can appear.
             .disable_session_resumption = true,
-        }, client_psk);
+        }, client_psk.*);
+        errdefer client_backend.secureWipe();
         // Public fork API: offer the fixed non-secret external-PSK identity.
         try client_backend.setClientPskIdentity(psk_identity);
 
         const server_backend = try alloc.create(Tls13Backend);
+        errdefer alloc.destroy(server_backend);
         server_backend.* = Tls13Backend.initServerWithPsk(.{
             .alpn = server_alpn,
             .disable_session_resumption = true,
             // No cert_chain_der, no private key: PSK-only or fail.
-        }, server_psk);
+        }, server_psk.*);
+        errdefer server_backend.secureWipe();
         if (server_identity) |identity| try server_backend.setServerPskIdentity(identity);
+
+        // Initial secrets derived last; the return moves them into the
+        // caller's pair, so exactly one live copy exists from here on.
+        const secrets = try protection.deriveInitialSecrets(.v1, &original_dcid);
 
         return .{
             .alloc = alloc,
-            .client_psk_copy = client_psk,
-            .server_psk_copy = server_psk,
             .client_lifecycle = client_lifecycle,
             .server_lifecycle = server_lifecycle,
             .client = client,
@@ -152,7 +153,7 @@ const Pair = struct {
             .server_backend = server_backend,
             .client_path = client_path,
             .server_path = server_path,
-            .secrets = try protection.deriveInitialSecrets(.v1, &original_dcid),
+            .secrets = secrets,
         };
     }
 
@@ -163,8 +164,6 @@ const Pair = struct {
         self.client_backend.secureWipe();
         self.server_backend.secureWipe();
         quicz.protection.secureWipeInitialSecrets(&self.secrets);
-        std.crypto.secureZero(u8, &self.client_psk_copy);
-        std.crypto.secureZero(u8, &self.server_psk_copy);
         self.client.deinit();
         self.server.deinit();
         self.client_lifecycle.deinit();
@@ -221,9 +220,12 @@ test "certificate-free external-PSK handshake and 1-RTT echo" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     try testing.io.randomSecure(&bootstrap);
-    const psk = derivePsk(bootstrap);
+    var psk: [32]u8 = undefined;
+    derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
 
-    var p = try Pair.init(alloc, psk, psk, psk_identity, &alpn_zmosh);
+    var p = try Pair.init(alloc, &psk, &psk, psk_identity, &alpn_zmosh);
     defer p.deinit();
 
     // Flight 1-2: ClientHello -> ServerHello.
@@ -359,12 +361,18 @@ test "wrong PSK fails the handshake at the binder" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     try testing.io.randomSecure(&bootstrap);
-    const good = derivePsk(bootstrap);
+    var good: [32]u8 = undefined;
+    derivePsk(&good, &bootstrap);
+    defer std.crypto.secureZero(u8, &good);
+    defer std.crypto.secureZero(u8, &bootstrap);
     var attacker: [32]u8 = undefined;
     try testing.io.randomSecure(&attacker);
-    const wrong = derivePsk(attacker);
+    defer std.crypto.secureZero(u8, &attacker);
+    var wrong: [32]u8 = undefined;
+    derivePsk(&wrong, &attacker);
+    defer std.crypto.secureZero(u8, &wrong);
 
-    var p = try Pair.init(alloc, wrong, good, psk_identity, &alpn_zmosh);
+    var p = try Pair.init(alloc, &wrong, &good, psk_identity, &alpn_zmosh);
     defer p.deinit();
 
     const ch = try p.buildClientHello();
@@ -399,11 +407,14 @@ test "wrong identity cannot fall back to a certificate path" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     try testing.io.randomSecure(&bootstrap);
-    const psk = derivePsk(bootstrap);
+    var psk: [32]u8 = undefined;
+    derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
 
     // Server binds to a different identity and configures no certificate:
     // an unmatched PSK offer must fail instead of silently downgrading.
-    var p = try Pair.init(alloc, psk, psk, "zmosh-other-v1", &alpn_zmosh);
+    var p = try Pair.init(alloc, &psk, &psk, "zmosh-other-v1", &alpn_zmosh);
     defer p.deinit();
 
     const ch = try p.buildClientHello();
@@ -435,10 +446,13 @@ test "ALPN mismatch is rejected" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     try testing.io.randomSecure(&bootstrap);
-    const psk = derivePsk(bootstrap);
+    var psk: [32]u8 = undefined;
+    derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
     const wrong_alpn = [_][]const u8{"zmosh/2"};
 
-    var p = try Pair.init(alloc, psk, psk, psk_identity, &wrong_alpn);
+    var p = try Pair.init(alloc, &psk, &psk, psk_identity, &wrong_alpn);
     defer p.deinit();
 
     const ch = try p.buildClientHello();
