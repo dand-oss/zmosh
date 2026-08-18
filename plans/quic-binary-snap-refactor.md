@@ -43,7 +43,7 @@ Record these inputs before coding and do not silently advance them:
 | Ghostty snapshot content | `1359973aefb37a9beaa2ec3e8f79df78290ea6f5` | last commit touching `src/terminal/snapshot/` as of the audited tree, 2026-08-15 |
 | **Ghostty production pin** | dand-oss/ghostty `6361b2eac73e8243a7042f517ea95ab87165f105` | fork of upstream `56e1f3a62` plus the public `lib_vt` snapshot re-export; pinned by SHA only (the `zmosh-snapshot-v1` tag is retired: Ghostty's build permits only its own matching `vX.Y.Z` tags at HEAD, so custom tags break a normal checkout) |
 | **quicz remediation base** | dand-oss/quicz `3a75a8b63dd4137f07932d3d85ee773b24ad80c1` | fork of upstream `b4352201` plus the six reviewed Q1 commits; tags `zmosh-quic-q1`/`zmosh-quic-q1-2` |
-| **quicz production pin** | dand-oss/quicz `238a57b9d93344bfbd098bcde865450adeba9274` | the `zmosh-quic-q1-4` tip (immutable tag): upstream `b4352201` + eight reviewed zmosh commits, ending with the bounded-candidate remediation (`653d247` exact stored-exchange slot contract; `238a57b` path validation bound to the candidate path). Zig package hash `quicz-0.1.0-g2J97yxrlgBCQxYnbJBVx1V05SbJqCBuUiA4707_924f`. Suite at the pin: 1900/1900; spike gates green in Debug and ReleaseSafe. `zmosh-quic-q1-3` (`fa6c4c0e…`) remains immutable, superseded history |
+| **quicz production pin** | **pending re-review** | `zmosh-quic-q1-4` (dand-oss/quicz `238a57b9d93344bfbd098bcde865450adeba9274`, immutable) is **superseded**: follow-up review found fail-open path validation (bound challenge consumed on a null arrival hint; total-count route commit) and unproven rollback. The next reviewed quicz commit is a **provisional SHA, pending** — recorded exactly (SHA + package hash) in the spike dependency update and report commit. No production tag until re-review approval; the pin then becomes the reviewed SHA tagged `zmosh-quic-q1-5`. `zmosh-quic-q1-3`/`-q1-4` remain immutable history |
 | Zig | `0.16.0` | project and dependency toolchain |
 
 The current Ghostty dependency (`aa21cae...`) has no snapshot module and must
@@ -293,6 +293,35 @@ or begin the command gateway.
   keys derive from the public destination CID — so the boundary is the
   token-gated candidate, not strict pre-allocation packet authentication.
   The Retry response stays within the received-byte amplification allowance.
+  Four implementation rules are frozen for the remediation:
+
+  - **Fail-closed path validation**: a PATH_RESPONSE for a bound
+    challenge is consumed only when the arrival path is recorded AND
+    equals the binding; a null arrival hint leaves the challenge
+    outstanding. Every public routed short-datagram entry that accepts
+    a path records the arrival hint, with one address-neutral
+    implementation as the single source of truth and IPv4 wrappers as
+    pure `.toUdp()` delegates.
+  - **Path-specific route commit**: route mutation is authorized only
+    by a decrease in the candidate path's own bound-challenge count
+    (`outstandingPathChallengeCountForPath`), never by total-count
+    comparison; legacy unbound challenges never authorize migration.
+  - **Adopted-candidate rollback**: the bounded candidate is adopted
+    into a private capacity-one registry with its route installed
+    (private ownership is not publication); authentication failure — or
+    a `commit()` failure after adoption — retires the record and
+    returns registry/connection/route counts to the pre-adoption
+    baseline, with the registry's `deinit_record` wiping the backend
+    before destruction. Replay semantics: repeated classification
+    before commit is idempotent; commit consumes exactly once;
+    classification after commit is rejected.
+  - **Secret ownership**: `PairOptions` carries PSK pointers; callers
+    own and wipe the mutable bootstrap/PSK/token-secret originals;
+    `derivePsk(out: *[32]u8, bootstrap: *const [32]u8)` writes in
+    place; the harness retains no redundant copies; every backend is
+    `secureWipe()`d before destruction; constructors build resources as
+    locals with adjacent errdefers and assign the Pair only on success.
+
   The one-client-per-gateway policy and authenticated second-client
   rejection are Q3.
 - Prove that a wrong PSK, wrong identity, replayed Initial, and pre-handshake
