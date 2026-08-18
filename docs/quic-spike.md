@@ -1,22 +1,23 @@
-# Q1 QUIC feasibility spike report — round-4 resubmission
+# Q1 QUIC feasibility spike report — round-4 resubmission (APPROVED)
 
-**Verdict: GO, pending re-review.** Both hard gates pass against the
+**Verdict: GO — approved 2026-08-18 at the exact untagged-then-tagged
+SHA `d854133`.** Both hard gates pass against the
 pinned dand-oss forks under the frozen round-4 rules: fail-closed
 candidate-path validation with the ReceivePathHintScope guard at every
 PATH_RESPONSE-capable receive root, the adoption-transaction rollback,
 fresh-packet-number proofs, and complete secret wipes. Spike branch:
 `8sd1-quic-q1-spike`, governed by the canonical plan synced from
-`replant-zmx0.7` at `ad86781`. **No production tag exists yet**: the quicz dependency below
-is an untagged review dependency, and the production pin (immutable
-`zmosh-quic-q1-5` at the reviewed SHA) is created only after re-review
-approval. Q2 remains locked until that closure completes.
+`replant-zmx0.7` (plan pin row at `b860063`). **The production pin now
+exists**: the reviewed SHA below is tagged immutable `zmosh-quic-q1-5`
+(annotated tag object verified to peel to the exact commit), and Q1's
+post-approval closure completes with the bead closed and Q2 unlocked.
 
 ## Exact dependency pins
 
 | Dependency | Pin | Base | Tag status |
 |---|---|---|---|
 | Ghostty | `git+https://github.com/dand-oss/ghostty#6361b2eac73e8243a7042f517ea95ab87165f105` (hash `ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD`) | upstream `56e1f3a62` | SHA-only (the `zmosh-snapshot-v1` tag is retired — Ghostty's own build permits only its `vX.Y.Z` tags at HEAD, verified: `test-lib-vt` exit 0 from an ordinary untagged checkout) |
-| quicz | `git+https://github.com/dand-oss/quicz#d854133d39b8d024e0b19ac34f84ef821d7766b9` (hash `quicz-0.1.0-g2J9778GlwAog98LXhKJ_bcuXttrr2432UdJ9T3scPsp`) | upstream `b4352201` | **untagged review dependency** — `zmosh-quic-q1-4` (`238a57b`), the round-3 tip `470c4bd`, and the round-4 tip `7093988` are superseded, immutable history; no production tag until re-review approval |
+| quicz | `git+https://github.com/dand-oss/quicz#d854133d39b8d024e0b19ac34f84ef821d7766b9` (hash `quicz-0.1.0-g2J9778GlwAog98LXhKJ_bcuXttrr2432UdJ9T3scPsp`) | upstream `b4352201` | **production pin — immutable `zmosh-quic-q1-5`** (approved 2026-08-18; annotated tag peels to the exact SHA); `zmosh-quic-q1-4` (`238a57b`), the round-3 tip `470c4bd`, and the round-4 tip `7093988` are superseded, immutable history |
 
 Forks keep upstream remotes for synchronization; zmosh pins exact
 commits; tags never move. The provisional SHA recorded in the plan
