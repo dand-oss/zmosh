@@ -43,7 +43,7 @@ Record these inputs before coding and do not silently advance them:
 | Ghostty snapshot content | `1359973aefb37a9beaa2ec3e8f79df78290ea6f5` | last commit touching `src/terminal/snapshot/` as of the audited tree, 2026-08-15 |
 | **Ghostty production pin** | dand-oss/ghostty `6361b2eac73e8243a7042f517ea95ab87165f105` | fork of upstream `56e1f3a62` plus the public `lib_vt` snapshot re-export; pinned by SHA only (the `zmosh-snapshot-v1` tag is retired: Ghostty's build permits only its own matching `vX.Y.Z` tags at HEAD, so custom tags break a normal checkout) |
 | **quicz remediation base** | dand-oss/quicz `3a75a8b63dd4137f07932d3d85ee773b24ad80c1` | fork of upstream `b4352201` plus the six reviewed Q1 commits; tags `zmosh-quic-q1`/`zmosh-quic-q1-2` |
-| **quicz production pin** | the future `zmosh-quic-q1-3` target | defined as the tip after the three remediation commits (conservative stream progress; address-neutral Retry/token/migration; secret ownership); recorded exactly in one pin-only plan/report commit once that suite is green |
+| **quicz production pin** | the future `zmosh-quic-q1-4` target | `zmosh-quic-q1-3` (`fa6c4c0e…`, immutable) is **superseded**: its PendingRetrySlot and path-validation follow-up review found the blockers corrected by the next two reviewed commits (hardened slot: occupied/exact-tuple/exact-token contract; lifecycle path validation bound to the candidate path). The production pin becomes the `zmosh-quic-q1-4` tip after those commits pass the full suite and the spike gates; its exact SHA/hash is recorded in one pin-only plan/report commit |
 | Zig | `0.16.0` | project and dependency toolchain |
 
 The current Ghostty dependency (`aa21cae...`) has no snapshot module and must
@@ -236,12 +236,14 @@ or begin the command gateway.
 - Prove IPv4, IPv6, and dual-stack operation without regressing current zmosh
   behavior.
 - Prove all required behavior through public quicz APIs of the dand-oss fork.
-  The production pin is the `zmosh-quic-q1-3` tip: upstream `b4352201` plus
+  The production pin is the `zmosh-quic-q1-4` tip: upstream `b4352201` plus
   the reviewed remediation commits (conservative stream-progress metric;
   address-neutral paths across routing, Initial acceptance, Retry, token
-  policy, migration, and route updates; secret ownership and teardown). Each
+  policy, migration, and route updates; secret ownership and teardown; the
+  hardened bounded-candidate slot; candidate-path-bound validation). Each
   commit passes the full quicz suite; the fork tracks upstream
-  `venjiang/quicz` for future synchronization.
+  `venjiang/quicz` for future synchronization. `zmosh-quic-q1-3` and every
+  earlier tag remain immutable history.
 - Keep the production compatibility adapter below 500 non-test lines. This
   excludes zmosh's application protocol but includes all quicz-specific
   lifecycle glue.
@@ -267,22 +269,32 @@ or begin the command gateway.
   This is QUIC/TLS handshake resumption, not zmosh terminal reattachment; the
   latter remains supported through a fresh authenticated connection followed
   by snapshot installation.
-- Require QUIC Retry/address validation before client state: the first
-  Initial allocates no connection-sized or unbounded per-client state. One
-  bounded token/Retry buffer is permitted. The pending-Retry slot matches on
-  the full UDP path, QUIC version, original DCID, and client SCID — never
-  byte-identical datagrams; retransmissions reissue the same Retry without
-  extending the absolute ten-second expiry; unrelated Initials are dropped
-  while the slot is occupied. The token is validated without consuming
-  replay state, the protected follow-up Initial is authenticated, and only
-  then is the connection allocated transactionally; the token is consumed
-  and the slot cleared only after successful acceptance. Assertions compare
-  against the pre-Initial baseline: every invalid, expired, replayed,
-  wrong-path, or unrelated Initial produces zero delta in active Connection,
-  TLS, stream, and route state, and one valid follow-up Initial creates
-  exactly one connection. The Retry response stays within the received-byte
-  amplification allowance. The one-client-per-gateway policy and
-  authenticated second-client rejection are Q3.
+- Require QUIC Retry/address validation before published client state,
+  using the approved **bounded-candidate** contract. The first Initial
+  allocates no connection-sized or unbounded per-client state; one bounded
+  token/Retry buffer is permitted. The pending-Retry slot matches on the
+  full UDP path, QUIC version, original DCID, and client SCID — never
+  byte-identical datagrams; tokenless retransmissions matching that tuple
+  reissue the same Retry without extending the absolute ten-second expiry;
+  unrelated Initials are dropped while the slot is occupied. A token-bearing
+  follow-up is accepted only when the slot is occupied and unexpired and its
+  path, version, Retry SCID, client SCID, and token match the stored
+  exchange exactly. After that exact validation, at most one bounded,
+  unpublished candidate connection is created; the follow-up Initial is
+  authenticated and processed against the candidate, and only on success is
+  the candidate published and the token consumed (clearing the slot). Any
+  parse or authentication failure wipes the candidate and rolls every
+  allocation back to the pre-Initial baseline. `commit()` consumes only the
+  exact stored token. Assertions compare against the pre-Initial baseline:
+  every malformed, expired, replayed, wrong-path, unrelated, or
+  unauthenticated attempt leaves candidate/Connection/TLS/stream/route
+  counts at zero delta, and one valid follow-up creates exactly one
+  candidate. QUIC Initial protection is not client authentication — the
+  keys derive from the public destination CID — so the boundary is the
+  token-gated candidate, not strict pre-allocation packet authentication.
+  The Retry response stays within the received-byte amplification allowance.
+  The one-client-per-gateway policy and authenticated second-client
+  rejection are Q3.
 - Prove that a wrong PSK, wrong identity, replayed Initial, and pre-handshake
   application data cannot reach application dispatch.
 - Zeroize secrets in their real owners: `Tls13ServerTransport.deinit()`
@@ -349,7 +361,7 @@ Write `docs/quic-spike.md` with exact SHAs, patches/API gaps, test output,
 binary/build measurements, platform results, and residual risks.
 
 QUIC is accepted only if every hard gate above passes. On acceptance, the
-production quicz pin is the `zmosh-quic-q1-3` fork tip recorded in the
+production quicz pin is the `zmosh-quic-q1-4` fork tip recorded in the
 frozen-inputs table. If a hard gate fails, stop and follow the fallback
 section; do not weaken the gate during implementation.
 
