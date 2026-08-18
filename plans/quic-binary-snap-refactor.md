@@ -653,6 +653,42 @@ all new commits use the exact required `Changed:`/`Fixed:` prefixes.
 Q2 item 3 (poll-loop integration) stays LOCKED until this correction
 passes review.
 
+### Round-3 correction contract (frozen 2026-08-18)
+
+Verdict on round 2: narrow send-back. The QUIC direction is correct
+and quicz is not failing (144/144 in Debug and ReleaseSafe, independently
+verified). Three corrections:
+
+1. **Borrowed InitialSecrets access.** All stored InitialSecrets
+   access is borrowed by pointer (`|*secrets|`); no optional payload
+   is captured by value — the transport remains the sole owner and no
+   unwiped stack copy of secret material exists in production or test
+   code.
+2. **Route lookup error split.** Route lookup drops network routing
+   errors but propagates `OutOfMemory`: `routeVerified` returns
+   `!bool`, counting and discarding every network routing failure and
+   `path_changed` while the locally generated allocation failure
+   propagates loudly.
+3. **Unknown-CID coverage proves route-first dispatch.** The test uses
+   a genuine protected follow-up Initial against a real post-Retry
+   server candidate with NO route installed — a datagram that WOULD
+   decrypt if handed to packet processing — plus a positive control
+   proving the identical datagram is accepted after its route is
+   installed. AEAD rejection can no longer masquerade as routing.
+
+Also frozen in this round: `peekProtectedLongPacketInfo()` is the sole
+long-header parser — adapter and tests do no byte-offset header
+parsing; sizing reads as client Initials at least 1200 bytes, server
+ACK-only Initials possibly smaller, every emitted datagram at most
+1232 bytes; the Retry test boundary generates its token secret as a
+mutable local wiped by an immediate defer (the policy retains and
+wipes the sole copy through its own `deinit`), with no unused
+allocator or duplicate-secret fields; unused test-only fields exposed
+by the cleanup are removed; the adapter's responsibilities are not
+broadened. Q2 item 3 stays locked. Round-2 commits `aa58460` and
+`8173b7d` are immutable history including their missing `Refs:`
+trailers; both round-3 commits carry `Refs: zmosh-8sd.2`.
+
 Do not remove the custom modules until the PSK QUIC loopback, migration, and
 shutdown tests pass in zmosh. Then remove custom XChaCha framing, packet ACKs,
 retransmission windows, replay window, heartbeat packets, reorder buffers, and
