@@ -424,9 +424,24 @@ pub fn main() !void {
             const command = if (command_args.items.len > 0) command_args.items else null;
             const session = remote.connectRemote(alloc, host, sesh, command) catch |err| {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
-                return;
+                // std.log goes to the log file; a kitty --hold tab or a
+                // scripted caller needs the failure on stderr and a
+                // non-zero exit, distinct from a normal detach.
+                var msg_buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &msg_buf,
+                    "zmx: remote connect to {s} failed: {s} (see {s}/zmx.log)\n",
+                    .{ host, @errorName(err), cfg.log_dir },
+                ) catch "zmx: remote connect failed\n";
+                _ = posix.write(posix.STDERR_FILENO, msg) catch {};
+                std.process.exit(2);
             };
-            return remote.remoteAttach(alloc, session);
+            remote.remoteAttach(alloc, session) catch |err| switch (err) {
+                // Message already written to the terminal by remoteAttach.
+                error.ConnectionLost => std.process.exit(3),
+                else => return err,
+            };
+            return;
         }
 
         // Local attach (existing behavior)
@@ -1903,6 +1918,68 @@ fn serializeTerminal(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, forma
         std.log.warn("failed to allocate terminal output err={s}", .{@errorName(err)});
         return null;
     };
+}
+
+test "session persists and stays attachable after its last client disconnects" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const socket_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(socket_dir);
+    const log_dir = try std.fs.path.join(alloc, &.{ socket_dir, "logs" });
+    defer alloc.free(log_dir);
+
+    var cfg = Cfg{ .socket_dir = socket_dir, .log_dir = log_dir };
+    try cfg.mkdir();
+
+    const sesh = "regress-gateway-gone";
+    const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+    const command: []const []const u8 = &.{ "sleep", "600" };
+    var daemon = Daemon{
+        .running = true,
+        .cfg = &cfg,
+        .alloc = alloc,
+        .clients = clients,
+        .session_name = sesh,
+        .socket_path = undefined,
+        .pid = undefined,
+        .command = command,
+        .cwd = socket_dir,
+        .created_at = @intCast(std.time.nanoTimestamp()),
+    };
+    daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, sesh);
+    defer alloc.free(daemon.socket_path);
+    defer daemon.clients.deinit(alloc);
+
+    const result = try ensureSession(&daemon);
+    // The forked daemon child only returns here after the session is
+    // killed; it must not continue running the test binary.
+    if (result.is_daemon) posix.exit(0);
+    try std.testing.expect(result.created);
+
+    // A probe of the fresh session reports zero attached clients.
+    const probe1 = try probeSession(alloc, daemon.socket_path);
+    posix.close(probe1.fd);
+    try std.testing.expectEqual(@as(usize, 0), probe1.info.clients_len);
+
+    // Simulate a remote gateway: connect as a client, then vanish
+    // without sending Detach, like a dropped SSH bootstrap.
+    const gateway_fd = try sessionConnect(daemon.socket_path);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    posix.close(gateway_fd);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // The daemon must still be alive, attachable, and back to zero clients.
+    const probe2 = try probeSession(alloc, daemon.socket_path);
+    posix.close(probe2.fd);
+    try std.testing.expectEqual(@as(usize, 0), probe2.info.clients_len);
+
+    // Cleanup: kill the session and reap the forked daemon child.
+    const kill_fd = try sessionConnect(daemon.socket_path);
+    try ipc.send(kill_fd, .Kill, "");
+    posix.close(kill_fd);
+    _ = posix.waitpid(-1, 0);
 }
 
 test "isKittyCtrlBackslash" {
