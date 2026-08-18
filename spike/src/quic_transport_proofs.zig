@@ -366,7 +366,7 @@ test "migration: PATH_CHALLENGE/RESPONSE commits the route; wrong responses cann
     // and sends it on the candidate path.
     var challenge_bytes: [8]u8 = undefined;
     try testing.io.randomSecure(&challenge_bytes);
-    try p.server.sendPathChallenge(challenge_bytes);
+    try p.server.sendPathChallengeForPath(challenge_bytes, p.server_path.toUdp());
     try testing.expect(p.server.pendingPathChallengeCount() > 0);
     try p.flushServerShort();
 
@@ -418,7 +418,7 @@ test "migration: stale, wrong, and old-path responses cannot commit" {
     // data is rejected at frame level inside quicz).
     var challenge: [8]u8 = undefined;
     try testing.io.randomSecure(&challenge);
-    try p.server.sendPathChallenge(challenge);
+    try p.server.sendPathChallengeForPath(challenge, p.server_path.toUdp());
     try p.flushServerShort();
     try testing.expect(p.server.outstandingPathChallengeCount() > 0);
     const still_old = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
