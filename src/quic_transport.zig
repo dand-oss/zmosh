@@ -315,7 +315,7 @@ pub const Transport = struct {
             // long-header type bits (0b11 = Retry, RFC 9000 §17.2.2).
             error.UnsupportedPacketType => {
                 if (data.len > 0 and (data[0] & 0xC0) == 0xC0 and (data[0] & 0x30) == 0x30) {
-                    if (self.routeVerified(arrival, data)) try self.processRetry(now_nanos, data);
+                    if (try self.routeVerified(arrival, data)) try self.processRetry(now_nanos, data);
                 } else {
                     self.counters.datagrams_discarded += 1;
                 }
@@ -331,8 +331,8 @@ pub const Transport = struct {
             },
         };
         switch (info.packet_type) {
-            .initial => if (self.routeVerified(arrival, data)) try self.processInitial(now_nanos, data),
-            .handshake => if (self.routeVerified(arrival, data)) try self.processHandshake(now_nanos, data),
+            .initial => if (try self.routeVerified(arrival, data)) try self.processInitial(now_nanos, data),
+            .handshake => if (try self.routeVerified(arrival, data)) try self.processHandshake(now_nanos, data),
             // v1 sends no 0-RTT and accepts no Version Negotiation
             // beyond the pinned version: both are foreign traffic.
             else => self.counters.datagrams_discarded += 1,
@@ -341,14 +341,19 @@ pub const Transport = struct {
 
     /// Route-first dispatch for every long datagram: its DCID must
     /// route to THIS transport's handle on the REGISTERED path. Any
-    /// route error — unknown or ambiguous CID, malformed header — or a
-    /// changed path discards the datagram before any packet processing;
-    /// path migration is validated 1-RTT behavior (the short entry),
-    /// never a long-space event.
-    fn routeVerified(self: *Transport, arrival: quicz.endpoint.UdpTuple, data: []const u8) bool {
-        const route = self.lifecycle.routeAndVerifyDatagramAddress(handle, arrival, data) catch {
-            self.counters.datagrams_discarded += 1;
-            return false;
+    /// network routing failure — unknown or ambiguous CID, malformed
+    /// header — or a changed path discards the datagram before any
+    /// packet processing; a locally generated `OutOfMemory` propagates
+    /// loudly instead of masquerading as network traffic. Path
+    /// migration is validated 1-RTT behavior (the short entry), never
+    /// a long-space event.
+    fn routeVerified(self: *Transport, arrival: quicz.endpoint.UdpTuple, data: []const u8) !bool {
+        const route = self.lifecycle.routeAndVerifyDatagramAddress(handle, arrival, data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                self.counters.datagrams_discarded += 1;
+                return false;
+            },
         };
         if (route.path_changed) {
             self.counters.datagrams_discarded += 1;
@@ -358,21 +363,23 @@ pub const Transport = struct {
     }
 
     /// quicz's own OrClose processor for Initial space, behind the one
-    /// shared receive-error classification.
+    /// shared receive-error classification. The stored secrets are
+    /// BORROWED by pointer — the transport stays their sole owner and
+    /// no stack copy is ever taken.
     fn processInitial(self: *Transport, now_nanos: i64, data: []const u8) !void {
-        const secrets = self.secrets orelse {
-            self.counters.datagrams_discarded += 1;
-            return;
-        };
         const was_active = self.conn.connectionState() == .active;
-        _ = self.lifecycle.processProtectedLongDatagramOrClose(
-            handle,
-            self.conn,
-            now_nanos,
-            .{ .initial = if (self.is_server) secrets.client else secrets.server },
-            data,
-        ) catch |err| return self.classifyReceive(was_active, err);
-        self.noteViolation(was_active);
+        if (self.secrets) |*secrets| {
+            _ = self.lifecycle.processProtectedLongDatagramOrClose(
+                handle,
+                self.conn,
+                now_nanos,
+                .{ .initial = if (self.is_server) secrets.client else secrets.server },
+                data,
+            ) catch |err| return self.classifyReceive(was_active, err);
+            self.noteViolation(was_active);
+        } else {
+            self.counters.datagrams_discarded += 1;
+        }
     }
 
     fn processHandshake(self: *Transport, now_nanos: i64, data: []const u8) !void {
@@ -477,7 +484,7 @@ pub const Transport = struct {
     /// tolerated non-event; encoding/invariant errors propagate.
     pub fn pollOutbound(self: *Transport, now_nanos: i64) !?[]u8 {
         if (!self.conn.packetNumberSpaceDiscarded(.initial)) {
-            if (self.secrets) |secrets| {
+            if (self.secrets) |*secrets| {
                 if (self.lifecycle.pollProtectedLongDatagram(
                     handle,
                     self.conn,
@@ -556,38 +563,35 @@ pub const Transport = struct {
         return self.conn.peerDestinationConnectionId() orelse self.clientInitialDst();
     }
 
-    /// The Initial emission invariants, checked against the ENCODED
-    /// header and quicz's own stored CID state — an authority
-    /// independent of the value handed to the encoder: every Initial
-    /// is within the fixed cap and addressed to the authoritative
-    /// destination; client Initials additionally meet the 1200 floor.
-    /// A violation frees the datagram and is a local error. No
-    /// ack-eliciting inference: a valid server ACK-only Initial may be
-    /// under the floor.
+    /// The Initial emission invariants, checked by re-parsing the
+    /// ENCODED header through the same quicz peek used everywhere else
+    /// and comparing against quicz's own stored CID state — an
+    /// authority independent of the value handed to the encoder:
+    /// every Initial is an Initial within the fixed cap and addressed
+    /// to the authoritative destination; client Initials additionally
+    /// meet the 1200 floor. A violation frees the datagram and is a
+    /// local error. No ack-eliciting inference: a valid server
+    /// ACK-only Initial may be under the floor.
     fn initialChecked(self: *Transport, dg: []u8) !?[]u8 {
         const authority = if (self.is_server)
             self.conn.peerInitialSourceConnectionId()
         else
             self.conn.retrySourceConnectionId() orelse self.odcid_buf[0..self.odcid_len];
-        const ok = dg.len <= max_udp_payload and
+        const info = protection.peekProtectedLongPacketInfo(dg) catch {
+            self.alloc.free(dg);
+            return error.InitialInvariantViolated;
+        };
+        const ok = info.packet_type == .initial and
+            dg.len <= max_udp_payload and
             (self.is_server or dg.len >= min_initial_dgram) and
             authority != null and
-            initialDcidIs(dg, authority.?);
+            std.mem.eql(u8, info.dcid, authority.?);
         if (!ok) {
             self.alloc.free(dg);
             return error.InitialInvariantViolated;
         }
         self.counters.datagrams_sent += 1;
         return dg;
-    }
-
-    /// Re-parse the encoded long header and compare its DCID against
-    /// the authoritative stored CID: [0]=flags, [1..5]=version,
-    /// [5]=DCID length, [6..]=DCID.
-    fn initialDcidIs(dg: []const u8, authority: []const u8) bool {
-        if (dg.len < 6 or dg[5] != authority.len) return false;
-        if (dg.len < 6 + authority.len) return false;
-        return std.mem.eql(u8, dg[6 .. 6 + authority.len], authority);
     }
 
     /// Queue an application CONNECTION_CLOSE and enter the closing
@@ -607,7 +611,6 @@ const testing = std.testing;
 /// itself. The registry's deinit_record destroys the transport (whose
 /// single wipe path runs first).
 const CandidateRecord = struct {
-    alloc: std.mem.Allocator,
     transport: *Transport,
 
     fn connectionOf(record: *CandidateRecord) *Connection {
@@ -628,10 +631,11 @@ const CandidateRegistry = quicz.EndpointConnectionRegistry(
 );
 
 /// The gateway-side machinery the adapter deliberately does not own:
-/// token policy, PendingRetrySlot, and private adoption.
+/// token policy, PendingRetrySlot, and private adoption. The token
+/// secret's mutable original exists only inside `init`, wiped by an
+/// immediate defer; the policy retains the sole copy and its `deinit`
+/// wipes it.
 const RetryBoundary = struct {
-    alloc: std.mem.Allocator,
-    secret: quicz.address_validation_token.Secret,
     policy: quicz.endpoint.AddressValidationPolicy,
     slot: quicz.pending_retry_slot.PendingRetrySlot = .{},
     registry: CandidateRegistry,
@@ -640,23 +644,26 @@ const RetryBoundary = struct {
     fn init(alloc: std.mem.Allocator) !RetryBoundary {
         var secret: quicz.address_validation_token.Secret = undefined;
         try testing.io.randomSecure(&secret);
+        defer std.crypto.secureZero(u8, &secret);
+        var policy = quicz.endpoint.AddressValidationPolicy.init(alloc, secret, .{});
+        errdefer policy.deinit();
+        var registry = try CandidateRegistry.initWithCapacity(alloc, 1);
+        errdefer registry.deinit();
         return .{
-            .alloc = alloc,
-            .secret = secret,
-            .policy = quicz.endpoint.AddressValidationPolicy.init(alloc, secret, .{}),
-            .registry = try CandidateRegistry.initWithCapacity(alloc, 1),
+            .policy = policy,
+            .registry = registry,
             .nonce = [_]u8{0x42} ** quicz.address_validation_token.nonce_len,
         };
     }
 
     /// Idempotent full cleanup: removes the adopted candidate (whose
     /// deinit_record destroys the transport through its single wipe
-    /// path) before releasing the policy and wiping the secret.
+    /// path) before releasing the registry and the policy (whose
+    /// deinit wipes its retained token secret).
     fn deinit(self: *RetryBoundary) void {
         self.registry.remove(1) catch {};
         self.registry.deinit();
         self.policy.deinit();
-        std.crypto.secureZero(u8, &self.secret);
     }
 };
 
@@ -665,9 +672,24 @@ const retry_scid = [_]u8{ 0x31, 0x32, 0x33, 0x34 };
 const original_dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
 
 /// Create the server candidate and adopt it into the boundary's
-/// private capacity-one registry. On success the registry owns the
-/// record and the transport; the caller cleans up through
-/// `RetryBoundary.deinit` (idempotent).
+/// private capacity-one registry WITHOUT installing a CID route. On
+/// success the registry owns the record and the transport; the caller
+/// cleans up through `RetryBoundary.deinit` (idempotent).
+fn adoptCandidate(
+    alloc: std.mem.Allocator,
+    boundary: *RetryBoundary,
+    opts: ServerCandidateOptions,
+) !*Transport {
+    const server = try Transport.createServerCandidate(alloc, opts);
+    errdefer server.destroy();
+    const record = try alloc.create(CandidateRecord);
+    errdefer alloc.destroy(record);
+    record.* = .{ .transport = server };
+    try boundary.registry.adopt(1, record);
+    return server;
+}
+
+/// Adopt as above, then install the CID route.
 fn createAndAdopt(
     alloc: std.mem.Allocator,
     boundary: *RetryBoundary,
@@ -675,13 +697,8 @@ fn createAndAdopt(
     local: quicz.endpoint.UdpAddress,
     remote: quicz.endpoint.UdpAddress,
 ) !*Transport {
-    const server = try Transport.createServerCandidate(alloc, opts);
-    errdefer server.destroy();
+    const server = try adoptCandidate(alloc, boundary, opts);
     try server.registerRoute(local, remote);
-    const record = try alloc.create(CandidateRecord);
-    errdefer alloc.destroy(record);
-    record.* = .{ .alloc = alloc, .transport = server };
-    try boundary.registry.adopt(1, record);
     return server;
 }
 
@@ -825,14 +842,16 @@ const TestPair = struct {
         const sh = (try server.pollOutbound(now)) orelse return error.NotAuthenticated;
         defer alloc.free(sh);
 
-        // The ServerHello is addressed to the client's SCID — asserted
-        // against the ENCODED header, not the encoder's input — and
-        // padded within the Initial invariants (quicz pads
-        // ack-eliciting server Initials to the 1200 floor).
+        // The ServerHello is asserted by re-parsing its encoded header
+        // through the same quicz peek production uses — an Initial,
+        // addressed to the client's SCID, padded within the fixed
+        // invariants (quicz pads ack-eliciting server Initials to the
+        // 1200 floor).
+        const sh_info = try protection.peekProtectedLongPacketInfo(sh);
+        try testing.expect(sh_info.packet_type == .initial);
         try testing.expect(sh.len >= min_initial_dgram);
         try testing.expect(sh.len <= max_udp_payload);
-        try testing.expectEqual(@as(u8, client_scid.len), sh[5]);
-        try testing.expectEqualSlices(u8, &client_scid, sh[6 .. 6 + client_scid.len]);
+        try testing.expectEqualSlices(u8, &client_scid, sh_info.dcid);
 
         // ── Commit BEFORE publication or echo. ───────────────────────
         try ex.boundary.slot.commit(&ex.boundary.policy, now, ex.commit_token);
@@ -853,6 +872,7 @@ const TestPair = struct {
             .followup = ex.followup,
             .token = ex.token,
         };
+        errdefer pair.deinit(alloc);
         try pair.completeHandshake(alloc);
         return pair;
     }
@@ -1130,7 +1150,7 @@ test "shutdown: initiator closing, peer draining, single wipe path" {
     // calls. Both secret sets zeroed while the transport exists.
     pair.client.wipeSecrets();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&pair.client.backend.hs.key_schedule.early_secret), 0));
-    if (pair.client.secrets) |s| {
+    if (pair.client.secrets) |*s| {
         try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&s.client.secret), 0));
     }
     // destroy() wipes again (idempotent) and frees everything under
@@ -1186,7 +1206,7 @@ test "wrong-PSK candidate: binder failure, no commit, registry retirement" {
     try testing.expectEqual(@as(usize, 0), ex.boundary.policy.replayFilterEntryCount());
 }
 
-test "unknown-CID Initial is discarded without connection mutation" {
+test "unknown-CID Initial is discarded by routing; the same datagram is accepted once routed" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     var psk: [32]u8 = undefined;
@@ -1194,32 +1214,60 @@ test "unknown-CID Initial is discarded without connection mutation" {
     defer std.crypto.secureZero(u8, &bootstrap);
     defer std.crypto.secureZero(u8, &psk);
 
-    var pair = try TestPair.init(alloc, &psk);
-    defer pair.deinit(alloc);
+    var ex = try FirstExchange.open(alloc, &psk);
+    defer ex.deinit(alloc);
 
-    // An otherwise structurally valid v1 Initial on the correct path —
-    // flags, version, well-formed CIDs, empty token, a 256-byte
-    // protected-region length, 1200-byte datagram — addressed to an
-    // UNREGISTERED destination CID: routing rejects it before any
-    // packet processing.
-    var foreign: [1200]u8 = undefined;
-    @memset(&foreign, 0);
-    foreign[0] = 0xC3;
-    foreign[1..5].* = .{ 0, 0, 0, 1 };
-    foreign[5] = 4;
-    foreign[6..10].* = .{ 0xde, 0xad, 0xbe, 0xef };
-    foreign[10] = 4;
-    foreign[11..15].* = retry_scid;
-    foreign[15] = 0x00; // token length varint: empty
-    foreign[16] = 0x41; // length varint (2-byte form): 256
-    foreign[17] = 0x00;
+    // A real post-Retry server candidate, adopted into the private
+    // registry but with NO CID route installed.
+    const server = try adoptCandidate(alloc, &ex.boundary, .{
+        .psk = &psk,
+        .retry_scid = retry_scid,
+        .original_dcid = original_dcid,
+        .client_scid = client_scid,
+        .token = ex.token,
+        .now_nanos = ex.now_nanos,
+    });
 
-    const pn_before = pair.server.conn.nextPeerPacketNumber(.initial);
-    const discards = pair.server.counters.datagrams_discarded;
-    try pair.server.handleDatagram(pair.server_path, pair.now_nanos, &foreign);
-    try testing.expectEqual(discards + 1, pair.server.counters.datagrams_discarded);
-    try testing.expectEqual(pn_before, pair.server.conn.nextPeerPacketNumber(.initial));
-    try testing.expect(pair.server.conn.connectionState() == .active);
+    // The GENUINE protected follow-up Initial — a datagram that would
+    // decrypt and advance packet numbers if it ever reached packet
+    // processing — is discarded by route lookup alone. This fails if
+    // route-first dispatch is bypassed.
+    try testing.expectEqual(@as(u64, 0), server.conn.nextPeerPacketNumber(.initial));
+    const discards = server.counters.datagrams_discarded;
+    try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup);
+    try testing.expectEqual(discards + 1, server.counters.datagrams_discarded);
+    try testing.expectEqual(@as(u64, 0), server.conn.nextPeerPacketNumber(.initial));
+    try testing.expect(server.conn.connectionState() == .active);
+
+    // Positive control: install the route and the IDENTICAL datagram
+    // is accepted — the rejection above was routing, not AEAD.
+    try server.registerRoute(ex.server_path.local, ex.server_path.remote);
+    try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup);
+    try testing.expect(server.conn.nextPeerPacketNumber(.initial) > 0);
+}
+
+test "initialChecked rejects an altered destination CID and frees the datagram" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testPsk(&bootstrap, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var ex = try FirstExchange.open(alloc, &psk);
+    defer ex.deinit(alloc);
+
+    // A genuine emitted client Initial, duplicated and altered ONLY
+    // in its encoded DCID — located through the same quicz peek
+    // production uses, not by byte offsets.
+    const bad = try alloc.dupe(u8, ex.followup);
+    const info = try protection.peekProtectedLongPacketInfo(bad);
+    @constCast(info.dcid)[0] ^= 0xff;
+
+    const sent = ex.client.counters.datagrams_sent;
+    try testing.expectError(error.InitialInvariantViolated, ex.client.initialChecked(bad));
+    try testing.expectEqual(sent, ex.client.counters.datagrams_sent);
+    // The rejected datagram was freed; the testing allocator proves it.
 }
 
 test "changed-path Initial is discarded before state change; correct path still delivers" {
@@ -1303,13 +1351,18 @@ test "malformed Retry: integrity-tag corruption discards without rekey" {
     defer alloc.free(corrupt);
     corrupt[corrupt.len - 1] ^= 0xff;
 
-    const secrets_before = client.secrets;
+    // Expected Initial secrets for a client that has NOT rekeyed:
+    // derived from the first-flight ODCID into a mutable temporary
+    // wiped the moment construction finishes — no by-value capture of
+    // the transport's stored secrets.
+    var expected = try protection.deriveInitialSecrets(.v1, &original_dcid);
+    defer protection.secureWipeInitialSecrets(&expected);
     const discards = client.counters.datagrams_discarded;
     try client.handleDatagram(client_path, now, corrupt);
     try testing.expectEqual(discards + 1, client.counters.datagrams_discarded);
     // No rekey: no Retry SCID recorded, Initial secrets unchanged.
     try testing.expect(client.conn.retrySourceConnectionId() == null);
-    try testing.expectEqual(secrets_before, client.secrets);
+    try testing.expectEqual(expected, client.secrets.?);
     try testing.expect(client.conn.connectionState() == .active);
 }
 
@@ -1331,13 +1384,14 @@ test "authenticated violation: fresh PN, closing, close via pollOutbound, peer d
     // reject it.
     const pn = pair.server.conn.nextPeerPacketNumber(.application);
     const invalid_plaintext = [_]u8{0x1f} ++ ([_]u8{0} ** 31);
-    const send_keys = pair.client.conn.local_one_rtt_key_phase_state.?.current;
+    // The key state is BORROWED from the connection, not retained as
+    // a local copy.
     const bad = try protection.protectShortPacketAes128(alloc, .{
         .dcid = &retry_scid,
         .spin_bit = false,
         .key_phase = false,
         .packet_number = pn,
-    }, try quicz.packet.encodePacketNumberForHeader(pn, null), send_keys, &invalid_plaintext);
+    }, try quicz.packet.encodePacketNumberForHeader(pn, null), pair.client.conn.local_one_rtt_key_phase_state.?.current, &invalid_plaintext);
     defer alloc.free(bad);
 
     const violations = pair.server.counters.protocol_violations;
