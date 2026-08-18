@@ -298,10 +298,11 @@ or begin the command gateway.
   - **Fail-closed path validation**: a PATH_RESPONSE for a bound
     challenge is consumed only when the arrival path is recorded AND
     equals the binding; a null arrival hint leaves the challenge
-    outstanding. Every public routed short-datagram entry that accepts
-    a path records the arrival hint, with one address-neutral
-    implementation as the single source of truth and IPv4 wrappers as
-    pure `.toUdp()` delegates.
+    outstanding. Every public application/short-packet receiver
+    capable of decoding PATH_RESPONSE records the arrival hint — not
+    every API that accepts a path — with one guard mechanism as the
+    single source of truth and IPv4 wrappers as pure `.toUdp()`
+    delegates.
   - **Path-specific route commit**: route mutation is authorized only
     by a decrease in the candidate path's own bound-challenge count
     (`outstandingPathChallengeCountForPath`), never by total-count
@@ -321,6 +322,65 @@ or begin the command gateway.
     place; the harness retains no redundant copies; every backend is
     `secureWipe()`d before destruction; constructors build resources as
     locals with adjacent errdefers and assign the Pair only on success.
+
+  Round-4 frozen rules (review of the round-3 resubmission):
+
+  - **Fresh packet numbers for every crafted injection**: the spike
+    migration matrix derives each injected packet number from
+    `server.nextPeerPacketNumber(.application)`; only the exact-replay
+    case reuses the identical protected datagram bytes. The stale and
+    wrong-data cases run on separate fresh pairs, as does any case
+    that could close the connection.
+  - **Guard mechanism, never nested**: quicz gains a tiny private
+    `ReceivePathHintScope` (set on init, clear on deinit). Exactly one
+    guard per processing path; delegating wrappers never create
+    guards; the existing manual `setReceivePathHint` brackets are
+    replaced by the single guard, not wrapped. Scoped receive roots
+    that must guard:
+    `processRoutedProtectedShortDatagram` (9951), `…OrClose` (10073),
+    `…WithKeyUpdate` (10378), `…WithKeyPhaseState` (10683),
+    `…WithInstalledKeysOrCloseAndPollDatagram` (12763), and BOTH feed
+    roots — `feedDatagramWithInstalledKeys` (1743) and
+    `feedDatagramWithInstalledKeysAcrossConnections` (1991). Feed
+    roots guard only the `.application` processor: Handshake and 0-RTT
+    cannot decode PATH_RESPONSE. Route mutation stays solely in the
+    existing UpdatePath implementations.
+  - **No test-only fns in the production API**:
+    `processDecodedFramesForTest` is removed; the null-hint proof
+    exercises the connection-level entry
+    `processProtectedShortDatagramWithInstalledKeys` with a crafted
+    protected PATH_RESPONSE datagram.
+  - **Secret wipe completeness**: the actual mutable token-secret
+    original is wiped (no `secret_original` copies), and each mutable
+    HKDF PRK is wiped with an immediate `defer` right after
+    extraction, in every `derivePsk`.
+  - **Real state, not counters**: the fake `AllocCounters` proof is
+    deleted; bounded-candidate assertions use lifecycle/registry
+    state (`router.routeCount()`, `replayFilterEntryCount()`,
+    `slot.occupied`, registry counts).
+  - **Report taxonomy**: 4 real-socket proofs + 1 sans-I/O adoption
+    proof; the adoption test is not counted as real-socket.
+  - **Bats gate amendment (evidence-first)**: baseline runs at
+    `6f4c4d1` precede any amendment. Baseline evidence 2026-08-18:
+    fresh `zig build` in a temp worktree, 20 isolated filtered runs
+    (`bats --filter '^write accepts exactly 128 KiB and rejects one
+    byte more$' test/write.bats`), Linux 7.1.7+deb14-amd64, Zig
+    0.16.0, binary sha256 `186817f4…d6075d` — **10/20 failed**
+    (9× `write.bats:96` size assert; 1× `write.bats:75` status
+    assert), so the flake is proven pre-existing and outside Q1. The
+    write flake is tracked as **zmosh-r3b** (labels bug, write,
+    replant) which **blocks zmosh-pnf** (`bd dep zmosh-r3b --blocks
+    zmosh-pnf`); its acceptance requires a real daemon fix, repeated
+    boundary-test success, and full Bats green. `zmosh-8sd.1`
+    criterion 5 is amended to no-regression-versus-baseline:
+    identical filtered command, 20 runs per side at the frozen
+    candidate SHA (recorded in the evidence report and Bead comment —
+    the plan commit cannot contain its own SHA), tracked root inputs
+    identical via `git diff --exit-code 6f4c4d1..<candidate_sha> --
+    src test build.zig build.zig.zon build_support flake.nix`
+    (omitting only nonexistent paths), no new failure signature, and
+    one complete `bats test` at that SHA permitting only the two
+    tracked known signatures.
 
   The one-client-per-gateway policy and authenticated second-client
   rejection are Q3.
@@ -390,9 +450,12 @@ Write `docs/quic-spike.md` with exact SHAs, patches/API gaps, test output,
 binary/build measurements, platform results, and residual risks.
 
 QUIC is accepted only if every hard gate above passes. On acceptance, the
-production quicz pin is the `zmosh-quic-q1-4` fork tip recorded in the
-frozen-inputs table. If a hard gate fails, stop and follow the fallback
-section; do not weaken the gate during implementation.
+production quicz pin is the reviewed untagged dependency SHA recorded in
+the frozen-inputs table, tagged immutable `zmosh-quic-q1-5` only after
+re-review approval. The full-Bats gate is the amended
+no-regression-versus-`6f4c4d1` criterion (round-4 rules above); if a
+hard gate fails, stop and follow the fallback section; do not weaken
+the gate during implementation.
 
 Checkpoint: spike report committed and pushed; implementation remains locked
 pending review.
