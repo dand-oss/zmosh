@@ -16,17 +16,18 @@ approval. Q2 remains locked until that closure completes.
 | Dependency | Pin | Base | Tag status |
 |---|---|---|---|
 | Ghostty | `git+https://github.com/dand-oss/ghostty#6361b2eac73e8243a7042f517ea95ab87165f105` (hash `ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD`) | upstream `56e1f3a62` | SHA-only (the `zmosh-snapshot-v1` tag is retired — Ghostty's own build permits only its `vX.Y.Z` tags at HEAD, verified: `test-lib-vt` exit 0 from an ordinary untagged checkout) |
-| quicz | `git+https://github.com/dand-oss/quicz#7093988534e16582e0c3c53c6aebd52795777acd` (hash `quicz-0.1.0-g2J975z1lgA8gwMenw6IhH9FWVTT6wVnWGSpTQ9m-AIg`) | upstream `b4352201` | **untagged review dependency** — `zmosh-quic-q1-4` (`238a57b`) and the round-3 tip `470c4bd` are superseded, immutable history; no production tag until re-review approval |
+| quicz | `git+https://github.com/dand-oss/quicz#d854133d39b8d024e0b19ac34f84ef821d7766b9` (hash `quicz-0.1.0-g2J9778GlwAog98LXhKJ_bcuXttrr2432UdJ9T3scPsp`) | upstream `b4352201` | **untagged review dependency** — `zmosh-quic-q1-4` (`238a57b`), the round-3 tip `470c4bd`, and the round-4 tip `7093988` are superseded, immutable history; no production tag until re-review approval |
 
 Forks keep upstream remotes for synchronization; zmosh pins exact
 commits; tags never move. The provisional SHA recorded in the plan
 became concrete in spike commits and is re-recorded here each round
-(round 4: `7093988` in the repair commit `b698c76`).
+(round 4: `7093988` in the repair commit `b698c76`, superseded within
+the round by `d854133` after the feed path-commit fix).
 
 ## Round-4 corrections (all six blockers)
 
 1. **Arrival-path coverage now matches the frozen contract** (quicz
-   `7093988`): a tiny private `ReceivePathHintScope` guard (set on
+   `d854133`, guard introduced in `7093988`): a tiny private `ReceivePathHintScope` guard (set on
    init, clear on deinit; NEVER nested — exactly one per processing
    path, delegating wrappers never create one, and the six
    pre-existing manual brackets were REPLACED, not wrapped) now runs
@@ -39,9 +40,15 @@ became concrete in spike commits and is re-recorded here each round
    guard only the `.application` processor (Handshake and 0-RTT cannot
    decode PATH_RESPONSE). Route mutation remains solely in the
    UpdatePath implementations, authorized only by a decrease of the
-   candidate path's own bound-challenge count. In-fork per-root tests
-   prove each root consumes a bound response only from the bound path;
-   1906/1906 at the pin.
+   candidate path's own bound-challenge count — enforced in the
+   UpdatePath entries AND in `feedDatagramWithInstalledKeysAndUpdatePathOrClose`
+   (`d854133`: the feed previously compared TOTAL outstanding counts,
+   letting a legacy unbound challenge consumed from any path authorize
+   the route update; a regression test proves an unbound challenge may
+   be consumed via the feed while the route stays on the old path, and
+   that test fails against the previous comparison). In-fork per-root
+   tests prove each root consumes a bound response only from the bound
+   path; 1907/1907 at the pin.
 2. **No test-only fns in the production API** (quicz `7093988`):
    `processDecodedFramesForTest` is removed; the null-hint proof — in
    fork and spike alike — drives a crafted protected PATH_RESPONSE

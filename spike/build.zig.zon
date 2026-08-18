@@ -14,8 +14,8 @@
         // PATH_RESPONSE-capable receive roots tip. No production tag
         // until re-review approval (zmosh-quic-q1-4 superseded).
         .quicz = .{
-            .url = "git+https://github.com/dand-oss/quicz#7093988534e16582e0c3c53c6aebd52795777acd",
-            .hash = "quicz-0.1.0-g2J975z1lgA8gwMenw6IhH9FWVTT6wVnWGSpTQ9m-AIg",
+            .url = "git+https://github.com/dand-oss/quicz#d854133d39b8d024e0b19ac34f84ef821d7766b9",
+            .hash = "quicz-0.1.0-g2J9778GlwAog98LXhKJ_bcuXttrr2432UdJ9T3scPsp",
         },
     },
     .paths = .{
