@@ -58,6 +58,20 @@ fn hasScrollback(term: *const Terminal) bool {
     return !pages.getTopLeft(.screen).eql(pages.getTopLeft(.active));
 }
 
+/// Complete primary-screen text INCLUDING history (the `.screen` dump
+/// region), not the viewport-only `plainString`.
+fn fullScreenString(term: *Terminal, alloc: std.mem.Allocator) ![]const u8 {
+    return term.screens.get(.primary).?.dumpStringAlloc(alloc, .{ .screen = .{} });
+}
+
+fn expectScreensFullyEqual(a: *Terminal, b: *Terminal) !void {
+    const a_text = try fullScreenString(a, testing.allocator);
+    defer testing.allocator.free(a_text);
+    const b_text = try fullScreenString(b, testing.allocator);
+    defer testing.allocator.free(b_text);
+    try testing.expectEqualStrings(a_text, b_text);
+}
+
 fn expectTerminalsEqual(a: *Terminal, b: *Terminal) !void {
     const a_text = try a.plainString(testing.allocator);
     defer testing.allocator.free(a_text);
@@ -113,15 +127,33 @@ test "encode/decode round trip through the public snapshot alias" {
     var decoded = try decoder.ready(alloc, testing.io, .{
         .max_continuation_bytes = max_continuation_bytes,
     });
-    defer decoded.deinit(alloc);
     try testing.expect((decoded.history_rows.get(.primary) orelse 0) > 0);
 
+    // The decoded continuation must equal the source stream's exported
+    // continuation: the round trip carried the unfinished parser state.
+    switch (decoded.continuation) {
+        .ground => try testing.expectEqual(@as(usize, 0), continuation.len),
+        .bytes => |decoded_bytes| {
+            try testing.expectEqualStrings(continuation, decoded_bytes);
+        },
+    }
+
+    // toOwned moves the Terminal to its final address; ownership of the
+    // continuation stays with `decoded` until replay completes.
     var restored = decoded.toOwned();
     defer restored.deinit(alloc);
+    // Error-safe continuation ownership: after toOwned, deinit only frees
+    // the decoded continuation bytes, so one defer releases them on every
+    // path — including failures between here and FINISH.
+    defer decoded.deinit(alloc);
 
     var restored_stream = streamFor(alloc, &restored);
     defer restored_stream.deinit();
-    restored_stream.nextSlice(continuation); // replay exactly once
+    // Replay ONLY the decoded continuation, exactly once.
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => |decoded_bytes| restored_stream.nextSlice(decoded_bytes),
+    }
 
     while (try decoder.next(alloc, &restored)) |_| {}
     // FINISH validated; no trailing bytes may remain in the spool.
@@ -130,11 +162,14 @@ test "encode/decode round trip through the public snapshot alias" {
     try testing.expect(hasScrollback(&term));
     try testing.expect(hasScrollback(&restored));
     try expectTerminalsEqual(&term, &restored);
+    // Complete primary-screen text including history must match.
+    try expectScreensFullyEqual(&term, &restored);
 
     // Both terminals stay in lockstep after the cut.
     stream.nextSlice("mA");
     restored_stream.nextSlice("mA");
     try expectTerminalsEqual(&term, &restored);
+    try expectScreensFullyEqual(&term, &restored);
 }
 
 test "post-cut output applied before history pages matches uninterrupted terminal" {
@@ -178,19 +213,33 @@ test "post-cut output applied before history pages matches uninterrupted termina
     var decoded = try decoder.ready(alloc, testing.io, .{
         .max_continuation_bytes = max_continuation_bytes,
     });
-    defer decoded.deinit(alloc);
+    try testing.expectEqualStrings(
+        continuation,
+        switch (decoded.continuation) {
+            .ground => "",
+            .bytes => |b| b,
+        },
+    );
     var restored = decoded.toOwned();
     defer restored.deinit(alloc);
+    // Error-safe continuation ownership (see the round-trip test).
+    defer decoded.deinit(alloc);
 
     var restored_stream = streamFor(alloc, &restored);
     defer restored_stream.deinit();
-    restored_stream.nextSlice(continuation);
-    restored_stream.nextSlice(post_cut); // before history completes
+    // Replay the DECODED continuation, then post-cut output before any
+    // history page completes.
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => |decoded_bytes| restored_stream.nextSlice(decoded_bytes),
+    }
+    restored_stream.nextSlice(post_cut);
 
     while (try decoder.next(alloc, &restored)) |_| {}
     try testing.expectEqual(@as(usize, 0), reader.buffered().len);
 
     try expectTerminalsEqual(&control, &restored);
+    try expectScreensFullyEqual(&control, &restored);
     try testing.expect(hasScrollback(&control));
     try testing.expect(hasScrollback(&restored));
 }

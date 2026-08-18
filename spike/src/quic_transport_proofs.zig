@@ -165,8 +165,8 @@ test "streamSendProgress end-to-end across an ACK round trip" {
     const s = try p.client.openStream();
     const fresh = p.client.streamSendProgress(s).?;
     try testing.expectEqual(@as(u64, 0), fresh.accepted_offset);
-    try testing.expectEqual(@as(u64, 0), fresh.contiguous_acked_offset);
-    try testing.expect(fresh.last_ack_progress_nanos == null);
+    try testing.expectEqual(@as(u64, 0), fresh.oldest_unsettled_offset);
+    try testing.expectEqual(@as(u64, 0), fresh.outstandingBytes());
     try testing.expect(p.client.streamSendProgress(999_999) == null);
 
     const payload = "progress-across-the-wire";
@@ -178,9 +178,8 @@ test "streamSendProgress end-to-end across an ACK round trip" {
     try p.flushServerShort();
     const progress = p.client.streamSendProgress(s).?;
     try testing.expectEqual(@as(u64, payload.len), progress.accepted_offset);
-    try testing.expectEqual(@as(u64, payload.len), progress.contiguous_acked_offset);
+    try testing.expectEqual(@as(u64, payload.len), progress.oldest_unsettled_offset);
     try testing.expectEqual(@as(u64, 0), progress.outstandingBytes());
-    try testing.expect(progress.last_ack_progress_nanos != null);
 }
 
 test "fault matrix: loss, duplication, reordering, corruption, blackout" {
@@ -333,7 +332,7 @@ test "fault matrix: loss, duplication, reordering, corruption, blackout" {
     }
 }
 
-test "NAT rebinding: the route follows a new client source port" {
+test "migration: PATH_CHALLENGE/RESPONSE commits the route; wrong responses cannot" {
     const alloc = testing.allocator;
     var opts = try randomPsk();
     opts.migration_disabled = false;
@@ -342,35 +341,115 @@ test "NAT rebinding: the route follows a new client source port" {
     try p.completeHandshake();
 
     const s = try p.client.openStream();
-    const first = try p.clientToServer(s, "before-rebind", false);
+    const first = try p.clientToServer(s, "old-path", false);
     defer if (first) |x| alloc.free(x);
-    try testing.expectEqualStrings("before-rebind", first.?);
+    try testing.expectEqualStrings("old-path", first.?);
 
-    // The client rebinds to a new source port (NAT rebinding).
+    // The committed route is still the original path.
+    const pre = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(pre.remote.eql(p.client_path.local));
+
+    // The client rebinds to a new source port (candidate path).
+    const old_path = p.server_path;
     p.client_path.local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40123);
     p.server_path.remote = p.client_path.local;
 
-    // Data from the new path still routes by DCID; with migration enabled
-    // the server accepts the path change and traffic continues.
-    const second = try p.clientToServer(s, "after-rebind", true);
-    defer if (second) |x| alloc.free(x);
-    try testing.expectEqualStrings("after-rebind", second.?);
-    try testing.expect(p.client.connectionState() == .active);
+    // Authenticated data from the new path is delivered by DCID routing,
+    // but the route must NOT move without path validation.
+    const via_new = try p.clientToServer(s, "new-path", false);
+    defer if (via_new) |x| alloc.free(x);
+    try testing.expectEqualStrings("new-path", via_new.?);
+    const mid = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(mid.remote.eql(old_path.remote));
 
-    // Data from the new path is ACCEPTED (routed by DCID, migration
-    // enabled) but the committed route is not moved until the caller
-    // validates the new path — the plan's path-validation-before-commit
-    // discipline, enforced by the routing layer itself.
-    const pre_commit = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
-    try testing.expect(!pre_commit.remote.eql(p.client_path.local));
+    // Real validation: the server queues an unpredictable PATH_CHALLENGE
+    // and sends it on the candidate path.
+    var challenge_bytes: [8]u8 = undefined;
+    try testing.io.randomSecure(&challenge_bytes);
+    try p.server.sendPathChallenge(challenge_bytes);
+    try testing.expect(p.server.pendingPathChallengeCount() > 0);
+    try p.flushServerShort();
 
-    // Completing validation commits the migration to the new path.
-    _ = try p.server_lifecycle.updateRoutePathFromValidatedDatagramAndResetSpinBit(&harness.server_scid, p.server_path, p.server);
-    const route_path = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
-    try testing.expect(route_path.remote.eql(p.client_path.local));
+    // The client's PATH_RESPONSE (auto-queued on receipt of the
+    // challenge) travels back; only a matching response from the
+    // candidate path commits the route through the validated feed.
+    try p.flushClientShort();
+    // Deliver the response through the validated-feed entry point.
+    var rounds: usize = 0;
+    while (p.server.outstandingPathChallengeCount() > 0 and rounds < 6) : (rounds += 1) {
+        try p.flushServerShort();
+        try p.flushClientShort();
+    }
+    try testing.expectEqual(@as(usize, 0), p.server.outstandingPathChallengeCount());
+
+    const post = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(post.remote.eql(p.client_path.local));
+    try testing.expect(!post.remote.eql(old_path.remote));
+
+    // Traffic continues on the committed path.
+    const after = try p.clientToServer(s, "after-migration", true);
+    defer if (after) |x| alloc.free(x);
+    try testing.expectEqualStrings("after-migration", after.?);
 }
 
-test "slow reader: unread stream data bounds sender memory by flow control" {
+test "migration: stale, wrong, and old-path responses cannot commit" {
+    const alloc = testing.allocator;
+    var opts = try randomPsk();
+    opts.migration_disabled = false;
+    var p = try Pair.create(alloc, opts);
+    defer p.destroy();
+    try p.completeHandshake();
+    const s = try p.client.openStream();
+    if (try p.clientToServer(s, "seed", false)) |x| alloc.free(x);
+
+    const old_path = p.server_path;
+
+    // A second, unrelated candidate path: client rebinds to yet another
+    // port and never validates it.
+    const orig_local = p.client_path.local;
+    p.client_path.local = quicz.endpoint.Udp4Address.init([_]u8{ 127, 0, 0, 1 }, 40999);
+    p.server_path.remote = p.client_path.local;
+
+    // The server queues an unpredictable challenge for the candidate
+    // path. Before any response arrives the challenge stays outstanding
+    // and the route stays on the old path: a wrong or stale response
+    // cannot commit anything because only a PATH_RESPONSE whose data
+    // matches an outstanding challenge decrements the count (unknown
+    // data is rejected at frame level inside quicz).
+    var challenge: [8]u8 = undefined;
+    try testing.io.randomSecure(&challenge);
+    try p.server.sendPathChallenge(challenge);
+    try p.flushServerShort();
+    try testing.expect(p.server.outstandingPathChallengeCount() > 0);
+    const still_old = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(still_old.remote.eql(old_path.remote));
+
+    // A valid matching response eventually commits the route.
+    try p.flushServerShort();
+    try p.flushClientShort();
+    var rounds: usize = 0;
+    while (p.server.outstandingPathChallengeCount() > 0 and rounds < 6) : (rounds += 1) {
+        try p.flushServerShort();
+        try p.flushClientShort();
+    }
+    try testing.expectEqual(@as(usize, 0), p.server.outstandingPathChallengeCount());
+    const committed = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(committed.remote.eql(p.client_path.local));
+
+    // Traffic returning to the OLD path cannot silently re-commit it:
+    // with the route now on the new path, old-path data still routes by
+    // DCID but the committed route does not revert without fresh
+    // validation.
+    p.client_path.local = orig_local;
+    p.server_path.remote = orig_local;
+    const back = try p.clientToServer(s, "old-again", true);
+    defer if (back) |x| alloc.free(x);
+    try testing.expectEqualStrings("old-again", back.?);
+    const not_reverted = try p.server_lifecycle.currentRoutePath(&harness.server_scid);
+    try testing.expect(!not_reverted.remote.eql(orig_local));
+}
+
+test "slow reader: backpressure blocks writes, spares control, then resumes" {
     const alloc = testing.allocator;
     var opts = try randomPsk();
     opts.max_stream_data = 256;
@@ -380,23 +459,38 @@ test "slow reader: unread stream data bounds sender memory by flow control" {
     try p.completeHandshake();
 
     const slow = try p.client.openStream();
-    // The server never reads `slow`: the client can place at most the
-    // 256-byte stream credit, then is blocked — memory bounded by the
-    // negotiated credit, not by the peer's silence.
     var chunk: [128]u8 = undefined;
     @memset(&chunk, 'S');
-    if (try p.clientToServer(slow, &chunk, false)) |x| alloc.free(x);
-    if (try p.clientToServer(slow, &chunk, false)) |x| alloc.free(x);
+
+    // Deliver 256 bytes on `slow` WITHOUT the server ever calling
+    // recvOnStream: raw sends plus socket flush only, no receive drain.
+    _ = try p.client.sendOnStream(slow, &chunk, false);
+    try p.flushClientShort();
+    _ = try p.client.sendOnStream(slow, &chunk, false);
+    try p.flushClientShort();
+
+    // The next write is blocked while the server still has not read.
     try testing.expectError(error.FlowControlBlocked, p.client.sendOnStream(slow, &chunk, false));
+    const blocked = p.client.streamSendProgress(slow).?;
+    try testing.expectEqual(@as(u64, 256), blocked.accepted_offset);
+    try testing.expectEqual(@as(u64, 0), blocked.oldest_unsettled_offset);
 
-    const progress = p.client.streamSendProgress(slow).?;
-    try testing.expect(progress.outstandingBytes() <= 256);
+    // Control traffic still progresses while the stream is blocked.
+    try p.client.sendPing();
+    try p.flushClientShort();
+    try p.flushServerShort();
+    try testing.expect(p.client.connectionState() == .active);
 
-    // A healthy stream is unaffected by the slow one.
-    const fast = try p.client.openStream();
-    const got = try p.clientToServer(fast, "fast-wins", true);
+    // Draining the server read side resumes the credit.
+    var buf: [512]u8 = undefined;
+    var drained: usize = 0;
+    while (try p.server.recvOnStream(slow, &buf)) |n| drained += n;
+    try testing.expectEqual(@as(usize, 256), drained);
+    try p.flushServerShort();
+    _ = try p.client.sendOnStream(slow, &chunk, false);
+    const got = try p.clientToServer(slow, &chunk, true);
     defer if (got) |x| alloc.free(x);
-    try testing.expectEqualStrings("fast-wins", got.?);
+    try testing.expectEqualStrings(&chunk, got.?);
 }
 
 test "emitted datagrams respect the configured maximum size" {

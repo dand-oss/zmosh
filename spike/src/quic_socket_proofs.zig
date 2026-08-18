@@ -248,6 +248,11 @@ const SocketPair = struct {
 
     fn deinit(self: *SocketPair) void {
         const alloc = self.alloc;
+        // Teardown wipes TLS backends and Initial secrets first;
+        // Connection.deinit wipes its own packet keys.
+        self.client_backend.secureWipe();
+        self.server_backend.secureWipe();
+        quicz.protection.secureWipeInitialSecrets(&self.secrets);
         self.client.deinit();
         self.server.deinit();
         self.client_lifecycle.deinit();
@@ -446,4 +451,455 @@ test "real sockets: IPv6 dual-stack server serves an IPv4-mapped client" {
     // The server socket is IPv6 (dual-stack on Linux by default); the
     // client is IPv4, reaching it as a v4-mapped peer.
     try assertSocketHandshakeAndEcho(alloc, io, .dual_stack_v4_peer, "dual-stack-echo");
+}
+
+/// Baseline-relative allocation counters for the bounded-candidate
+/// assertions: how many connection-sized objects this test itself created.
+const AllocCounters = struct {
+    connections: usize = 0,
+    backends: usize = 0,
+    streams: usize = 0,
+    routes: usize = 0,
+};
+
+/// Drive one space unless its packet-number space is already discarded.
+fn driveSpaceUnlessDiscarded(
+    lifecycle: *quicz.EndpointConnectionLifecycle,
+    handle: u64,
+    conn: *Connection,
+    space: quicz.PacketNumberSpace,
+    backend: *Tls13Backend,
+    scratch: []u8,
+) !void {
+    if (conn.packetNumberSpaceDiscarded(space)) return;
+    _ = try lifecycle.driveCryptoBackendInSpaceAndArmConnection(
+        handle,
+        conn,
+        space,
+        backend.cryptoBackend(),
+        scratch,
+    );
+}
+
+test "real sockets: native IPv6 Retry, bounded candidate, PSK handshake, 1-RTT echo" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Real IPv6 loopback sockets.
+    var client_sock = try (std.Io.net.IpAddress{ .ip6 = .loopback(0) }).bind(io, .{ .mode = .dgram, .protocol = .udp });
+    var server_sock = try (std.Io.net.IpAddress{ .ip6 = .loopback(0) }).bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_sock.close(io);
+    defer server_sock.close(io);
+    const server_addr = server_sock.address;
+    const client_addr = client_sock.address;
+
+    var bootstrap: [32]u8 = undefined;
+    try io.randomSecure(&bootstrap);
+    const psk = harness.derivePsk(bootstrap);
+    // The bootstrap secret and every derived copy are wiped on ALL paths.
+    var bootstrap_copy = bootstrap;
+    defer std.crypto.secureZero(u8, &bootstrap_copy);
+
+    // Address-neutral routing for a native IPv6 path end to end.
+    const client_local = quicz.endpoint.UdpAddress.init6(client_addr.ip6.bytes, client_addr.ip6.port);
+    const server_local = quicz.endpoint.UdpAddress.init6(server_addr.ip6.bytes, server_addr.ip6.port);
+    const client_path = quicz.endpoint.UdpTuple{ .local = client_local, .remote = server_local };
+    const server_path = quicz.endpoint.UdpTuple{ .local = server_local, .remote = client_local };
+
+    var baseline = AllocCounters{};
+
+    // The CLIENT registers its own route (its outbound address choice);
+    // the SERVER allocates nothing until the candidate is authenticated.
+    var client_lifecycle = quicz.EndpointConnectionLifecycle.init(alloc);
+    defer client_lifecycle.deinit();
+    try client_lifecycle.router.registerConnectionIdAddress(
+        harness.client_handle,
+        &harness.client_scid,
+        client_path,
+        .{ .active_migration_disabled = true },
+    );
+    baseline.routes += 1;
+
+    const conn_cfg = quicz.Config{
+        .initial_max_data = 8192,
+        .initial_max_stream_data = 2048,
+        .initial_max_streams_bidi = 8,
+        .max_datagram_size = 1200,
+    };
+    const client = try alloc.create(Connection);
+    client.* = try Connection.init(alloc, .client, conn_cfg);
+    defer {
+        client.deinit();
+        alloc.destroy(client);
+    }
+    baseline.connections += 1;
+    try client.setLocalInitialSourceConnectionId(&harness.client_scid);
+
+    const client_backend = try alloc.create(Tls13Backend);
+    client_backend.* = Tls13Backend.initClientWithPsk(.{
+        .alpn = &alpn_zmosh,
+        .server_name = "zmosh",
+        .disable_session_resumption = true,
+    }, psk);
+    defer alloc.destroy(client_backend);
+    baseline.backends += 1;
+    try client_backend.setClientPskIdentity(psk_identity);
+    var psk_copy = psk;
+    defer std.crypto.secureZero(u8, &psk_copy);
+
+    const secrets = try quicz.protection.deriveInitialSecrets(.v1, &harness.original_dcid);
+    defer quicz.protection.secureWipeInitialSecrets(@constCast(&secrets));
+
+    var scratch: [16384]u8 = undefined;
+    var now: i64 = 1000;
+    var recv_buf: [2048]u8 = undefined;
+    const supported = [_]quicz.packet.Version{.v1};
+
+    // Token policy + pending-Retry slot: the ONLY server state so far.
+    const secret: quicz.address_validation_token.Secret = [_]u8{0x71} ** quicz.address_validation_token.secret_len;
+    var token_secret_copy = secret;
+    defer std.crypto.secureZero(u8, &token_secret_copy);
+    var policy = quicz.endpoint.AddressValidationPolicy.init(alloc, secret, .{});
+    defer policy.deinit();
+    var slot = quicz.pending_retry_slot.PendingRetrySlot{};
+
+    // ── 1. First tokenless client Initial over the real socket. ────────
+    now += 1_000_000;
+    try driveSpaceUnlessDiscarded(&client_lifecycle, harness.client_handle, client, .initial, client_backend, &scratch);
+    const first_initial = (try client_lifecycle.pollProtectedLongDatagram(
+        harness.client_handle,
+        client,
+        now,
+        &harness.original_dcid,
+        &harness.client_scid,
+        &[_]u8{},
+        .{ .initial = secrets.client },
+    )) orelse return error.NoInitial;
+    defer alloc.free(first_initial);
+    try testing.expect(first_initial.len >= 1200);
+    try client_sock.send(io, &server_addr, first_initial);
+
+    // ── 2. Server classifies the Initial for real (no preinstalled
+    //       route) and answers with a Retry through the bounded slot. ──
+    const r1 = try server_sock.receive(io, &recv_buf);
+    try testing.expectEqual(@as(usize, first_initial.len), r1.data.len);
+    const accept = (try quicz.endpoint.peekInitialAcceptDatagram(
+        server_path,
+        r1.data,
+        &supported,
+    )) orelse return error.NotAccepted;
+    try testing.expectEqual(quicz.packet.Version.v1, accept.version);
+    // The accepted slices borrow recv_buf, which every later receive
+    // reuses; own copies so the stored exchange stays exact.
+    const first_odcid = try alloc.dupe(u8, accept.original_destination_connection_id);
+    defer alloc.free(first_odcid);
+    const first_scid = try alloc.dupe(u8, accept.source_connection_id);
+    defer alloc.free(first_scid);
+
+    const nonce: quicz.address_validation_token.Nonce = [_]u8{0x42} ** quicz.address_validation_token.nonce_len;
+    const token = try policy.issueTokenForPath(
+        alloc,
+        .retry,
+        now,
+        10 * std.time.ns_per_s,
+        server_path,
+        nonce,
+    );
+    defer alloc.free(token);
+    const retry_scid = [_]u8{ 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 };
+
+    const retry = try slot.open(
+        alloc,
+        now,
+        10 * std.time.ns_per_s,
+        server_path,
+        .v1,
+        first_odcid,
+        first_scid,
+        &retry_scid,
+        token,
+    );
+    try server_sock.send(io, &client_addr, retry);
+
+    // ── 3. Baseline-relative failure matrix against the slot: every
+    //       malformed/expired/replayed/wrong-path/unrelated attempt must
+    //       leave all allocation counters at zero delta. ───────────────
+    const failAttempts = struct {
+        fn run(
+            s: *quicz.pending_retry_slot.PendingRetrySlot,
+            pol: *const quicz.endpoint.AddressValidationPolicy,
+            t: i64,
+            sp: quicz.endpoint.UdpTuple,
+            odcid: []const u8,
+            cscid: []const u8,
+            rscid: []const u8,
+            tok: []const u8,
+        ) !void {
+            const wrong_scid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+            const other_path = quicz.endpoint.UdpTuple{
+                .local = sp.local,
+                .remote = quicz.endpoint.UdpAddress.init6Scoped(sp.remote.v6, 51000, 9),
+            };
+            // Short datagram.
+            try testing.expectError(error.InitialTooShort, s.classify(pol, t, sp, .v1, odcid, cscid, rscid, tok, 1199, true));
+            // Not an Initial.
+            try testing.expectError(error.NotAnInitial, s.classify(pol, t, sp, .v1, odcid, cscid, rscid, tok, 1200, false));
+            // Unrelated tokenless Initial (different client SCID).
+            try testing.expectError(error.UnrelatedInitial, s.classify(pol, t, sp, .v1, odcid, &wrong_scid, rscid, &.{}, 1200, true));
+            // Wrong path on the follow-up.
+            try testing.expectError(error.TokenInvalid, s.classify(pol, t, other_path, .v1, odcid, cscid, rscid, tok, 1200, true));
+            // Wrong Retry SCID as the follow-up destination.
+            try testing.expectError(error.TokenInvalid, s.classify(pol, t, sp, .v1, odcid, cscid, &wrong_scid, tok, 1200, true));
+            // Wrong client SCID on the follow-up.
+            try testing.expectError(error.TokenInvalid, s.classify(pol, t, sp, .v1, odcid, &wrong_scid, rscid, tok, 1200, true));
+            // Mutated token bytes.
+            var mutated = try std.heap.page_allocator.dupe(u8, tok);
+            defer std.heap.page_allocator.free(mutated);
+            mutated[0] ^= 0xff;
+            try testing.expectError(error.TokenInvalid, s.classify(pol, t, sp, .v1, odcid, cscid, rscid, mutated, 1200, true));
+        }
+    };
+    try failAttempts.run(&slot, &policy, now + 1, server_path, first_odcid, first_scid, &retry_scid, token);
+    // No server connection, backend, stream, or route exists yet.
+    try testing.expectEqual(baseline.connections, 1);
+    try testing.expectEqual(baseline.backends, 1);
+    try testing.expectEqual(baseline.routes, 1);
+
+    // ── 4. The CLIENT receives the Retry on its real socket and performs
+    //       the true quicz Retry sequence: processRetryDatagram records
+    //       token + Retry SCID, retryReceived re-caches the ClientHello,
+    //       resetInitialCryptoSendForRetry rewinds Initial send state,
+    //       and the re-drive emits the follow-up Initial protected with
+    //       Retry-SCID Initial keys. ────────────────────────────────────
+    const r_retry = try client_sock.receive(io, &recv_buf);
+    now += 1_000_000;
+    try client.processRetryDatagram(now, &harness.original_dcid, r_retry.data);
+    const conn_retry_scid = client.retrySourceConnectionId() orelse return error.NoRetryScid;
+    try testing.expectEqualSlices(u8, &retry_scid, conn_retry_scid);
+    const retry_keys = try quicz.protection.deriveInitialSecrets(.v1, conn_retry_scid);
+    defer quicz.protection.secureWipeInitialSecrets(@constCast(&retry_keys));
+    client_backend.retryReceived();
+    try client.resetInitialCryptoSendForRetry();
+    _ = try client.driveCryptoBackendInSpace(.initial, client_backend.cryptoBackend(), &scratch);
+    const second_initial = (try client.pollProtectedLongCryptoDatagramInSpace(
+        .initial,
+        now,
+        conn_retry_scid,
+        &harness.client_scid,
+        &[_]u8{},
+        retry_keys.client,
+    )) orelse return error.NoSecondInitial;
+    defer alloc.free(second_initial);
+    try testing.expect(second_initial.len >= 1200);
+    try client_sock.send(io, &server_addr, second_initial);
+
+    // ── 5. The server validates the exact stored exchange and creates
+    //       ONE bounded unpublished candidate, authenticates the follow-up
+    //       Initial, then publishes and commits. The follow-up Initial is
+    //       the first datagram the server receives here. ────────────────
+    const r3 = try server_sock.receive(io, &recv_buf);
+    const accept2 = (try quicz.endpoint.peekInitialAcceptDatagram(
+        server_path,
+        r3.data,
+        &supported,
+    )) orelse return error.SecondNotAccepted;
+    const decision = try slot.classify(
+        &policy,
+        now + 1,
+        server_path,
+        .v1,
+        accept2.original_destination_connection_id,
+        accept2.source_connection_id,
+        conn_retry_scid,
+        accept2.token,
+        r3.data.len,
+        true,
+    );
+    switch (decision) {
+        .validated => {},
+        else => return error.ExpectedValidated,
+    }
+    // Replay state unconsumed until commit.
+    try testing.expectEqual(@as(usize, 0), policy.replayFilterEntryCount());
+
+    // One bounded candidate: a server Connection + backend, published
+    // nowhere yet.
+    var server_lifecycle = quicz.EndpointConnectionLifecycle.init(alloc);
+    defer server_lifecycle.deinit();
+    const server = try alloc.create(Connection);
+    server.* = try Connection.init(alloc, .server, conn_cfg);
+    defer {
+        server.deinit();
+        alloc.destroy(server);
+    }
+    try server.validatePeerAddress();
+    try server.setLocalInitialSourceConnectionId(&retry_scid);
+    // Bring the candidate into the exact post-Retry server state: record
+    // the original client DCID, the Retry SCID, and the pending token the
+    // follow-up Initial must carry. The datagram bytes are discarded (the
+    // slot already answered the first Initial).
+    const candidate_retry = try server.issueRetryDatagram(
+        now + 1,
+        first_odcid,
+        first_scid,
+        &retry_scid,
+        token,
+    );
+    defer alloc.free(candidate_retry);
+    try testing.expect(server.pendingRetryTokenCount() == 1);
+    const server_backend = try alloc.create(Tls13Backend);
+    server_backend.* = Tls13Backend.initServerWithPsk(.{
+        .alpn = &alpn_zmosh,
+        .disable_session_resumption = true,
+    }, psk);
+    defer alloc.destroy(server_backend);
+    try server_backend.setServerPskIdentity(psk_identity);
+
+    // Authenticate: deliver the follow-up Initial to the candidate and
+    // drive the TLS server — the PSK binder check happens here. Initial
+    // keys for the follow-up derive from the Retry SCID.
+    // For the follow-up Initial the datagram's destination CID IS the
+    // Retry SCID, so one registration under the observed DCID covers the
+    // published candidate.
+    try testing.expectEqualSlices(u8, &retry_scid, accept2.original_destination_connection_id);
+    _ = try server_lifecycle.router.registerConnectionIdAddress(
+        harness.server_handle,
+        accept2.original_destination_connection_id,
+        server_path,
+        .{ .active_migration_disabled = true },
+    );
+    _ = try server_lifecycle.processRoutedProtectedInitialDatagramAddress(
+        harness.server_handle,
+        server,
+        server_path,
+        now + 2,
+        conn_retry_scid,
+        r3.data,
+    );
+    try driveSpaceUnlessDiscarded(&server_lifecycle, harness.server_handle, server, .initial, server_backend, &scratch);
+    // ServerHello exists => the follow-up Initial authenticated under the
+    // PSK. Publish the candidate and consume the token.
+    const sh = (try server_lifecycle.pollProtectedLongDatagram(
+        harness.server_handle,
+        server,
+        now + 3,
+        &harness.client_scid,
+        &retry_scid,
+        &[_]u8{},
+        .{ .initial = retry_keys.server },
+    )) orelse return error.NoServerHello;
+    defer alloc.free(sh);
+    try slot.commit(&policy, now + 4, accept2.token);
+    try testing.expectEqual(@as(usize, 1), policy.replayFilterEntryCount());
+    try testing.expect(!slot.occupied);
+    // A retransmitted first Initial (after the candidate was published)
+    // still matches the stored tuple only while the slot lives; after
+    // commit the slot is cleared, so it is unrelated — but it must not
+    // disturb the published candidate. (Before commit the same datagram
+    // reissues the identical Retry, proven in the quicz slot tests.)
+    try client_sock.send(io, &server_addr, first_initial);
+    const r_retr = try server_sock.receive(io, &recv_buf);
+    _ = r_retr;
+
+    // Exactly one candidate was created: one server Connection, one
+    // backend, and one route (the Retry-SCID DCID of the follow-up).
+    try testing.expectEqual(baseline.connections + 1, 2);
+    try testing.expectEqual(baseline.backends + 1, 2);
+    try testing.expectEqual(server_lifecycle.router.routeCount(), 1);
+
+    // ── 6. Complete the certificate-free PSK handshake over the SAME
+    //       sockets and finish with a 1-RTT echo. ──────────────────────
+    // Client processes the ServerHello.
+    _ = try client_lifecycle.processRoutedProtectedInitialDatagramAddress(
+        harness.client_handle,
+        client,
+        client_path,
+        now + 5,
+        conn_retry_scid,
+        sh,
+    );
+    try driveSpaceUnlessDiscarded(&client_lifecycle, harness.client_handle, client, .initial, client_backend, &scratch);
+    // Server handshake flight.
+    try driveSpaceUnlessDiscarded(&server_lifecycle, harness.server_handle, server, .handshake, server_backend, &scratch);
+    const sflight = (try server_lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(
+        harness.server_handle,
+        server,
+        now + 6,
+        &harness.client_scid,
+        &retry_scid,
+    )) orelse return error.NoServerFlight;
+    defer alloc.free(sflight);
+    try server_sock.send(io, &client_addr, sflight);
+    const r4 = try client_sock.receive(io, &recv_buf);
+    _ = try client_lifecycle.processRoutedProtectedHandshakeDatagramWithInstalledKeysAddress(
+        harness.client_handle,
+        client,
+        client_path,
+        now + 7,
+        r4.data,
+    );
+    try driveSpaceUnlessDiscarded(&client_lifecycle, harness.client_handle, client, .handshake, client_backend, &scratch);
+    const cfin = (try client_lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(
+        harness.client_handle,
+        client,
+        now + 8,
+        &retry_scid,
+        &harness.client_scid,
+    )) orelse return error.NoClientFinished;
+    defer alloc.free(cfin);
+    try client_sock.send(io, &server_addr, cfin);
+    const r5 = try server_sock.receive(io, &recv_buf);
+    _ = try server_lifecycle.processRoutedProtectedHandshakeDatagramWithInstalledKeysAddress(
+        harness.server_handle,
+        server,
+        server_path,
+        now + 9,
+        r5.data,
+    );
+    try driveSpaceUnlessDiscarded(&server_lifecycle, harness.server_handle, server, .handshake, server_backend, &scratch);
+    if (!server.handshakeConfirmed()) return error.ServerNotConfirmed;
+    try server.sendHandshakeDone();
+    const done = (try server_lifecycle.pollProtectedShortDatagramWithInstalledKeys(
+        harness.server_handle,
+        server,
+        now + 10,
+        &harness.client_scid,
+    )) orelse return error.NoHandshakeDone;
+    defer alloc.free(done);
+    try server_sock.send(io, &client_addr, done);
+    const r6 = try client_sock.receive(io, &recv_buf);
+    _ = try client_lifecycle.processRoutedProtectedShortDatagramWithInstalledKeysAddress(
+        harness.client_handle,
+        client,
+        client_path,
+        now + 11,
+        r6.data,
+    );
+    try driveSpaceUnlessDiscarded(&client_lifecycle, harness.client_handle, client, .handshake, client_backend, &scratch);
+    if (!client.handshakeConfirmed()) return error.ClientNotConfirmed;
+
+    // 1-RTT echo over the same sockets.
+    const stream_id = try client.openStream();
+    try client.sendOnStream(stream_id, "v6-retry-echo", true);
+    const echo_req = (try client_lifecycle.pollProtectedShortDatagramWithInstalledKeys(
+        harness.client_handle,
+        client,
+        now + 12,
+        &retry_scid,
+    )) orelse return error.NoEchoRequest;
+    defer alloc.free(echo_req);
+    try client_sock.send(io, &server_addr, echo_req);
+    const r7 = try server_sock.receive(io, &recv_buf);
+    _ = try server_lifecycle.processRoutedProtectedShortDatagramWithInstalledKeysAddress(
+        harness.server_handle,
+        server,
+        server_path,
+        now + 13,
+        r7.data,
+    );
+    var echo_buf: [128]u8 = undefined;
+    const n = (try server.recvOnStream(stream_id, &echo_buf)) orelse return error.NoEchoData;
+    try testing.expectEqualStrings("v6-retry-echo", echo_buf[0..n]);
 }

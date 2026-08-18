@@ -63,6 +63,8 @@ const Pair = struct {
     client_path: quicz.endpoint.Udp4Tuple,
     server_path: quicz.endpoint.Udp4Tuple,
     secrets: protection.InitialSecrets,
+    client_psk_copy: [32]u8 = .{0} ** 32,
+    server_psk_copy: [32]u8 = .{0} ** 32,
     scratch: [8192]u8 = undefined,
 
     fn init(
@@ -123,22 +125,25 @@ const Pair = struct {
         client_backend.* = Tls13Backend.initClientWithPsk(.{
             .alpn = &alpn_zmosh,
             .server_name = "zmosh",
+            // zmosh never resumes: tickets are rejected, 0-RTT never
+            // offered, no resumption state can appear.
+            .disable_session_resumption = true,
         }, client_psk);
-        // The offered PSK identity rides in the public session-ticket slot
-        // (the identity blob of the pre_shared_key extension); early data
-        // stays disabled because session_ticket_allows_early_data is false.
-        client_backend.hs.session_ticket_len = psk_identity.len;
-        @memcpy(client_backend.hs.session_ticket[0..psk_identity.len], psk_identity);
+        // Public fork API: offer the fixed non-secret external-PSK identity.
+        try client_backend.setClientPskIdentity(psk_identity);
 
         const server_backend = try alloc.create(Tls13Backend);
         server_backend.* = Tls13Backend.initServerWithPsk(.{
             .alpn = server_alpn,
+            .disable_session_resumption = true,
             // No cert_chain_der, no private key: PSK-only or fail.
         }, server_psk);
         if (server_identity) |identity| try server_backend.setServerPskIdentity(identity);
 
         return .{
             .alloc = alloc,
+            .client_psk_copy = client_psk,
+            .server_psk_copy = server_psk,
             .client_lifecycle = client_lifecycle,
             .server_lifecycle = server_lifecycle,
             .client = client,
@@ -152,6 +157,14 @@ const Pair = struct {
     }
 
     fn deinit(self: *Pair) void {
+        // Wipe every secret this pair holds — on success, failure, and
+        // initialization-error paths alike — before freeing anything:
+        // TLS backends, Initial secrets, and the PSK copies.
+        self.client_backend.secureWipe();
+        self.server_backend.secureWipe();
+        quicz.protection.secureWipeInitialSecrets(&self.secrets);
+        std.crypto.secureZero(u8, &self.client_psk_copy);
+        std.crypto.secureZero(u8, &self.server_psk_copy);
         self.client.deinit();
         self.server.deinit();
         self.client_lifecycle.deinit();

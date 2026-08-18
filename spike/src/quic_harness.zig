@@ -151,6 +151,8 @@ pub const Pair = struct {
     client_path: quicz.endpoint.Udp4Tuple,
     server_path: quicz.endpoint.Udp4Tuple,
     secrets: protection.InitialSecrets,
+    client_psk_copy: [32]u8 = .{0} ** 32,
+    server_psk_copy: [32]u8 = .{0} ** 32,
     scratch: [16384]u8 = undefined,
     pkt: u64 = 10,
     /// Handshake-space datagrams that arrived before the receiver had
@@ -170,6 +172,14 @@ pub const Pair = struct {
 
     pub fn destroy(self: *Pair) void {
         const alloc = self.alloc;
+        // Teardown wipes every secret this pair holds: both TLS backends
+        // (key schedules, PSKs, ephemeral keys) and the Initial secrets.
+        // Derived-PSK copies are wiped by the caller that created them.
+        self.client_backend.secureWipe();
+        self.server_backend.secureWipe();
+        protection.secureWipeInitialSecrets(&self.secrets);
+        std.crypto.secureZero(u8, &self.client_psk_copy);
+        std.crypto.secureZero(u8, &self.server_psk_copy);
         self.deinit();
         alloc.destroy(self);
     }
@@ -218,6 +228,8 @@ pub const Pair = struct {
         try p.server.setLocalInitialSourceConnectionId(&server_scid);
 
         p.client_backend = try alloc.create(Tls13Backend);
+        p.client_psk_copy = opts.client_psk;
+        p.server_psk_copy = opts.server_psk;
         p.client_backend.* = Tls13Backend.initClientWithPsk(.{
             .alpn = &alpn_zmosh,
             .server_name = "zmosh",
@@ -362,7 +374,7 @@ pub const Pair = struct {
         const info = protection.peekProtectedLongPacketInfo(data) catch {
             // Short header: 1-RTT application data. A datagram that fails
             // authentication (corruption injection) is discarded, per QUIC.
-            _ = lifecycle.processRoutedProtectedShortDatagramWithInstalledKeys(
+            _ = lifecycle.processRoutedProtectedShortDatagramWithInstalledKeysAndUpdatePathOrClose(
                 handle,
                 conn,
                 path,

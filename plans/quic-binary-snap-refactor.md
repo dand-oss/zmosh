@@ -39,18 +39,21 @@ Record these inputs before coding and do not silently advance them:
 | zmx base | `cd88d1b` | zmx v0.7.0 replant base |
 | custom fallback | `master` at `db4661c02965733d5975011e92875e3c639cac87` | zmosh 0.5.3 reliable snapshot/reordering implementation |
 | quicz spike | `b4352201f1217bbc4538e379be0f68f783558070` | only QUIC candidate admitted to the spike |
-| **quicz production pin** | dand-oss/quicz `3a75a8b63dd4137f07932d3d85ee773b24ad80c1` | fork of upstream `b4352201` + six reviewed zmosh commits (external-PSK identity API; explicit resumption disable; address-neutral routing; streamSendProgress; secureWipe; lifecycle neutral process entries); immutable tag `zmosh-quic-q1-2` (`zmosh-quic-q1` = first five commits, also immutable) |
 | Ghostty audited tree | `b97b17f06b1ffd694f80edd3df5dd2134a0bcb9e` | frozen 2026-08-17 tree containing the reviewed Snapshot v1 Zig and C APIs; the commit itself is an unrelated i18n change |
-| **Ghostty production pin** | dand-oss/ghostty `6361b2eac73e8243a7042f517ea95ab87165f105` | fork of upstream `56e1f3a62` + the public `lib_vt` snapshot re-export; immutable tag `zmosh-snapshot-v1`; snapshot content ref still `1359973ae` |
 | Ghostty snapshot content | `1359973aefb37a9beaa2ec3e8f79df78290ea6f5` | last commit touching `src/terminal/snapshot/` as of the audited tree, 2026-08-15 |
+| **Ghostty production pin** | dand-oss/ghostty `6361b2eac73e8243a7042f517ea95ab87165f105` | fork of upstream `56e1f3a62` plus the public `lib_vt` snapshot re-export; pinned by SHA only (the `zmosh-snapshot-v1` tag is retired: Ghostty's build permits only its own matching `vX.Y.Z` tags at HEAD, so custom tags break a normal checkout) |
+| **quicz remediation base** | dand-oss/quicz `3a75a8b63dd4137f07932d3d85ee773b24ad80c1` | fork of upstream `b4352201` plus the six reviewed Q1 commits; tags `zmosh-quic-q1`/`zmosh-quic-q1-2` |
+| **quicz production pin** | dand-oss/quicz `238a57b9d93344bfbd098bcde865450adeba9274` | the `zmosh-quic-q1-4` tip (immutable tag): upstream `b4352201` + eight reviewed zmosh commits, ending with the bounded-candidate remediation (`653d247` exact stored-exchange slot contract; `238a57b` path validation bound to the candidate path). Zig package hash `quicz-0.1.0-g2J97yxrlgBCQxYnbJBVx1V05SbJqCBuUiA4707_924f`. Suite at the pin: 1900/1900; spike gates green in Debug and ReleaseSafe. `zmosh-quic-q1-3` (`fa6c4c0e…`) remains immutable, superseded history |
 | Zig | `0.16.0` | project and dependency toolchain |
 
 The current Ghostty dependency (`aa21cae...`) has no snapshot module and must
 not be used for the production snapshot path. Snapshot v1 is explicitly work
 in progress, so its numeric version is not a compatibility boundary. The
-production dependency advances to the exact reviewed upstream commit that
-contains the public snapshot re-export required in Phase Q1. That commit and
-its Zig package hash are part of the application handshake.
+production dependency is the dand-oss fork pin above. That commit and its Zig
+package hash are part of the application handshake. The dand-oss forks keep
+their original projects configured as upstream remotes for future
+synchronization; zmosh pins exact fork commits, never moving branch heads, and
+existing tags are immutable.
 
 ## Non-negotiable constraints
 
@@ -107,6 +110,62 @@ packet state machine; Ghostty removes the terminal serialization state
 machine. zmosh must still coordinate connection negotiation, stream roles,
 snapshot installation, output replacement, command completion, and shutdown.
 
+## SSH resumption, Mosh, and terminal continuity
+
+Decision: zmosh does not depend on Mosh or implement Mosh's State
+Synchronization Protocol, but it retains the user-visible properties that
+make Mosh valuable: roaming, tolerance of intermittent connectivity, visible
+staleness, responsive control traffic, and deterministic terminal recovery.
+
+As of OpenSSH 10.4, OpenSSH has no reconnectable interactive-session
+resumption. `ControlMaster` and `ControlPersist` multiplex sessions over, and
+retain, an existing TCP connection; they do not recover its channels after
+that connection dies. OpenSSH's old experimental roaming client was disabled
+and then removed in 7.2, and matching server code was never shipped. An
+automatic SSH reconnect or a fresh SSH login is therefore a new transport and
+new channel. A program under tmux or screen may survive independently. zmosh
+instead has a detached owner process per live session; it owns that session's
+PTY master and shell child and survives ordinary client disconnect. Neither
+mechanism is SSH channel resumption, and SSH does not reconstruct terminal
+state or prove which output was displayed before the break.
+
+Keep these layers distinct:
+
+- **SSH bootstrap** authenticates the host and user, applies existing SSH
+  configuration, and launches/owns the ephemeral zmosh gateway. It is not the
+  terminal data transport.
+- **QUIC path migration** preserves the same authenticated QUIC connection
+  through address and port changes while its connection state remains alive.
+- **QUIC TLS resumption** would only accelerate creation of a new connection;
+  it would not resume zmosh stream state, terminal state, or uncertain command
+  outcomes. Session tickets, resumption, and 0-RTT remain disabled in v1 so a
+  new connection always receives a fresh SSH-delivered secret and cannot
+  replay application work.
+- **zmosh reattachment** reconnects to the existing detached per-session owner
+  while it is alive, installs a Ghostty binary snapshot, and crosses an
+  explicit output-epoch boundary before live output resumes. This is the
+  actual terminal-session continuation mechanism.
+
+The per-session owner is not a global service or durable store. Its lifetime is
+bounded by the PTY child: it ends when the shell exits, the session is killed,
+or the owner fails, and it does not survive a host reboot. "Persistence" in
+this plan means continuity across client detach and network loss only.
+
+Mosh remains a behavior and qualification reference, not a component. Mosh
+uses SSH bootstrap followed by UDP, synchronizes terminal screen state instead
+of replaying a byte stream, supports roaming and local prediction, and keeps
+control responsive under loss. zmosh obtains those correctness properties
+from QUIC plus Ghostty Snapshot v1, while also preserving scrollback and parser
+continuation. Predictive local echo is optional latency UX, not required for
+session continuity, and remains outside v1.
+
+If a future OpenSSH release ships authenticated reconnection of live channels,
+re-evaluate whether SSH can replace part of the bootstrap/transport layer. It
+still does not replace zmosh's detached per-session PTY owner, binary terminal
+snapshot, output epochs, remote command semantics, or C ABI without explicit
+proof of equivalent behavior under loss, migration, and detached
+reattachment.
+
 ## Phase Q0: reconcile the checkpoint and freeze recovery
 
 1. Re-run `zig build`, `zig build check`, `zig build test`, full Bats,
@@ -134,16 +193,17 @@ or begin the command gateway.
 
 ### Phase ownership (frozen)
 
-- Q1 owns dependency and transport feasibility: fork pins, the PSK gate, the
-  fault matrix, send-progress accounting, secure teardown, real-socket family
-  proofs, and the spike report.
-- Q2 owns production zmosh integration: the `poll()` loop, sockets, UDP
-  port range, bootstrap, and zmosh-side key cleanup and zeroization.
+- Q1 owns dependency and transport feasibility: fork pins, the PSK gate,
+  Retry before client state, real PATH_CHALLENGE/PATH_RESPONSE migration, the
+  fault matrix, the conservative backlog metric, secure teardown, and the
+  real-socket family proofs.
+- Q2 owns production zmosh integration (poll() loop, sockets, bootstrap,
+  process cleanup) together with Q8's process-cleanup release gates.
 - Q3 owns HELLO authorization, replay and pre-handshake rejection, and the
-  one-client-per-gateway policy.
+  one-client-per-gateway policy including authenticated second-client
+  rejection.
 - Q5 owns visible disconnect/reconnect behavior and output replacement.
-- Q7/Q8 own attribution, packaging, process cleanup, platform execution, and
-  soak qualification.
+- DPLPMTUD is deferred entirely: v1 fixes a 1200-byte UDP payload.
 
 ### Independent Ghostty snapshot API prerequisite
 
@@ -151,10 +211,9 @@ or begin the command gateway.
 
       pub const snapshot = terminal.snapshot;
 
-- The re-export landed in the dand-oss Ghostty fork (upstream `56e1f3a62` +
-  one commit, tag `zmosh-snapshot-v1`); the production pin is that exact fork
-  commit. Original projects remain configured as upstream remotes for future
-  synchronization; no upstream acceptance is required for Q1/Q2.
+- The re-export landed in the dand-oss Ghostty fork (upstream `56e1f3a62`
+  plus one reviewed commit); the production pin is that exact fork commit,
+  SHA-only. No upstream acceptance is required for Q1/Q2.
 - Do not use the Ghostty C snapshot API as a fallback. It owns a C
   `TerminalWrapper`, while zmosh owns a native Zig `ghostty_vt.Terminal`; using
   it would require an unrelated terminal-ownership rewrite.
@@ -162,7 +221,9 @@ or begin the command gateway.
   `vt-features=+snapshot` explicitly so a future default change cannot silently
   remove it.
 - Track this prerequisite independently of the quicz decision. It blocks both
-  the QUIC production path and the custom-transport fallback.
+  the QUIC production path and the custom-transport fallback. The fork must
+  build and pass its own `test-lib-vt` suite from an ordinary untagged
+  checkout at the pinned SHA.
 
 ### Dependency and API proof
 
@@ -174,13 +235,15 @@ or begin the command gateway.
   `poll()` loop.
 - Prove IPv4, IPv6, and dual-stack operation without regressing current zmosh
   behavior.
-- Prove all required behavior through public quicz APIs. The production
-  dependency is the dand-oss fork pin: upstream `b4352201` plus six reviewed
-  zmosh commits adding exactly those APIs (`setClientPskIdentity`, explicit
-  resumption/0-RTT disable, address-neutral IPv4/IPv6 routing,
-  `streamSendProgress`, `secureWipe`, lifecycle neutral process entries).
-  Each commit passed the full quicz suite; the fork tracks upstream
-  `venjiang/quicz` for future synchronization.
+- Prove all required behavior through public quicz APIs of the dand-oss fork.
+  The production pin is the `zmosh-quic-q1-4` tip: upstream `b4352201` plus
+  the reviewed remediation commits (conservative stream-progress metric;
+  address-neutral paths across routing, Initial acceptance, Retry, token
+  policy, migration, and route updates; secret ownership and teardown; the
+  hardened bounded-candidate slot; candidate-path-bound validation). Each
+  commit passes the full quicz suite; the fork tracks upstream
+  `venjiang/quicz` for future synchronization. `zmosh-quic-q1-3` and every
+  earlier tag remain immutable history.
 - Keep the production compatibility adapter below 500 non-test lines. This
   excludes zmosh's application protocol but includes all quicz-specific
   lifecycle glue.
@@ -189,10 +252,13 @@ or begin the command gateway.
 
 - Make a certificate-free external-PSK TLS 1.3 handshake the first Q1
   go/no-go checkpoint. Do not build the transport fault matrix until this
-  succeeds through an upstreamable quicz API.
+  succeeds through the fork's public quicz API.
 - Generate the existing 32-byte bootstrap secret with `std.crypto.random`.
-- Derive a QUIC external PSK with HKDF-SHA256 using the fixed context
-  `zmosh quic psk v1`; derive Retry/token material with a separate context.
+- Frozen derivations: the external PSK is HKDF-SHA256 extract with salt
+  `zmosh quic psk v1` and the bootstrap secret as IKM, expanded with info
+  `zmosh-ssh-bootstrap-v1` to 32 bytes; the address-validation token secret
+  is extract with salt `zmosh quic token v1`, expanded with info
+  `zmosh-address-validation-v1` to 32 bytes.
 - Use ALPN `zmosh/1` and the fixed non-secret PSK identity
   `zmosh-ssh-bootstrap-v1`.
 - Use quicz's certificate-free, PSK-selected TLS 1.3 handshake. Do not use
@@ -200,32 +266,70 @@ or begin the command gateway.
   generator.
 - Disable session tickets, resumption, and 0-RTT. No application stream is
   accepted before `handshakeConfirmed()` and successful application HELLO.
-- Require QUIC Retry/address validation before allocating large per-client
-  state. Accept only one authenticated connection per ephemeral gateway.
-- Prove that a wrong PSK, wrong identity, replayed Initial, second client, and
-  pre-handshake application data cannot reach application dispatch.
-- Zeroize bootstrap and derived key material during cleanup. Never log key
-  material or enable qlog by default.
+  This is QUIC/TLS handshake resumption, not zmosh terminal reattachment; the
+  latter remains supported through a fresh authenticated connection followed
+  by snapshot installation.
+- Require QUIC Retry/address validation before published client state,
+  using the approved **bounded-candidate** contract. The first Initial
+  allocates no connection-sized or unbounded per-client state; one bounded
+  token/Retry buffer is permitted. The pending-Retry slot matches on the
+  full UDP path, QUIC version, original DCID, and client SCID — never
+  byte-identical datagrams; tokenless retransmissions matching that tuple
+  reissue the same Retry without extending the absolute ten-second expiry;
+  unrelated Initials are dropped while the slot is occupied. A token-bearing
+  follow-up is accepted only when the slot is occupied and unexpired and its
+  path, version, Retry SCID, client SCID, and token match the stored
+  exchange exactly. After that exact validation, at most one bounded,
+  unpublished candidate connection is created; the follow-up Initial is
+  authenticated and processed against the candidate, and only on success is
+  the candidate published and the token consumed (clearing the slot). Any
+  parse or authentication failure wipes the candidate and rolls every
+  allocation back to the pre-Initial baseline. `commit()` consumes only the
+  exact stored token. Assertions compare against the pre-Initial baseline:
+  every malformed, expired, replayed, wrong-path, unrelated, or
+  unauthenticated attempt leaves candidate/Connection/TLS/stream/route
+  counts at zero delta, and one valid follow-up creates exactly one
+  candidate. QUIC Initial protection is not client authentication — the
+  keys derive from the public destination CID — so the boundary is the
+  token-gated candidate, not strict pre-allocation packet authentication.
+  The Retry response stays within the received-byte amplification allowance.
+  The one-client-per-gateway policy and authenticated second-client
+  rejection are Q3.
+- Prove that a wrong PSK, wrong identity, replayed Initial, and pre-handshake
+  application data cannot reach application dispatch.
+- Zeroize secrets in their real owners: `Tls13ServerTransport.deinit()`
+  wipes its TLS backend; `Tls13ClientTransport.deinit()` wipes its backend
+  and retained Initial keys; `AddressValidationPolicy.deinit()` wipes token
+  secrets before freeing; stored `InitialSecrets` are wiped explicitly;
+  `Connection.deinit()` keeps wiping packet keys; temporary bootstrap and
+  derived copies use `defer`/`errdefer` secure wipes. Never log key material
+  or enable qlog by default.
 
 ### Transport proof
 
-- Use an initial UDP payload of 1200 bytes and never emit an IP-fragmenting
-  datagram. DPLPMTUD may raise the payload to at most 1350 only after a
-  validated path probe.
+- v1 fixes the UDP payload at 1200 bytes and never emits an IP-fragmenting
+  datagram. DPLPMTUD is deferred entirely; paths that cannot carry the
+  1200-byte QUIC minimum fail loudly.
 - Prove stream isolation under loss: delayed snapshot/output bytes must not
   block input or control on another stream.
-- Prove connection migration after source-port and source-address changes,
-  with path validation before committing the route.
+- Prove connection migration after source-port and source-address changes
+  through real path validation: authenticated data from the new path queues
+  an unpredictable PATH_CHALLENGE that is sent on the candidate path; the
+  matching PATH_RESPONSE must come from that path; the route commits only
+  afterward. Wrong, stale, and old-path responses cannot commit the route,
+  and traffic returning to the old path requires fresh validation.
 - Prove RESET_STREAM and STOP_SENDING are observable by the application.
-- Expose per-stream queued plus unacknowledged bytes and oldest-unacknowledged
-  age. These metrics are required for bounded output replacement.
+- Expose only the conservative per-stream backlog metric:
+  `accepted_offset`, `oldest_unsettled_offset` (the minimum STREAM offset
+  present in the application send queue or sent packets, equal to
+  `accepted_offset` when none exists), and derived `outstandingBytes()`. No
+  age API: zmosh Q5 owns `{last_offset, no_progress_since}` and starts its
+  timer on the 0-to-nonzero backlog transition.
 - Prove a 24-hour negotiated idle lifetime through negotiated-parameter
   assertions and scaled-down timer tests, not a literal 24-hour run. Prove a
   1-second keepalive while attach or tail is active and visible
   disconnected/reconnected transitions after five seconds without an
   authenticated packet.
-- Prove no orphan socket, SSH child, or gateway process after normal close,
-  timeout, signal cancellation, handshake failure, or forced termination.
 
 ### Resource and platform proof
 
@@ -244,10 +348,12 @@ or begin the command gateway.
 ### Spike fault matrix
 
 The deterministic harness must inject loss, duplication, reordering,
-corruption, delay, MTU reduction, NAT rebinding, a ten-second outage, and a
-slow receiver. It must demonstrate successful PSK handshake, stream echo,
-timer recovery, migration, bounded memory, reset observability, and clean
-shutdown.
+corruption, delay, NAT rebinding, a ten-second outage, and a slow receiver,
+and must fail loudly on paths that cannot carry the fixed 1200-byte payload.
+It must demonstrate successful PSK handshake, stream echo, timer recovery,
+migration, bounded memory, reset observability, and clean shutdown. Process
+cleanup (no orphan socket, SSH child, or gateway process) is proven at Q2
+integration and gated again at Q8.
 
 ### Go/no-go decision
 
@@ -255,9 +361,9 @@ Write `docs/quic-spike.md` with exact SHAs, patches/API gaps, test output,
 binary/build measurements, platform results, and residual risks.
 
 QUIC is accepted only if every hard gate above passes. On acceptance, the
-production quicz pin is the dand-oss fork commit recorded in the frozen-inputs
-table. If a hard gate fails, stop and follow the fallback section; do not
-weaken the gate during implementation.
+production quicz pin is the `zmosh-quic-q1-4` fork tip recorded in the
+frozen-inputs table. If a hard gate fails, stop and follow the fallback
+section; do not weaken the gate during implementation.
 
 Checkpoint: spike report committed and pushed; implementation remains locked
 pending review.
@@ -383,9 +489,9 @@ not network logic.
 
 - Advance Ghostty to the dand-oss fork pin (`6361b2eac...`, upstream
   `56e1f3a62` plus the reviewed `pub const snapshot = terminal.snapshot;`
-  re-export), then regenerate and record the Zig package hash. The audited
-  `b97b17f...` tree and snapshot content reference `1359973a...` are review
-  inputs, not the production pin.
+  re-export; SHA-only, no custom tag), then regenerate and record the Zig
+  package hash. The audited `b97b17f...` tree and snapshot content reference
+  `1359973a...` are review inputs, not the production pin.
 - Pass `vt-features=+snapshot` explicitly and, only after the re-export lands,
   use the public `ghostty_vt.snapshot` encoder and Decoder. Do not copy or
   reinterpret Ghostty record definitions, use the C wrapper, or carry a
@@ -512,7 +618,10 @@ epoch, or a rejected/corrupt snapshot.
 The gateway enforces both limits on the current output stream:
 
 - at most 1 MiB queued plus unacknowledged output;
-- oldest unacknowledged output age at most five seconds.
+- no contiguous progress on the output stream for at most five seconds,
+  measured by zmosh from the backlog metric's 0-to-nonzero transition and
+  subsequent lack of `oldest_unsettled_offset` advancement (no age API in
+  quicz).
 
 Crossing either limit resets that output stream with OUTPUT_STALE, stops
 forwarding stale daemon `.Output`, increments the epoch, and requests a fresh
@@ -807,6 +916,7 @@ acceptance tests. Push no bead-generated code or branch change automatically.
 
 - No HTTP/3, WebTransport, QUIC DATAGRAM live-output path, KCP, or second QUIC
   implementation.
+- No Mosh dependency, Mosh SSP implementation, or predictive local echo in v1.
 - No runtime custom-UDP fallback after QUIC acceptance.
 - No public C ABI change and no native binary-snapshot callback in v1.
 - No remote list, history, run, wait, switch, wildcard, or multi-session
@@ -815,6 +925,81 @@ acceptance tests. Push no bead-generated code or branch change automatically.
 - No daemon thread, general daemon IPC redesign, Rust rewrite, or hosted
   service.
 - No backward compatibility between pre-QUIC and QUIC gateway/client binaries.
+
+## Evaluated prior art
+
+Evaluated 2026-08-17. These projects are design references, not proposed
+runtime dependencies. The decision remains to use the forked Zig `quicz`
+transport with Ghostty Snapshot v1; none of the projects below replaces both
+halves of that design.
+
+- **[p2sh](https://github.com/eskimor/p2sh) — future discovery/relay reference,
+  not an implementation candidate.** Its intended model is a stable node ID,
+  NAT traversal, relay fallback, QUIC, and eventually terminal-state
+  synchronization, but the repository describes itself as a crude proof of
+  concept: it still invokes ordinary SSH and has not implemented QUIC or NAT
+  traversal. Retain its node-addressing and relay roadmap as input to a future
+  direct-UDP-reachability project; do not add those concerns to this refactor.
+
+- **[quicssh-rs](https://github.com/oowl/quicssh-rs) — transparent-tunnel
+  reference.** It puts an unmodified SSH byte stream through QUIC by using
+  OpenSSH `ProxyCommand`, Quinn, and Tokio. This usefully demonstrates that
+  connection migration can be hidden behind conventional SSH tooling, but it
+  has no terminal snapshot, output-epoch, or session-state semantics. Its Rust
+  async stack also conflicts with zmosh's Zig-only, single-threaded `poll()`
+  architecture. Borrow lifecycle and interoperability test ideas, not its
+  runtime or proxy architecture.
+
+- **[tsshd](https://github.com/trzsz/tsshd) and its
+  [Show HN report](https://news.ycombinator.com/item?id=46680813) — primary
+  operational reference for bootstrap and roaming.** It uses ordinary SSH to
+  start a temporary server, moves traffic to QUIC or KCP, authenticates a new
+  address before replacing the active path, and preserves full OpenSSH
+  behavior. This is strong evidence for the SSH-bootstrap UX and for tests of
+  authenticated rebinding, one-client ownership, reconnect visibility, and
+  orphan-free process cleanup. It is nevertheless a Go SSH proxy with its own
+  reconnect/heartbeat layer; zmosh should let QUIC own path migration and let
+  Ghostty snapshots/output epochs own terminal recovery. The HN post is an
+  author deployment report, useful corroboration rather than independent
+  protocol evidence.
+
+- **[Latch](https://github.com/unixshells/latch) — product and trust-boundary
+  reference.** Its single binary exposes shared terminal sessions through
+  standard SSH, native Mosh, a web terminal, and an encrypted relay. Its useful
+  lessons are consistent session naming across transports, explicit relay
+  trust claims, and simple one-binary remote-access UX. Its multiplexer,
+  windowing, hosted relay, web client, and multi-transport scope are outside
+  this refactor, and it offers no QUIC plus Ghostty binary-snapshot path.
+
+- **[RoSE](https://github.com/nikhiljha/rose) — closest architectural
+  comparison.** RoSE combines QUIC streams and RFC 9221 datagrams, SSH
+  bootstrap, roaming, local prediction, scrollback, and a terminal-state
+  synchronization protocol. It validates the broad direction and is valuable
+  for fault-matrix and stream/datagram-separation test ideas. Do not adopt its
+  Rust/GPL implementation, X.509/TOFU identity model, terminal emulator, or
+  state-synchronization protocol: those duplicate the selected SSH-delivered
+  PSK, native Zig Ghostty terminal, and Snapshot v1 design. QUIC migration
+  should also avoid an application-level reconnect state machine where the
+  library can preserve the connection.
+
+- **[libghostty-rs](https://github.com/uzaaft/libghostty-rs) — binding and
+  packaging reference only.** It provides generated raw FFI plus safe Rust
+  wrappers over `libghostty-vt`, pins the Ghostty source, supports local and
+  network-free source overrides, and tests Rust-owned unsafe boundaries. Those
+  are useful precedents for pin discipline, static-library packaging, and C ABI
+  smoke tests. It does not remove zmosh's need for a native Zig Snapshot v1
+  re-export: its documented render snapshots are not the binary continuation
+  protocol, and adopting it would add Rust and transfer terminal ownership
+  through the C ABI. Keep it as C-library/build-system prior art, not a
+  dependency or fallback.
+
+The concrete additions to qualification are therefore limited to test ideas:
+authenticated path replacement must reject the old path; SSH bootstrap and
+gateway teardown must leave no orphan; transport migration must not create a
+second application session; stream backpressure must not block control traffic;
+and snapshot/output-epoch recovery must remain byte-correct through loss,
+reordering, and address changes. No new feature scope or dependency follows
+from this survey.
 
 ## References
 
@@ -825,4 +1010,10 @@ acceptance tests. Push no bead-generated code or branch change automatically.
 - Ghostty snapshot source: <https://github.com/ghostty-org/ghostty/tree/main/src/terminal/snapshot>
 - Ghostty C snapshot API: <https://github.com/ghostty-org/ghostty/blob/main/include/ghostty/vt/snapshot.h>
 - Paneflow Ghostty integration lessons: <https://github.com/arthjean/paneflow/blob/main/BUILD_WEEK.md>
+- OpenSSH release notes, including 10.4 and removal of experimental roaming in
+  7.2: <https://www.openssh.com/releasenotes.html>
+- OpenSSH `ControlMaster`/`ControlPersist` semantics:
+  <https://man.openbsd.org/ssh_config.5>
+- Mosh behavior and State Synchronization Protocol overview:
+  <https://mosh.org/>
 - zmosh custom fallback commits: `7404914`, `db4661c`
