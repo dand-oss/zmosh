@@ -249,9 +249,17 @@ or begin the command gateway.
   commit passes the full quicz suite; the fork tracks upstream
   `venjiang/quicz` for future synchronization. `zmosh-quic-q1-3` and every
   earlier tag remain immutable history.
-- Keep the production compatibility adapter below 500 non-test lines. This
-  excludes zmosh's application protocol but includes all quicz-specific
-  lifecycle glue.
+- Keep the production compatibility adapter below 500 production SLOC:
+  `src/quic_transport.zig` remains below 500 production SLOC, excluding
+  blank lines, comment-only lines, and all test-only declarations/helpers.
+  The count at `00583d8` is 365, reproduced by the frozen counting command:
+
+  ```
+  awk '/^const testing = std\.testing;/{exit} NF && $0 !~ /^[[:space:]]*\/\// {n++} END{print n}' src/quic_transport.zig
+  ```
+
+  The adapter owns only QUIC lifecycle, datagrams, deadlines, and counters —
+  never terminal, command, socket-poll, or gateway policy.
 
 ### Authentication proof
 
@@ -565,6 +573,85 @@ change, no repin) and froze this contract for the correction commit.
    pointer).
 8. **Minor**: no `if (true)` scaffolding; the loopback test performs
    a real bidirectional echo.
+
+### Round-2 correction contract (frozen 2026-08-18)
+
+**Strategy decision: stay with QUIC/quicz.** The checkpoint-1 blockers
+are integration defects in OUR adapter, not quicz failures (quicz
+1907/1907; Q1 spike green; adapter 138/138; nothing deployed). The
+custom transport stays intact as the recovery branch until QUIC
+qualification; do not resume it or switch libraries. Reconsider quicz
+only if the corrected fully routed test exposes a defect inside quicz
+itself requiring another substantial fork redesign.
+
+`src/quic_transport.zig` implements all of it in ONE `Fixed:`
+checkpoint commit:
+
+1. **Route-first dispatch, no duplicated CID state.** Every Retry,
+   Initial, and Handshake datagram handed to an existing Transport
+   routes through
+   `lifecycle.routeAndVerifyDatagramAddress(handle, arrival, data)`
+   first: any route error OR `route.path_changed` → discard and count,
+   return normally. The tokenless first Initial stays above the
+   adapter at the PendingRetrySlot boundary. No `peer_scid_buf`:
+   `createServerCandidate` calls
+   `conn.setPeerInitialSourceConnectionId(&opts.client_scid)` (also
+   validates the follow-up Initial's SCID against the slot); server
+   output uses `peerDestinationConnectionId()`/`dstCid`; client
+   Initial output uses `retrySourceConnectionId()` after Retry, else
+   the stored ODCID.
+2. **Independent-authority outbound invariants.** After emitting an
+   Initial, the encoded header is inspected: length ≤ 1232 (every
+   Initial), length ≥ 1200 (client Initials only), DCID compared
+   against quicz's STORED peer CID — never the value passed to the
+   encoder. No ordinal tracking: a valid server ACK-only Initial may
+   be under 1200 bytes; the focused ServerHello test asserts
+   1200..1232 and DCID == client_scid. Every failure frees the
+   datagram and returns a local invariant error.
+3. **One receive-error classification path.** `InvalidPacket` with
+   the connection still active → discard and count, return normally;
+   active → closing → `protocol_violations` and return normally (the
+   queued close leaves via `pollOutbound`); already closing/draining
+   → discard. `ConnectionClosed` tolerated as a discard. Every other
+   error (OutOfMemory, Internal, CryptoError, BufferTooSmall, …)
+   propagates. quicz's own OrClose processors are used; no manual
+   close-frame reconstruction.
+4. **Ownership and secret hygiene.** `createEndpoint` takes
+   `*const protection.InitialSecrets` (one owned copy installed;
+   caller wipes its temporary on every path); `errdefer
+   t.destroy()` immediately after server-candidate creation; the
+   Retry reconstruction datagram is freed and never sent. Client
+   Retry rekey: derive the replacement, IMMEDIATELY defer-wipe the
+   replacement temporary, run the fallible reset sequence, wipe the
+   old owned secrets, copy the replacement in, record Retry-SCID
+   bookkeeping only after success. The wrong-PSK test retires the
+   candidate through `boundary.registry.retire(server.lifecycle, 1)`
+   — retirement destroys the server AND its lifecycle, so nothing is
+   read from either afterward; assert `retired.routes_retired == 1`,
+   registry/active counts zero, slot still occupied, replay filter
+   unchanged; registry-owned storage is never directly destroyed.
+5. **Coverage split and anti-false-positive discipline.** Unknown-CID
+   and changed-path rejections are SEPARATE tests, and every negative
+   test uses an otherwise-valid packet so only the property under
+   test can fail it: the authenticated-violation packet uses a fresh
+   `nextPeerPacketNumber(.application)`; the malformed Retry keeps
+   the correct path and registered client CID and corrupts ONLY its
+   integrity tag; the changed-path packet is a fresh valid protected
+   long packet (delivering it afterward on the correct path must
+   still succeed); the unknown-CID packet is otherwise structurally
+   valid. New coverage: the fully routed Retry → ServerHello →
+   handshake → 1-RTT loopback with bidirectional echo (route
+   verification active end-to-end; no direct-delivery bypass);
+   wrong-PSK rollback without slot commit; malformed-Retry discard
+   without rekey; authenticated violation → `.closing`/`.draining`
+   with CONNECTION_CLOSE via `pollOutbound`; 1233-byte inbound
+   discard and 1233-byte outbound `DatagramExceedsFixedCap` with the
+   freed allocation proven by the testing allocator.
+
+Landing note: the earlier `Fixed(q2):` subject is retained history;
+all new commits use the exact required `Changed:`/`Fixed:` prefixes.
+Q2 item 3 (poll-loop integration) stays LOCKED until this correction
+passes review.
 
 Do not remove the custom modules until the PSK QUIC loopback, migration, and
 shutdown tests pass in zmosh. Then remove custom XChaCha framing, packet ACKs,
@@ -973,7 +1060,10 @@ Use an in-process datagram harness below QUIC to inject:
 - loss of handshake and 1-RTT packets;
 - heavy reordering and duplication;
 - corruption and truncation;
-- MTU 1200 and failed larger probes;
+- datagrams at the 1200-byte QUIC client Initial floor and at the fixed
+  1232-byte maximum UDP payload — no payload probing or DPLPMTUD in v1;
+  oversized inbound datagrams are discarded and counted, and oversized
+  outbound datagrams are freed and reported as local errors;
 - delayed ACK/PTO recovery;
 - source-port and source-address rebinding;
 - ten-second blackout and recovery;
