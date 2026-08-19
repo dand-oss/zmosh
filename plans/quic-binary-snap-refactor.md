@@ -964,6 +964,143 @@ latest is applied after installation.
 Keep parsing allocation-free for fixed headers and validate all lengths before
 allocation. Unknown control messages are rejected rather than ignored in v1.
 
+### Q3 checkpoint contract (frozen 2026-08-19, review rounds 1–4)
+
+Baseline: `replant-zmx0.7` at `207fd6d`; quicz immutable at
+`zmosh-quic-q2-1` = `fc99692500610f1aa45aa8205bef0d239fe83eda` (no
+quicz change); no daemon-core or IPC-tag change; `quic_transport.zig`
+untouched (SLOC 467 < 500); custom transport untouched; the four attach
+Bats skips stay skipped (Q5) and `remote.zig` keeps rejecting the `quic`
+token. Track under bead `zmosh-8sd.9` (auto-assigned successor of the
+Q2 bead).
+
+**Modules.** `src/quic_wire.zig` (pure framing, no sockets/quicz),
+`src/quic_session.zig` (`QuicSession` — gateway-side application
+session, owns no fds), `src/quic_client.zig` (client protocol module,
+consumed by Q5/Q6, exercised by tests only). `quic_gateway.zig` stays
+CONNECTION LIFECYCLE ONLY: sheds `rejectPreQ3StreamData`, exposes the
+borrowed established transport; daemon fds/IPC buffers never enter it.
+`serve.Gateway` owns `QuicSession`, the daemon-side relay, a dynamic
+POLL.OUT arm over a bounded 64 KiB unix write buffer, a bounded daemon
+reader, and the session-deadline composition. `build.zig` gains a
+`ghostty_commit` option (40-hex parsed from the zon url) for the
+fingerprint. `docs/quic-wire.md` records the frozen wire.
+
+**Wire freezes.** Preface flags and reserved are zero for every role in
+v1 (unknown role → `unknown_role`; nonzero flags/reserved →
+`protocol_violation`). HELLO/HELLO_ACK payload is 48 B: major u8, minor
+u8, mode u8, reserved u8, capabilities u32 BE (= 0x1F exactly — one v1
+profile: binary_snapshot 0x01, resettable_output 0x02, remote_commands
+0x04, tail 0x08, dual_stack 0x10), snapshot_abi_id 32 B, snapshot_limit
+u32 BE (128 MiB), command_limit u32 BE (1 MiB); limits negotiate as
+min(client, server). RESIZE is four u16 BE; ERROR is code u32 BE +
+printable reason ≤ 256 B; SESSION_END/DETACH empty. Error codes (same
+values as u32 in ERROR frames and u64 in closeApplication/resetStream/
+stopSending): 0 none, 1 protocol_violation, 2 version_mismatch,
+3 capability_mismatch, 4 fingerprint_mismatch, 5 unknown_role,
+6 unknown_frame, 7 stream_cardinality, 8 unimplemented, 9 session_ended,
+10 internal_error. Mode 2 → unimplemented (terminal); unknown mode →
+protocol_violation. Validation order: parse → version → capability →
+fingerprint → mode. The abi_id is computed at comptime from build
+options; the CURRENT Ghostty pin (`aa21cae` until Q4 advances it) is
+deliberate — Q4's advance changes the fingerprint and rejects mixed
+versions.
+
+**Incremental parsers.** QUIC delivers arbitrary chunks: preface,
+control header/payload, and output header (preface + epoch u64 BE) parse
+through explicit state machines that resume mid-field, validate lengths
+before allocation, loop over coalesced frames, and treat truncated FIN
+as protocol_violation. Tests feed golden sequences byte-at-a-time and at
+every split boundary.
+
+**Ordering and reordering.** The client sends ONLY control (bidi id 0)
++ preface + HELLO first. Pre-HELLO non-control data is a terminal
+violation. Post-HELLO, pre-`.Init` input on stream 2 may legitimately
+arrive first (no cross-stream ordering in QUIC): the gateway parks it
+WITHOUT consuming or granting credit, then consumes strictly after the
+first RESIZE queues daemon `.Init(sizes)` — parked input still reaches
+the daemon after `.Init`. Symmetric on the client: output stream 3
+bytes may arrive before the HELLO_ACK packet; `quic_client` parks them
+unexposed until HELLO_ACK validates. Stream ids: control = client bidi
+0, input = client uni 2, output epoch = server uni 3; later server uni
+ids reserved for Q4/Q5. Unexpected streams are detected by scanning the
+finite peer-id space the frozen 4-bidi/8-uni limits allow via PUBLIC
+`streamState(id)` — no quicz internals.
+
+**Fatal errors.** Two arms: control stream observed → bounded ERROR+FIN
+terminal sequence; stream 0 never observed → immediate application
+close with the correct code and bounded reason (no `sendOnStream(0)` —
+no send side exists).
+
+**Terminal state.** Never queue a final frame and immediately
+CONNECTION_CLOSE. Stop daemon reads; drain every pending output byte
+(chunked to available credit); FIN the output stream ONLY after all
+pending bytes are accepted; queue SESSION_END/ERROR+FIN on control;
+wait for BOTH streams' public `streamState(id).send == .data_acked` OR
+a one-second deadline (`QuicSession.nextDeadline()` min-composed into
+the gateway poll timeout and serviced with no fd ready), then close.
+Daemon EOF closes with code 9. DETACH flushes the buffered `.Detach`
+unix write first, then closes with code 0. A dropped final OUTPUT
+packet recovers like a dropped SESSION_END via QUIC retransmission; the
+deadline bounds the wait. SNAPSHOT_REQUEST's ERROR(unimplemented) is
+NONTERMINAL (no FIN, session continues); HELLO/protocol/cardinality
+errors are terminal.
+
+**Lossless backpressure.** Input: capacity checked BEFORE `recvOnStream`
+(consumed bytes can never be dropped afterward; unconsumed bytes stay
+in quicz with credit withheld → end-to-end client backpressure) into
+`.Input` frames ≤ 4 KiB and a bounded 64 KiB unix write buffer flushed
+by a dynamic daemon-fd POLL.OUT arm. Output: `sendOnStream` is
+all-or-nothing under flow control — chunk to available capacity
+(`send_max_data − send_offset`, connection-credit bounded), retain the
+unsent tail in a 64 KiB pending buffer, retry after each inbound batch;
+while full, the daemon fd is not polled for POLL.IN. Control: ONE
+bounded encoded response pending; while blocked, stop consuming further
+control frames; retry after credit; the terminal deadline closes if a
+final ERROR cannot leave; a nonterminal response never blocks relay.
+Per turn: ONE shared 64 KiB budget over control+input bytes together, a
+separate 64-control-frame ceiling, daemon reads ≤ 64 KiB — alongside
+the existing datagram/outbound bounds.
+
+**Bounded daemon reader.** `ipc.SocketBuffer.read` grows without a cap
+(ipc.zig:183) and `next()` cannot consume partial frames. Add an
+opt-in bounded mode (gateway only): cap `@sizeOf(ipc.Header) + 64 KiB`;
+an oversized DECLARED length is rejected BEFORE payload accumulation;
+fail-closed session end. A large legacy `.Init` VT replay is NOT
+guaranteed to fit (the daemon sends the whole replay as ONE `.Output`
+frame, loop.zig:942) — normal 4 KiB PTY output fits; oversized replay
+fails closed until Q4's chunked snapshots.
+
+**Daemon→client tag table.** `.Output` relays to the output stream;
+daemon `.Resize` is answered with `.Resize` carrying the last client
+size (exactly the local client's behavior, loop.zig:155–165 — never a
+fresh `.Init`, which would re-trigger replay); `.Switch` terminates
+with unimplemented (Q5-deferred); every other tag is logged, counted,
+and ignored (the local attach client's `else => {}`).
+
+**Tests** (deterministic; ACK counts only as bounds): the golden/parser
+suite above; the HELLO validation matrix; the unexpected-stream scan;
+pre-HELLO violation; positive post-HELLO input reordering (parked,
+then flows after `.Init`); withheld-HELLO_ACK client parking; stream-2
+without stream 0 (immediate close, no control send); nonterminal
+SNAPSHOT_REQUEST with continued service; control-response backpressure
+through exhausted credit and recovery; output backpressure by credit
+math; input backpressure at zero capacity; unix POLL.OUT flush with
+DETACH waiting; DETACH clean close; daemon EOF full terminal sequence
+observed by the client; timer-only 1 s terminal expiry; lost-final-
+output recovery; daemon `.Resize` reply with exactly ONE `.Init` per
+session; oversized daemon frame incl. the oversized-replay case with a
+testing-allocator bound proof; second-client and replayed-Initial
+discards; resetStream/stopSending observability. Bats unchanged
+(58 ok / 0 failed / 4 Q5 skips).
+
+**Execution order.** Plan-only commit first; then wire/build/docs;
+session/gateway; serve/client checkpoints — each a separate green FF
+commit on the standing gates (build test Debug+ReleaseSafe, check,
+ReleaseSafe build, fmt, diff, adapter SLOC unchanged, final full Bats);
+final evidence commit; STOP for review. No tag, no master push, no
+Q4/Q5/Q6 work, no Q5-skip restoration.
+
 ## Phase Q4: Ghostty binary snapshot export
 
 The daemon owns the authoritative `ghostty_vt.Terminal`; the gateway cannot
