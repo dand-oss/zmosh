@@ -423,8 +423,10 @@ const quic_test = struct {
         /// pipe it created — repeated fixtures never replace or leak
         /// descriptor pairs.
         owns_signal: bool,
+        /// Native-IPv6 identities both sides (dual-stack sockets).
+        v6: bool,
 
-        fn init(alloc: std.mem.Allocator, psk: *const [32]u8) !Loop {
+        fn init(alloc: std.mem.Allocator, psk: *const [32]u8, v6: bool) !Loop {
             // A pipe stands in for the daemon socket: the drain-discard
             // and close-detection behavior under test is identical.
             const fds = try lib_posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
@@ -440,10 +442,16 @@ const quic_test = struct {
                 .original_dcid = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 },
             });
             errdefer client.destroy();
-            try client.registerRoute(
-                quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, client_sock.bound_port),
-                quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, gw_sock.bound_port),
-            );
+            const loopback6 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            const client_local = if (v6)
+                quicz.endpoint.UdpAddress.init6Scoped(loopback6, client_sock.bound_port, 0)
+            else
+                quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, client_sock.bound_port);
+            const gw_remote = if (v6)
+                quicz.endpoint.UdpAddress.init6Scoped(loopback6, gw_sock.bound_port, 0)
+            else
+                quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, gw_sock.bound_port);
+            try client.registerRoute(client_local, gw_remote);
             const owns_signal = try signal.acquireSignalPipe();
             // Anchor on the local var — one struct, no copies.
             gw.quic.bootstrap_emitted_ns = lib_posix.nowNs();
@@ -453,15 +461,26 @@ const quic_test = struct {
                 .daemon_fd = fds[1],
                 .client_sock = client_sock,
                 .client = client,
-                .gw_addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, gw_sock.bound_port),
+                .gw_addr = if (v6)
+                    lib_posix.Address.initIp6(loopback6, gw_sock.bound_port, 0, 0)
+                else
+                    lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, gw_sock.bound_port),
                 .gw_port = gw_sock.bound_port,
                 .parked = .empty,
                 .parked_ready = .empty,
                 .owns_signal = owns_signal,
+                .v6 = v6,
             };
         }
 
         fn clientArrival(self: *const Loop) quicz.endpoint.UdpTuple {
+            if (self.v6) {
+                const loopback6 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+                return .{
+                    .local = quicz.endpoint.UdpAddress.init6Scoped(loopback6, self.client_sock.bound_port, 0),
+                    .remote = quicz.endpoint.UdpAddress.init6Scoped(loopback6, self.gw_port, 0),
+                };
+            }
             return .{
                 .local = quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, self.client_sock.bound_port),
                 .remote = quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, self.gw_port),
@@ -474,7 +493,7 @@ const quic_test = struct {
             self.parked_ready.deinit(self.alloc);
             self.client.destroy();
             self.client_sock.close();
-            lib_posix.close(self.daemon_fd);
+            if (self.daemon_fd != -1) lib_posix.close(self.daemon_fd);
             self.gw.deinit();
             if (self.owns_signal) signal.closeSignalPipe();
         }
@@ -489,6 +508,13 @@ const quic_test = struct {
         }
 
         fn clientDrain(self: *Loop, now: i64) !void {
+            return self.clientDrainFor(self.client, now);
+        }
+
+        /// Phase-scoped drain: the wrong-PSK rollback test drives a
+        /// second client transport over the SAME socket, so the
+        /// receiving transport is a parameter.
+        fn clientDrainFor(self: *Loop, target: *Transport, now: i64) !void {
             var turns: usize = 0;
             while (turns < 8) : (turns += 1) {
                 var buf: [quic_transport.max_udp_payload]u8 = undefined;
@@ -499,27 +525,27 @@ const quic_test = struct {
                 // Park Handshake-space datagrams that race key
                 // installation — the same recovery the fixtures use.
                 const info = quicz.protection.peekProtectedLongPacketInfo(buf[0..r.len]) catch {
-                    _ = try self.client.handleDatagram(self.clientArrival(), now, buf[0..r.len], &challenge);
+                    _ = try target.handleDatagram(self.clientArrival(), now, buf[0..r.len], &challenge);
                     continue;
                 };
-                if (info.packet_type == .handshake and !self.client.conn.hasHandshakeProtectionKeys()) {
+                if (info.packet_type == .handshake and !target.conn.hasHandshakeProtectionKeys()) {
                     try self.parked.append(self.alloc, try self.alloc.dupe(u8, buf[0..r.len]));
                     try self.parked_ready.append(self.alloc, true);
                     continue;
                 }
-                _ = try self.client.handleDatagram(self.clientArrival(), now, buf[0..r.len], &challenge);
+                _ = try target.handleDatagram(self.clientArrival(), now, buf[0..r.len], &challenge);
             }
-            try self.flushParked(now);
+            try self.flushParkedFor(target, now);
         }
 
-        fn flushParked(self: *Loop, now: i64) !void {
+        fn flushParkedFor(self: *Loop, target: *Transport, now: i64) !void {
             var i: usize = 0;
             while (i < self.parked.items.len) {
-                if (!self.client.conn.hasHandshakeProtectionKeys()) {
+                if (!target.conn.hasHandshakeProtectionKeys()) {
                     i += 1;
                     continue;
                 }
-                _ = try self.client.handleDatagram(self.clientArrival(), now, self.parked.items[i], &challenge);
+                _ = try target.handleDatagram(self.clientArrival(), now, self.parked.items[i], &challenge);
                 self.alloc.free(self.parked.items[i]);
                 _ = self.parked.orderedRemove(i);
                 _ = self.parked_ready.orderedRemove(i);
@@ -553,7 +579,7 @@ test "gateway loop: real-socket Retry transaction commits exactly once" {
     defer std.crypto.secureZero(u8, &bootstrap);
     defer std.crypto.secureZero(u8, &psk);
 
-    var loop = try quic_test.Loop.init(alloc, &psk);
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
     defer loop.deinit();
 
     try quic_test.driveHandshake(&loop);
@@ -581,7 +607,7 @@ test "gateway loop: pre-Q3 stream data closes the connection and exits" {
     defer std.crypto.secureZero(u8, &bootstrap);
     defer std.crypto.secureZero(u8, &psk);
 
-    var loop = try quic_test.Loop.init(alloc, &psk);
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
     defer loop.deinit();
     try quic_test.driveHandshake(&loop);
 
@@ -610,7 +636,7 @@ test "gateway loop: ten-second deadline with no first Initial exits" {
     defer std.crypto.secureZero(u8, &bootstrap);
     defer std.crypto.secureZero(u8, &psk);
 
-    var loop = try quic_test.Loop.init(alloc, &psk);
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
     defer loop.deinit();
     loop.gw.quic.bootstrap_emitted_ns = 1_000;
 
@@ -634,7 +660,7 @@ test "gateway loop: Retry expiry returns to a fresh exchange" {
     defer std.crypto.secureZero(u8, &bootstrap);
     defer std.crypto.secureZero(u8, &psk);
 
-    var loop = try quic_test.Loop.init(alloc, &psk);
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
     defer loop.deinit();
 
     // First flight only: the tokenless Initial opens the slot and the
@@ -666,4 +692,486 @@ test "gateway loop: Retry expiry returns to a fresh exchange" {
     _ = try loop.gw.processReadyAndDue(loop.gw.quic.bootstrap_emitted_ns + quic_gateway.handshake_deadline_ns, inert);
     try testing.expect(loop.gw.quic.state == .closed);
     try testing.expect(!loop.gw.running);
+}
+
+test "gateway loop: wrong-PSK follow-up rolls back with the slot reusable" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+    var other: [32]u8 = undefined;
+    var wrong_psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&other);
+    quic_transport.derivePsk(&wrong_psk, &other);
+    defer std.crypto.secureZero(u8, &other);
+    defer std.crypto.secureZero(u8, &wrong_psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+
+    // The wrong-PSK client shares the correct client's exchange
+    // identity (scid, original DCID) AND socket, so the issued token
+    // stays path-valid for either.
+    const bad = try quic_test.Transport.createClient(alloc, .{
+        .psk = &wrong_psk,
+        .scid = .{ 0x21, 0x22, 0x23, 0x24 },
+        .original_dcid = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 },
+    });
+    defer bad.destroy();
+    try bad.registerRoute(loop.clientArrival().local, loop.clientArrival().remote);
+
+    // Full failed exchange: Initial → stored Retry → token follow-up.
+    var now: i64 = lib_posix.nowNs();
+    try bad.driveCrypto(.initial, now);
+    const first_bad = (try bad.pollOutbound(now)) orelse return error.NoBadInitial;
+    defer alloc.free(first_bad);
+    try loop.client_sock.sendTo(first_bad, loop.gw_addr);
+    _ = try loop.gw.runOnce(0);
+    try testing.expect(loop.gw.quic.state == .retry_sent);
+    try loop.clientDrainFor(bad, now);
+    now += 1;
+    try bad.driveCrypto(.initial, now);
+    const follow_bad = (try bad.pollOutbound(now)) orelse return error.NoBadFollowup;
+    defer alloc.free(follow_bad);
+    const scid_before = loop.gw.quic.retry_scid;
+    const discarded_before = loop.gw.quic.counters.datagrams_discarded;
+    try loop.client_sock.sendTo(follow_bad, loop.gw_addr);
+    _ = try loop.gw.runOnce(0);
+
+    // The binder fails against the real PSK: rollback THROUGH THE
+    // REGISTRY (the once-armed-errdefer double-free path), state back
+    // to retry_sent, slot still occupied, Retry SCID unchanged, the
+    // failure counted.
+    try loop.clientDrainFor(bad, now);
+    try testing.expect(loop.gw.quic.state == .retry_sent);
+    try testing.expect(loop.gw.quic.slot.occupied);
+    try testing.expectEqual(scid_before, loop.gw.quic.retry_scid);
+    try testing.expect(loop.gw.quic.counters.datagrams_discarded > discarded_before);
+
+    // The CORRECT client with the same CIDs/path re-enters through the
+    // REISSUED stored Retry and completes on the SAME slot.
+    now += 1;
+    try loop.client.driveCrypto(.initial, now);
+    const first = (try loop.client.pollOutbound(now)) orelse return error.NoInitial;
+    defer alloc.free(first);
+    try loop.client_sock.sendTo(first, loop.gw_addr);
+    _ = try loop.gw.runOnce(0);
+    try loop.clientDrain(now);
+    try testing.expect(loop.gw.quic.state == .retry_sent);
+
+    try quic_test.driveHandshake(&loop);
+    try testing.expect(loop.gw.quic.state == .established);
+    try testing.expect(!loop.gw.quic.slot.occupied);
+    try testing.expectEqual(@as(usize, 1), loop.gw.quic.policy.replayFilterEntryCount());
+    try testing.expectEqual(@as(usize, 1), loop.gw.quic.counters.handshakes_confirmed);
+}
+
+test "gateway loop: SIGTERM is serviced before network work" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+
+    // The udp socket is PRIMED with a datagram and poll reports BOTH
+    // the signal fd and the network readable: the signal wins and the
+    // network is never read.
+    try loop.client_sock.sendTo(&([_]u8{0xff} ** 64), loop.gw_addr);
+    _ = lib_posix.write(signal.sig_pipe[1], "x") catch return error.SignalPipeWriteFailed;
+    const poll_fds = [3]lib_posix.pollfd{
+        .{ .fd = loop.gw.udp_sock.getFd(), .events = lib_posix.POLL.IN, .revents = lib_posix.POLL.IN },
+        .{ .fd = signal.sig_pipe[0], .events = lib_posix.POLL.IN, .revents = lib_posix.POLL.IN },
+        .{ .fd = 0, .events = 0, .revents = 0 },
+    };
+    const received_before = loop.gw.quic.counters.datagrams_received;
+    try testing.expect(!try loop.gw.processReadyAndDue(lib_posix.nowNs(), poll_fds));
+    try testing.expect(!loop.gw.running);
+    try testing.expectEqual(received_before, loop.gw.quic.counters.datagrams_received);
+    // The daemon pipe was never touched either.
+    var probe: [64]u8 = undefined;
+    const n = std.posix.read(loop.daemon_fd, &probe) catch 0;
+    try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "gateway loop: invalid traffic never resets state or deadlines" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+
+    // One real first flight opens the exchange.
+    const now: i64 = lib_posix.nowNs();
+    try loop.client.driveCrypto(.initial, now);
+    const first = (try loop.client.pollOutbound(now)) orelse return error.NoInitial;
+    defer alloc.free(first);
+    try loop.client_sock.sendTo(first, loop.gw_addr);
+    _ = try loop.gw.runOnce(0);
+    try testing.expect(loop.gw.quic.state == .retry_sent);
+    try testing.expect(loop.gw.quic.slot.occupied);
+    const expiry_before = loop.gw.quic.slot.expires_nanos;
+    const anchor = loop.gw.quic.bootstrap_emitted_ns;
+
+    // Garbage and truncated header-like datagrams: discarded, counted,
+    // and never a state or deadline reset.
+    const junk = [_][24]u8{
+        .{0xff} ** 24, .{0xc0} ** 24, .{0xe0} ** 24,
+        .{0x80} ** 24, .{0x40} ** 24, .{0x00} ** 24,
+    };
+    for (0..24) |i| {
+        try loop.client_sock.sendTo(&junk[i % junk.len], loop.gw_addr);
+    }
+    _ = try loop.gw.runOnce(0);
+    try testing.expect(loop.gw.quic.state == .retry_sent);
+    try testing.expect(loop.gw.quic.slot.occupied);
+    try testing.expectEqual(expiry_before, loop.gw.quic.slot.expires_nanos);
+    try testing.expect(loop.gw.quic.counters.datagrams_discarded >= 24);
+
+    // The absolute deadline is untouched by any of it: the gateway
+    // still closes at anchor + 10 s.
+    const inert = [3]lib_posix.pollfd{
+        .{ .fd = 0, .events = 0, .revents = 0 },
+        .{ .fd = 0, .events = 0, .revents = 0 },
+        .{ .fd = 0, .events = 0, .revents = 0 },
+    };
+    _ = try loop.gw.processReadyAndDue(anchor + quic_gateway.handshake_deadline_ns, inert);
+    try testing.expect(loop.gw.quic.state == .closed);
+    try testing.expect(!loop.gw.running);
+}
+
+test "gateway loop: keepalive queues once, retries a full second later, clears on emission" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+    const conn = loop.gw.quic.registry.get(1).?.transport.connection();
+
+    // Settle: the client answers everything outstanding and the
+    // gateway holds no pending emission — the timed stages below then
+    // count exactly their own output (an armed PTO would add probes).
+    var settled = false;
+    for (0..6) |_| {
+        const n: i64 = lib_posix.nowNs();
+        try loop.clientPump(n);
+        _ = try loop.gw.runOnce(0);
+        try loop.clientDrain(n);
+        // Quiescent when the gateway holds no further emission. A
+        // residual ACK-only leftover (the handshake tail) is dropped:
+        // it is not ack-eliciting, so nothing retrains a PTO on it.
+        var pending = false;
+        if (try loop.gw.quic.registry.get(1).?.transport.pollOutboundPath(n)) |left| {
+            alloc.free(left.dg);
+            pending = true;
+        }
+        if (!pending) {
+            settled = true;
+            break;
+        }
+    }
+    try testing.expect(settled);
+    const sent_base = loop.gw.quic.counters.datagrams_sent;
+
+    // Idle two seconds: exactly one PING leaves, emitted_ping clears
+    // the flag, and the output stamp advances. The client then answers
+    // it so its PTO cannot fire at the next synthetic stage.
+    const t1: i64 = lib_posix.nowNs() + 2 * std.time.ns_per_s;
+    var budget = quic_gateway.TurnBudget{};
+    try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t1, &budget));
+    try testing.expectEqual(sent_base + 1, loop.gw.quic.counters.datagrams_sent);
+    try testing.expect(!loop.gw.quic.keepalive_queued);
+    try testing.expectEqual(@as(usize, 0), conn.pending_ping_count);
+    try testing.expectEqual(t1, loop.gw.quic.last_output_ns);
+    try loop.clientDrain(t1 + 1);
+    try loop.clientPump(t1 + 1);
+    _ = try loop.gw.runOnce(0);
+
+    // Half a second later: nothing new.
+    var budget_half = quic_gateway.TurnBudget{};
+    try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t1 + 500 * std.time.ns_per_ms, &budget_half));
+    try testing.expectEqual(sent_base + 1, loop.gw.quic.counters.datagrams_sent);
+
+    // A PING queued with no sendable slot STAYS queued: the next
+    // deadline is the ATTEMPT plus one second — a real future
+    // deadline, never a busy-loop.
+    const t2 = t1 + 2 * std.time.ns_per_s;
+    var budget_one = quic_gateway.TurnBudget{ .outbound = 1 };
+    try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t2, &budget_one));
+    try testing.expect(loop.gw.quic.keepalive_queued);
+    try testing.expectEqual(@as(usize, 1), conn.pending_ping_count);
+    try testing.expectEqual(sent_base + 1, loop.gw.quic.counters.datagrams_sent);
+    try testing.expectEqual(t2 + quic_gateway.keepalive_interval_ns, loop.gw.quic.nextDeadline().?);
+
+    // One second later with a full budget: the EXISTING PING is
+    // drained — no second one is queued (pending returns to zero) —
+    // and the successful emission clears the flag.
+    var budget_full = quic_gateway.TurnBudget{};
+    try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t2 + quic_gateway.keepalive_interval_ns, &budget_full));
+    try testing.expectEqual(sent_base + 2, loop.gw.quic.counters.datagrams_sent);
+    try testing.expect(!loop.gw.quic.keepalive_queued);
+    try testing.expectEqual(@as(usize, 0), conn.pending_ping_count);
+    try loop.clientDrain(t2 + quic_gateway.keepalive_interval_ns + 1);
+    try loop.clientPump(t2 + quic_gateway.keepalive_interval_ns + 1);
+    _ = try loop.gw.runOnce(0);
+
+    // The budget-refused branch: an unsendable PING is never queued.
+    const t3 = t2 + 4 * std.time.ns_per_s;
+    var budget_zero = quic_gateway.TurnBudget{ .outbound = 0 };
+    try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t3, &budget_zero));
+    try testing.expect(!loop.gw.quic.keepalive_queued);
+    try testing.expectEqual(@as(usize, 0), conn.pending_ping_count);
+    try testing.expectEqual(sent_base + 2, loop.gw.quic.counters.datagrams_sent);
+}
+
+test "gateway loop: flood bounds defer inbound without starving output fairness" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+
+    // Distinct client PING datagrams (fresh packet numbers), then
+    // duplicates to reach a 100-datagram burst in ONE turn.
+    const now: i64 = lib_posix.nowNs();
+    var dgs: [100][]u8 = undefined;
+    var n_distinct: usize = 0;
+    for (0..100) |_| {
+        try loop.client.connection().sendPing();
+        const dg = (try loop.client.pollOutbound(now)) orelse break;
+        dgs[n_distinct] = dg;
+        n_distinct += 1;
+    }
+    defer for (dgs[0..n_distinct]) |dg| alloc.free(dg);
+    for (dgs[0..n_distinct]) |dg| try loop.client_sock.sendTo(dg, loop.gw_addr);
+    var i: usize = n_distinct;
+    while (i < 100) : (i += 1) {
+        try loop.client_sock.sendTo(dgs[0], loop.gw_addr);
+    }
+
+    const received_before = loop.gw.quic.counters.datagrams_received;
+    const sent_before = loop.gw.quic.counters.datagrams_sent;
+    _ = try loop.gw.runOnce(0);
+    // Exactly 64 inbound processed this turn; the remainder defers
+    // (the socket is still readable) and output stays bounded by the
+    // turn budget. No exact ACK count: coalescing is nondeterministic.
+    try testing.expectEqual(@as(usize, 64), loop.gw.quic.counters.datagrams_received - received_before);
+    try testing.expect(loop.gw.quic.counters.datagrams_sent - sent_before <= quic_gateway.max_outbound_per_turn);
+    var pfd = [1]lib_posix.pollfd{.{ .fd = loop.gw.udp_sock.getFd(), .events = lib_posix.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(usize, 1), try lib_posix.poll(&pfd, 0));
+}
+
+test "gateway loop: reserved slot carries the due PTO past ordinary exhaustion" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+
+    // A PING emitted to nowhere arms the application PTO.
+    const transport = loop.gw.quic.registry.get(1).?.transport;
+    const t: i64 = lib_posix.nowNs() + 1;
+    try transport.connection().sendPing();
+    const ping = (try transport.pollOutboundPath(t)) orelse return error.NoPingEmission;
+    alloc.free(ping.dg);
+
+    // Past the PTO with exactly ONE slot left: the reserved send
+    // consumes it while ordinary sends at the same budget are refused.
+    const t_due = t + 60 * std.time.ns_per_s;
+    var budget = quic_gateway.TurnBudget{ .outbound = 1 };
+    const sent_before = loop.gw.quic.counters.datagrams_sent;
+    try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t_due, &budget));
+    try testing.expectEqual(@as(usize, 0), budget.outbound);
+    try testing.expectEqual(sent_before + 1, loop.gw.quic.counters.datagrams_sent);
+
+    var ordinary = quic_gateway.TurnBudget{ .outbound = 1 };
+    try testing.expect(!ordinary.take(.ordinary));
+    try testing.expect(ordinary.take(.reserved));
+}
+
+test "gateway loop: migration through a second client path" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+
+    // NAT rebinding: the client's traffic now leaves from a second
+    // socket. The gateway sees an authenticated changed path.
+    var mig_sock = try udp.UdpSocket.bind(60800, 60900);
+    defer mig_sock.close();
+    const mig_arrival = quicz.endpoint.UdpTuple{
+        .local = quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, mig_sock.bound_port),
+        .remote = quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, loop.gw_port),
+    };
+    const now: i64 = lib_posix.nowNs();
+    try loop.client.connection().sendPing();
+    const migrated = (try loop.client.pollOutboundPath(now)) orelse return error.NoMigratedPing;
+    defer alloc.free(migrated.dg);
+    try mig_sock.sendTo(migrated.dg, loop.gw_addr);
+    _ = try loop.gw.runOnce(0);
+
+    // Exactly one challenge was queued for the candidate path.
+    try testing.expectEqual(@as(usize, 1), loop.gw.quic.counters.challenges_issued);
+
+    // The path-bound PATH_CHALLENGE is tagged to the NEW path and
+    // arrives on the migration socket (ordinary output — an ACK for
+    // the migrated PING — still uses the committed route until the
+    // migration validates, and may arrive on the original socket).
+    var buf: [quic_transport.max_udp_payload]u8 = undefined;
+    var saw_challenge = false;
+    while (true) {
+        const r = mig_sock.recvFrom(&buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        saw_challenge = true;
+        _ = try loop.client.handleDatagram(mig_arrival, now, buf[0..r.len], &quic_test.challenge);
+    }
+    try testing.expect(saw_challenge);
+    // The committed-route leftovers reach the client through the
+    // original socket.
+    while (true) {
+        const r = loop.client_sock.recvFrom(&buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        _ = try loop.client.handleDatagram(loop.clientArrival(), now, buf[0..r.len], &quic_test.challenge);
+    }
+
+    // The client's PATH_RESPONSE leaves through the migration path
+    // (bound to its arrival) — the pump routes each datagram by its
+    // tagged source port — and the gateway accepts the migration.
+    var sent: usize = 0;
+    while (sent < 8) : (sent += 1) {
+        const tagged = (try loop.client.pollOutboundPath(now)) orelse break;
+        defer alloc.free(tagged.dg);
+        if (tagged.dst.local.port == mig_arrival.local.port) {
+            try mig_sock.sendTo(tagged.dg, loop.gw_addr);
+        } else {
+            try loop.client_sock.sendTo(tagged.dg, loop.gw_addr);
+        }
+    }
+    _ = try loop.gw.runOnce(0);
+    try testing.expectEqual(@as(usize, 1), loop.gw.quic.counters.challenges_issued);
+    try testing.expect(loop.gw.quic.state == .established);
+
+    // Once validated, ALL gateway output follows the new path: a fresh
+    // client PING through the migration socket is answered there and
+    // the original socket stays empty.
+    const now2: i64 = lib_posix.nowNs();
+    try loop.client.connection().sendPing();
+    const again = (try loop.client.pollOutboundPath(now2)) orelse return error.NoSecondPing;
+    defer alloc.free(again.dg);
+    try mig_sock.sendTo(again.dg, loop.gw_addr);
+    _ = try loop.gw.runOnce(0);
+    var answered_on_new_path = false;
+    while (true) {
+        const r = mig_sock.recvFrom(&buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        answered_on_new_path = true;
+        _ = try loop.client.handleDatagram(mig_arrival, now2, buf[0..r.len], &quic_test.challenge);
+    }
+    try testing.expect(answered_on_new_path);
+    const stale = loop.client_sock.recvFrom(&buf) catch |err| switch (err) {
+        error.WouldBlock => null,
+        else => return err,
+    };
+    try testing.expect(stale == null);
+}
+
+test "gateway loop: native IPv6 loopback handshake" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, true);
+    defer loop.deinit();
+
+    try quic_test.driveHandshake(&loop);
+    try testing.expect(loop.gw.quic.state == .established);
+    try testing.expect(loop.client.handshakeConfirmed());
+}
+
+test "gateway loop: daemon EOF close survives the ordinary budget floor" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+
+    // The daemon side is gone and the turn's budget sits at the
+    // ordinary floor: the CONNECTION_CLOSE still leaves through the
+    // RESERVED slot.
+    lib_posix.close(loop.daemon_fd);
+    loop.daemon_fd = -1;
+    var budget = quic_gateway.TurnBudget{ .outbound = 1 };
+    try testing.expect(!budget.take(.ordinary));
+    try loop.gw.quic.closeForDaemonExit(&loop.gw.udp_sock, lib_posix.nowNs(), &budget);
+    try testing.expectEqual(@as(usize, 0), budget.outbound);
+    try testing.expect(loop.gw.quic.state == .closed);
+    try testing.expect(!loop.gw.quic.running);
+
+    // The close frame reached the client, whose connection leaves the
+    // active state on processing it.
+    var buf: [quic_transport.max_udp_payload]u8 = undefined;
+    var closed_seen = false;
+    while (true) {
+        const r = loop.client_sock.recvFrom(&buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        closed_seen = true;
+        _ = try loop.client.handleDatagram(loop.clientArrival(), lib_posix.nowNs(), buf[0..r.len], &quic_test.challenge);
+    }
+    try testing.expect(closed_seen);
+    try testing.expect(loop.client.conn.connectionState() != .active);
 }

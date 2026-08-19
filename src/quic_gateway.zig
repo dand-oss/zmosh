@@ -510,9 +510,11 @@ pub const QuicGateway = struct {
     ) !bool {
         defer self.alloc.free(dg);
         if (!budget.take(class)) return false;
-        sender.sendTo(dg, udpAddressToSockaddr(remote)) catch |err| switch (err) {
-            error.WouldBlock => return false,
-            else => return err,
+        // Any sender-specific non-WouldBlock failure propagates —
+        // never silently swallowed.
+        sender.sendTo(dg, udpAddressToSockaddr(remote)) catch |err| {
+            if (err == error.WouldBlock) return false;
+            return err;
         };
         self.counters.datagrams_sent += 1;
         return true;
@@ -692,3 +694,64 @@ pub const QuicGateway = struct {
         return if (a) |x| @min(x, b) else b;
     }
 };
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// A sendTo-compatible sender whose socket never accepts a datagram.
+const WouldBlockSender = struct {
+    fn sendTo(_: @This(), _: []const u8, _: lib_posix.Address) !void {
+        return error.WouldBlock;
+    }
+};
+
+test "sendOwnedVia on WouldBlock: freed, uncounted, budget decremented once" {
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+    var token_secret: [32]u8 = undefined;
+    deriveTokenSecret(&token_secret, &psk);
+    defer std.crypto.secureZero(u8, &token_secret);
+
+    var gw = try QuicGateway.init(
+        testing.allocator,
+        testing.io,
+        &psk,
+        &token_secret,
+        quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, 60000),
+        0,
+    );
+    defer gw.deinit();
+
+    // The datagram is freed on the drop (the testing allocator fails
+    // the test on any leak), the counter never moves, and the budget
+    // is decremented exactly once.
+    var budget = TurnBudget{};
+    const dg = try testing.allocator.alloc(u8, 64);
+    try testing.expect(!try gw.sendOwnedVia(
+        WouldBlockSender{},
+        dg,
+        quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, 60001),
+        &budget,
+        .reserved,
+    ));
+    try testing.expectEqual(@as(usize, max_outbound_per_turn - 1), budget.outbound);
+    try testing.expectEqual(@as(usize, 0), gw.counters.datagrams_sent);
+
+    // The refused class never reaches the sender: an ordinary send at
+    // the floor keeps the reserved slot intact.
+    const floor = try testing.allocator.alloc(u8, 64);
+    var at_floor = TurnBudget{ .outbound = 1 };
+    try testing.expect(!try gw.sendOwnedVia(
+        WouldBlockSender{},
+        floor,
+        quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, 60001),
+        &at_floor,
+        .ordinary,
+    ));
+    try testing.expectEqual(@as(usize, 1), at_floor.outbound);
+}
