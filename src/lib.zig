@@ -62,6 +62,8 @@ const Session = struct {
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.OrderedRecv,
     output_recv: transport.OutputRecvState,
+    snapshot: transport.SnapshotAssembler,
+    restoring: bool,
 
     last_ack_send_ns: i64,
     ack_dirty: bool,
@@ -131,6 +133,12 @@ fn flushReliable(s: *Session, now: i64) !void {
     }
 }
 
+fn beginRestore(s: *Session) void {
+    s.output_recv.clear();
+    s.snapshot.reset();
+    s.restoring = true;
+}
+
 fn handleReliablePayload(s: *Session, channel: transport.Channel, payload: []const u8) !void {
     switch (channel) {
         .reliable_ipc => {
@@ -142,13 +150,31 @@ fn handleReliablePayload(s: *Session, channel: transport.Channel, payload: []con
 
                 const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
                 const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
-                if (hdr.tag == .Output and msg_payload.len > 0) {
+                if (hdr.tag == .Output and msg_payload.len > 0 and !s.restoring) {
                     s.output_cb(s.ctx, msg_payload.ptr, @intCast(msg_payload.len));
                 } else if (hdr.tag == .SessionEnd) {
                     s.session_ended = true;
                     if (s.end_cb) |cb| cb(s.ctx);
                 }
                 offset += msg_len;
+            }
+        },
+        .snapshot => {
+            const frame = transport.parseSnapshotFrame(payload) catch return error.OutputStreamLost;
+            if (frame.kind == .begin) {
+                beginRestore(s);
+            } else if (!s.snapshot.active) {
+                return;
+            }
+
+            const completed = s.snapshot.accept(frame) catch return error.OutputStreamLost;
+            if (completed) |value| {
+                defer value.deinit(alloc);
+                if (value.data.len > 0) {
+                    s.output_cb(s.ctx, value.data.ptr, @intCast(value.data.len));
+                }
+                s.output_recv.reset(value.resume_output_seq);
+                s.restoring = false;
             }
         },
         .heartbeat, .output, .control => {},
@@ -244,6 +270,14 @@ export fn zmosh_connect(
         set_status(status, .err_socket);
         return null;
     };
+    var snapshot = transport.SnapshotAssembler.init(alloc) catch {
+        output_recv.deinit();
+        reliable_recv.deinit();
+        reliable_send.deinit();
+        udp_sock.close();
+        set_status(status, .err_socket);
+        return null;
+    };
 
     // Initialize dimensions without requesting a synthetic terminal repaint.
     const size = ipc.Resize{ .rows = rows, .cols = cols };
@@ -251,6 +285,7 @@ export fn zmosh_connect(
     const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
 
     _ = reliable_send.queue(.reliable_ipc, init_ipc, 0, 0) catch {
+        snapshot.deinit();
         output_recv.deinit();
         reliable_recv.deinit();
         reliable_send.deinit();
@@ -261,6 +296,7 @@ export fn zmosh_connect(
 
     // Allocate session
     const session = alloc.create(Session) catch {
+        snapshot.deinit();
         output_recv.deinit();
         reliable_recv.deinit();
         reliable_send.deinit();
@@ -275,6 +311,8 @@ export fn zmosh_connect(
         .reliable_send = reliable_send,
         .reliable_recv = reliable_recv,
         .output_recv = output_recv,
+        .snapshot = snapshot,
+        .restoring = false,
         .last_ack_send_ns = now,
         .ack_dirty = false,
         .output_cb = cb,
@@ -309,7 +347,7 @@ export fn zmosh_poll(session: ?*Session) Status {
         @as(i64, 50_000),
         @as(i64, 250_000),
     ) * std.time.ns_per_us;
-    if (s.output_recv.gapExpired(now, reorder_timeout_ns)) {
+    if (!s.restoring and s.output_recv.gapExpired(now, reorder_timeout_ns)) {
         return .err_output_stream_lost;
     }
 
@@ -349,7 +387,7 @@ export fn zmosh_poll(session: ?*Session) Status {
 
         switch (packet.channel) {
             .heartbeat => {},
-            .reliable_ipc, .control => {
+            .reliable_ipc, .control, .snapshot => {
                 s.ack_dirty = true;
                 _ = s.reliable_recv.push(packet) catch return .err_poll;
                 while (s.reliable_recv.popReady()) |ready| {
@@ -362,6 +400,7 @@ export fn zmosh_poll(session: ?*Session) Status {
                 if (s.session_ended) return .ok;
             },
             .output => {
+                if (s.restoring) continue;
                 switch (s.output_recv.onPacket(packet.seq, packet.payload, now) catch return .err_poll) {
                     .accept => {
                         var made_progress = false;
@@ -413,6 +452,17 @@ export fn zmosh_resize(session: ?*Session, rows: u16, cols: u16) Status {
     return .ok;
 }
 
+export fn zmosh_restore(session: ?*Session, rows: u16, cols: u16) Status {
+    const s = session orelse return .err_null;
+
+    beginRestore(s);
+    const size = ipc.Resize{ .rows = rows, .cols = cols };
+    sendIpcReliable(s, .Restore, std.mem.asBytes(&size)) catch return .err_send;
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    flushReliable(s, now) catch return .err_send;
+    return .ok;
+}
+
 export fn zmosh_disconnect(session: ?*Session) void {
     const s = session orelse return;
 
@@ -420,6 +470,7 @@ export fn zmosh_disconnect(session: ?*Session) void {
     sendIpcReliable(s, .Detach, "") catch {};
     flushReliable(s, now) catch {};
 
+    s.snapshot.deinit();
     s.output_recv.deinit();
     s.reliable_recv.deinit();
     s.reliable_send.deinit();

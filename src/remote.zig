@@ -276,29 +276,44 @@ const RemoteReceiveState = struct {
     alloc: std.mem.Allocator,
     reliable_recv: transport.OrderedRecv,
     output_recv: transport.OutputRecvState,
+    snapshot: transport.SnapshotAssembler,
     stdout_buf: std.ArrayList(u8),
     stdout_limit: usize = max_stdout_buf,
+    restoring: bool,
     session_ended: bool = false,
 
-    fn init(alloc: std.mem.Allocator) !RemoteReceiveState {
+    fn init(alloc: std.mem.Allocator, restore: bool) !RemoteReceiveState {
         var reliable_recv = try transport.OrderedRecv.init(alloc);
         errdefer reliable_recv.deinit();
         var output_recv = try transport.OutputRecvState.init(alloc);
         errdefer output_recv.deinit();
+        var snapshot = try transport.SnapshotAssembler.init(alloc);
+        errdefer snapshot.deinit();
         const stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
 
         return .{
             .alloc = alloc,
             .reliable_recv = reliable_recv,
             .output_recv = output_recv,
+            .snapshot = snapshot,
             .stdout_buf = stdout_buf,
+            .restoring = restore,
         };
     }
 
     fn deinit(self: *RemoteReceiveState) void {
         self.reliable_recv.deinit();
         self.output_recv.deinit();
+        self.snapshot.deinit();
         self.stdout_buf.deinit(self.alloc);
+    }
+
+    fn beginRestore(self: *RemoteReceiveState) void {
+        self.stdout_buf.clearRetainingCapacity();
+        self.stdout_limit = max_stdout_buf;
+        self.output_recv.clear();
+        self.snapshot.reset();
+        self.restoring = true;
     }
 
     fn appendStdout(self: *RemoteReceiveState, payload: []const u8) !bool {
@@ -319,7 +334,7 @@ const RemoteReceiveState = struct {
     fn handlePacket(self: *RemoteReceiveState, packet: transport.Packet, now: i64) !ReceiveAction {
         switch (packet.channel) {
             .heartbeat => return .none,
-            .reliable_ipc, .control => {
+            .reliable_ipc, .control, .snapshot => {
                 const recv_action = try self.reliable_recv.push(packet);
                 if (recv_action == .stale) {
                     log.warn("reliable packet outside receive window seq={d}", .{packet.seq});
@@ -335,6 +350,8 @@ const RemoteReceiveState = struct {
                 return result;
             },
             .output => {
+                if (self.restoring) return .none;
+
                 switch (try self.output_recv.onPacket(packet.seq, packet.payload, now)) {
                     .accept => {
                         var made_progress = false;
@@ -366,7 +383,7 @@ const RemoteReceiveState = struct {
 
                     const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
                     const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
-                    if (hdr.tag == .Output and msg_payload.len > 0) {
+                    if (hdr.tag == .Output and msg_payload.len > 0 and !self.restoring) {
                         if (!try self.appendStdout(msg_payload)) {
                             return .stream_lost;
                         }
@@ -377,12 +394,39 @@ const RemoteReceiveState = struct {
                 }
                 return .none;
             },
+            .snapshot => {
+                const frame = transport.parseSnapshotFrame(payload) catch return .stream_lost;
+
+                if (frame.kind == .begin) {
+                    self.beginRestore();
+                } else if (!self.snapshot.active) {
+                    return .none;
+                }
+
+                const completed = self.snapshot.accept(frame) catch return .stream_lost;
+                if (completed) |value| {
+                    defer value.deinit(self.alloc);
+                    self.stdout_limit = if (value.data.len > std.math.maxInt(usize) - max_stdout_buf)
+                        std.math.maxInt(usize)
+                    else
+                        value.data.len + max_stdout_buf;
+                    try self.stdout_buf.appendSlice(self.alloc, value.data);
+                    self.output_recv.reset(value.resume_output_seq);
+                    self.restoring = false;
+                    log.info("installed terminal snapshot generation={d} bytes={d} output_seq={d}", .{
+                        value.generation,
+                        value.data.len,
+                        value.resume_output_seq,
+                    });
+                }
+                return .none;
+            },
             .heartbeat, .output, .control => return .none,
         }
     }
 
     fn expireOutputGap(self: *RemoteReceiveState, now: i64, timeout_ns: i64) bool {
-        return self.output_recv.gapExpired(now, timeout_ns);
+        return !self.restoring and self.output_recv.gapExpired(now, timeout_ns);
     }
 };
 
@@ -393,7 +437,7 @@ fn outputReorderTimeoutNs(peer: *const udp_mod.Peer) i64 {
 }
 
 /// Remote attach: connect to a remote zmx session via UDP.
-pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
+pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession, restore: bool) !void {
     // Resolve host address — try numeric IP first, fall back to DNS
     const addr = std.net.Address.resolveIp(session.host, session.port) catch blk: {
         const list = try std.net.getAddressList(alloc, session.host, session.port);
@@ -417,7 +461,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
     var reliable_send = try transport.ReliableSend.init(alloc);
     defer reliable_send.deinit();
-    var receive_state = try RemoteReceiveState.init(alloc);
+    var receive_state = try RemoteReceiveState.init(alloc, restore);
     defer receive_state.deinit();
 
     // Set terminal to raw mode
@@ -445,10 +489,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
 
-    // Initialize dimensions without requesting a synthetic terminal repaint.
+    // Initialize dimensions, requesting a snapshot only for --restore.
     const size = getTerminalSize();
     var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+    const init_tag: ipc.Tag = if (restore) .Restore else .Init;
+    const init_ipc = transport.buildIpcBytes(init_tag, std.mem.asBytes(&size), &init_buf);
     try sendReliablePayload(&reliable_send, &receive_state.reliable_recv, .reliable_ipc, init_ipc);
 
     while (true) {
@@ -498,9 +543,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
-        if (receive_state.output_recv.gapRemainingNs(now, reorder_timeout_ns)) |remaining_ns| {
-            const remaining_ms = @divFloor(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms);
-            poll_timeout = @min(poll_timeout, remaining_ms);
+        if (!receive_state.restoring) {
+            if (receive_state.output_recv.gapRemainingNs(now, reorder_timeout_ns)) |remaining_ns| {
+                const remaining_ms = @divFloor(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+                poll_timeout = @min(poll_timeout, remaining_ms);
+            }
         }
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
@@ -541,7 +588,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                 const packet = transport.parsePacket(result.data) catch continue;
                 reliable_send.ack(packet.ack, packet.ack_bits);
 
-                if (packet.channel == .reliable_ipc or packet.channel == .control) {
+                if (packet.channel == .reliable_ipc or packet.channel == .control or packet.channel == .snapshot) {
                     ack_dirty = true;
                 }
                 if (try receive_state.handlePacket(packet, now) == .stream_lost) {
@@ -608,7 +655,7 @@ test "remote bootstrap honors a safely quoted explicit binary" {
 
 test "remote receive forwards reliable output without an automatic restore" {
     const alloc = std.testing.allocator;
-    var state = try RemoteReceiveState.init(alloc);
+    var state = try RemoteReceiveState.init(alloc, false);
     defer state.deinit();
 
     var ipc_buf: [transport.max_payload_len]u8 = undefined;
@@ -621,12 +668,96 @@ test "remote receive forwards reliable output without an automatic restore" {
         .payload = ipc_bytes,
     }, 1) == .none);
 
+    try std.testing.expect(!state.restoring);
     try std.testing.expectEqualStrings("raw-output", state.stdout_buf.items);
+}
+
+test "remote receive installs an explicitly requested snapshot before ordered output" {
+    const alloc = std.testing.allocator;
+    var state = try RemoteReceiveState.init(alloc, true);
+    defer state.deinit();
+
+    // Incremental output from the pre-snapshot generation is suppressed.
+    try std.testing.expect(try state.handlePacket(.{
+        .channel = .output,
+        .seq = 1,
+        .ack = 0,
+        .ack_bits = 0,
+        .payload = "stale",
+    }, 1) == .none);
+    try std.testing.expectEqual(@as(usize, 0), state.stdout_buf.items.len);
+
+    const snapshot_bytes = "complete-snapshot";
+    var frame_buf: [transport.max_payload_len]u8 = undefined;
+    const frames = [_]transport.SnapshotFrame{
+        .{
+            .kind = .begin,
+            .generation = 7,
+            .total_len = snapshot_bytes.len,
+            .offset = 0,
+            .resume_output_seq = 10,
+            .data = "",
+        },
+        .{
+            .kind = .chunk,
+            .generation = 7,
+            .total_len = snapshot_bytes.len,
+            .offset = 0,
+            .resume_output_seq = 10,
+            .data = snapshot_bytes,
+        },
+        .{
+            .kind = .end,
+            .generation = 7,
+            .total_len = snapshot_bytes.len,
+            .offset = snapshot_bytes.len,
+            .resume_output_seq = 10,
+            .data = "",
+        },
+    };
+
+    for (frames, 1..) |frame, seq| {
+        const payload = try transport.buildSnapshotFrame(frame, &frame_buf);
+        try std.testing.expect(try state.handlePacket(.{
+            .channel = .snapshot,
+            .seq = @intCast(seq),
+            .ack = 0,
+            .ack_bits = 0,
+            .payload = payload,
+        }, @intCast(seq)) == .none);
+
+        if (frame.kind != .end) {
+            try std.testing.expect(state.restoring);
+            try std.testing.expectEqual(@as(usize, 0), state.stdout_buf.items.len);
+        }
+    }
+
+    try std.testing.expect(!state.restoring);
+    try std.testing.expectEqualStrings(snapshot_bytes, state.stdout_buf.items);
+
+    // A modest output reordering is buffered and emitted in sequence order.
+    try std.testing.expect(try state.handlePacket(.{
+        .channel = .output,
+        .seq = 11,
+        .ack = 0,
+        .ack_bits = 0,
+        .payload = "B",
+    }, 20) == .none);
+    try std.testing.expectEqualStrings(snapshot_bytes, state.stdout_buf.items);
+
+    try std.testing.expect(try state.handlePacket(.{
+        .channel = .output,
+        .seq = 10,
+        .ack = 0,
+        .ack_bits = 0,
+        .payload = "A",
+    }, 21) == .none);
+    try std.testing.expectEqualStrings(snapshot_bytes ++ "AB", state.stdout_buf.items);
 }
 
 test "remote receive reports a reorder gap without synthesizing a restore" {
     const alloc = std.testing.allocator;
-    var state = try RemoteReceiveState.init(alloc);
+    var state = try RemoteReceiveState.init(alloc, false);
     defer state.deinit();
     state.output_recv.reset(1);
     try state.stdout_buf.appendSlice(alloc, "stable");
@@ -641,23 +772,33 @@ test "remote receive reports a reorder gap without synthesizing a restore" {
     try std.testing.expectEqualStrings("stable", state.stdout_buf.items);
     try std.testing.expect(!state.expireOutputGap(149, 50));
     try std.testing.expect(state.expireOutputGap(150, 50));
+    try std.testing.expect(!state.restoring);
     try std.testing.expectEqualStrings("stable", state.stdout_buf.items);
 }
 
 test "reliable terminal output survives loss and reordering without resync" {
     const alloc = std.testing.allocator;
-    var state = try RemoteReceiveState.init(alloc);
+    var state = try RemoteReceiveState.init(alloc, true);
     defer state.deinit();
     var send = try transport.ReliableSend.init(alloc);
     defer send.deinit();
 
-    for ([_][]const u8{ "initial-", "one-", "two-", "three" }) |output| {
+    const snapshot_range = try transport.queueSnapshot(
+        &send,
+        1,
+        "initial-",
+        1,
+        0,
+        0,
+    );
+
+    for ([_][]const u8{ "one-", "two-", "three" }) |output| {
         var ipc_buf: [transport.max_payload_len]u8 = undefined;
         const ipc_bytes = transport.buildIpcBytes(.Output, output, &ipc_buf);
         _ = try send.queue(.reliable_ipc, ipc_bytes, 0, 0);
     }
 
-    const dropped_seq = 3;
+    const dropped_seq = snapshot_range.last + 2;
     var dropped_once = false;
     var stream_losses: usize = 0;
     var now: i64 = 1;
@@ -690,5 +831,6 @@ test "reliable terminal output survives loss and reordering without resync" {
     try std.testing.expect(!send.hasPending());
     try std.testing.expect(rounds < 100);
     try std.testing.expectEqual(@as(usize, 0), stream_losses);
+    try std.testing.expect(!state.restoring);
     try std.testing.expectEqualStrings("initial-one-two-three", state.stdout_buf.items);
 }

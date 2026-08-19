@@ -37,7 +37,11 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|serve|kill|history)
+    \\    attach)
+    \\      local sessions=$(zmosh list --short 2>/dev/null | tr '\n' ' ')
+    \\      COMPREPLY=($(compgen -W "--restore $sessions" -- "$cur"))
+    \\      ;;
+    \\    run|serve|kill|history)
     \\      local sessions=$(zmosh list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -86,7 +90,10 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|serve|s|history|hi)
+    \\        attach|a)
+    \\          _values 'attach option or session' '--restore[Restore existing terminal state]' $(zmosh list --short 2>/dev/null)
+    \\          ;;
+    \\        kill|k|run|r|serve|s|history|hi)
     \\          _zmosh_sessions
     \\          ;;
     \\        completions|c)
@@ -134,6 +141,8 @@ const fish_completions =
     \\complete -c zmosh -n $no_subcmd -a preserve-scrollback -d 'Move visible screen into scrollback and clear'
     \\complete -c zmosh -n $no_subcmd -a version -d 'Show version'
     \\complete -c zmosh -n $no_subcmd -a help -d 'Show help message'
+    \\
+    \\complete -c zmosh -n "__fish_seen_subcommand_from attach" -l restore -d 'Restore existing terminal state'
     \\
     \\complete -c zmosh -n "__fish_seen_subcommand_from attach run serve kill history" -a '(zmosh list --short 2>/dev/null)' -d 'Session name'
     \\

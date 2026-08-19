@@ -6,12 +6,15 @@ pub const max_payload_len: usize = 1100;
 const header_len: usize = 20;
 pub const reliable_window_size: u32 = 32;
 pub const output_reorder_window: u32 = 32;
+const snapshot_header_len: usize = 17;
+pub const max_snapshot_chunk_len: usize = max_payload_len - snapshot_header_len;
 
 pub const Channel = enum(u8) {
     heartbeat = 0,
     reliable_ipc = 1,
     output = 2,
     control = 3,
+    snapshot = 4,
 };
 
 pub const Control = enum(u8) {
@@ -377,6 +380,188 @@ pub const ReliableSend = struct {
     }
 };
 
+pub const SnapshotKind = enum(u8) {
+    begin = 1,
+    chunk = 2,
+    end = 3,
+};
+
+pub const SnapshotFrame = struct {
+    kind: SnapshotKind,
+    generation: u32,
+    total_len: u32,
+    offset: u32,
+    resume_output_seq: u32,
+    data: []const u8,
+};
+
+pub const SnapshotSeqRange = struct {
+    first: u32,
+    last: u32,
+};
+
+pub const CompletedSnapshot = struct {
+    generation: u32,
+    resume_output_seq: u32,
+    data: []u8,
+
+    pub fn deinit(self: CompletedSnapshot, alloc: std.mem.Allocator) void {
+        alloc.free(self.data);
+    }
+};
+
+pub const SnapshotAssembler = struct {
+    alloc: std.mem.Allocator,
+    data: std.ArrayList(u8),
+    active: bool = false,
+    generation: u32 = 0,
+    total_len: u32 = 0,
+    resume_output_seq: u32 = 1,
+
+    pub fn init(alloc: std.mem.Allocator) !SnapshotAssembler {
+        return .{
+            .alloc = alloc,
+            .data = try std.ArrayList(u8).initCapacity(alloc, 4096),
+        };
+    }
+
+    pub fn deinit(self: *SnapshotAssembler) void {
+        self.data.deinit(self.alloc);
+    }
+
+    pub fn reset(self: *SnapshotAssembler) void {
+        self.data.clearRetainingCapacity();
+        self.active = false;
+    }
+
+    pub fn accept(self: *SnapshotAssembler, frame: SnapshotFrame) !?CompletedSnapshot {
+        switch (frame.kind) {
+            .begin => {
+                self.data.clearRetainingCapacity();
+                self.active = true;
+                self.generation = frame.generation;
+                self.total_len = frame.total_len;
+                self.resume_output_seq = if (frame.resume_output_seq == 0) 1 else frame.resume_output_seq;
+                return null;
+            },
+            .chunk => {
+                if (!self.active) return error.SnapshotNotStarted;
+                if (frame.generation != self.generation or
+                    frame.total_len != self.total_len or
+                    frame.resume_output_seq != self.resume_output_seq)
+                {
+                    return error.SnapshotGenerationMismatch;
+                }
+                if (@as(usize, frame.offset) != self.data.items.len) return error.SnapshotOffsetMismatch;
+                if (self.data.items.len + frame.data.len > @as(usize, self.total_len)) return error.SnapshotTooLong;
+                try self.data.appendSlice(self.alloc, frame.data);
+                return null;
+            },
+            .end => {
+                if (!self.active) return error.SnapshotNotStarted;
+                if (frame.generation != self.generation or
+                    frame.total_len != self.total_len or
+                    frame.resume_output_seq != self.resume_output_seq)
+                {
+                    return error.SnapshotGenerationMismatch;
+                }
+                if (frame.offset != self.total_len or self.data.items.len != @as(usize, self.total_len)) {
+                    return error.SnapshotIncomplete;
+                }
+
+                const data = try self.data.toOwnedSlice(self.alloc);
+                self.active = false;
+                return .{
+                    .generation = self.generation,
+                    .resume_output_seq = self.resume_output_seq,
+                    .data = data,
+                };
+            },
+        }
+    }
+};
+
+pub fn buildSnapshotFrame(frame: SnapshotFrame, out: []u8) ![]const u8 {
+    const total = snapshot_header_len + frame.data.len;
+    if (total > max_payload_len or out.len < total) return error.BufferTooSmall;
+
+    out[0] = @intFromEnum(frame.kind);
+    std.mem.writeInt(u32, out[1..5], frame.generation, .big);
+    std.mem.writeInt(u32, out[5..9], frame.total_len, .big);
+    std.mem.writeInt(u32, out[9..13], frame.offset, .big);
+    std.mem.writeInt(u32, out[13..17], frame.resume_output_seq, .big);
+    if (frame.data.len > 0) @memcpy(out[snapshot_header_len..total], frame.data);
+    return out[0..total];
+}
+
+pub fn parseSnapshotFrame(payload: []const u8) !SnapshotFrame {
+    if (payload.len < snapshot_header_len) return error.SnapshotFrameTooShort;
+    const kind = std.meta.intToEnum(SnapshotKind, payload[0]) catch return error.InvalidSnapshotKind;
+    const frame: SnapshotFrame = .{
+        .kind = kind,
+        .generation = std.mem.readInt(u32, payload[1..5], .big),
+        .total_len = std.mem.readInt(u32, payload[5..9], .big),
+        .offset = std.mem.readInt(u32, payload[9..13], .big),
+        .resume_output_seq = std.mem.readInt(u32, payload[13..17], .big),
+        .data = payload[snapshot_header_len..],
+    };
+
+    switch (kind) {
+        .begin => if (frame.offset != 0 or frame.data.len != 0) return error.InvalidSnapshotBegin,
+        .chunk => if (frame.data.len == 0) return error.InvalidSnapshotChunk,
+        .end => if (frame.offset != frame.total_len or frame.data.len != 0) return error.InvalidSnapshotEnd,
+    }
+    return frame;
+}
+
+pub fn queueSnapshot(
+    sender: *ReliableSend,
+    generation: u32,
+    snapshot: []const u8,
+    resume_output_seq: u32,
+    ack_seq: u32,
+    ack_bits: u32,
+) !SnapshotSeqRange {
+    if (snapshot.len > std.math.maxInt(u32)) return error.SnapshotTooLarge;
+    const total_len: u32 = @intCast(snapshot.len);
+    var frame_buf: [max_payload_len]u8 = undefined;
+
+    const begin = try buildSnapshotFrame(.{
+        .kind = .begin,
+        .generation = generation,
+        .total_len = total_len,
+        .offset = 0,
+        .resume_output_seq = resume_output_seq,
+        .data = "",
+    }, &frame_buf);
+    const first = try sender.queue(.snapshot, begin, ack_seq, ack_bits);
+
+    var offset: usize = 0;
+    while (offset < snapshot.len) {
+        const end = @min(offset + max_snapshot_chunk_len, snapshot.len);
+        const chunk = try buildSnapshotFrame(.{
+            .kind = .chunk,
+            .generation = generation,
+            .total_len = total_len,
+            .offset = @intCast(offset),
+            .resume_output_seq = resume_output_seq,
+            .data = snapshot[offset..end],
+        }, &frame_buf);
+        _ = try sender.queue(.snapshot, chunk, ack_seq, ack_bits);
+        offset = end;
+    }
+
+    const end_frame = try buildSnapshotFrame(.{
+        .kind = .end,
+        .generation = generation,
+        .total_len = total_len,
+        .offset = total_len,
+        .resume_output_seq = resume_output_seq,
+        .data = "",
+    }, &frame_buf);
+    const last = try sender.queue(.snapshot, end_frame, ack_seq, ack_bits);
+    return .{ .first = first, .last = last };
+}
 
 pub fn writeHeader(dst: []u8, channel: Channel, seq: u32, ack: u32, ack_bits: u32, payload_len: usize) void {
     std.debug.assert(dst.len >= header_len);
@@ -551,6 +736,61 @@ test "reliable send accounts queued bytes until acknowledgement" {
     try std.testing.expectEqual(@as(usize, 0), send.pendingBytes());
 }
 
+test "large snapshot survives loss and reverse-order delivery" {
+    const alloc = std.testing.allocator;
+    const snapshot_len = 472_124;
+    const snapshot = try alloc.alloc(u8, snapshot_len);
+    defer alloc.free(snapshot);
+    for (snapshot, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 7);
+
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+    const range = try queueSnapshot(&send, 19, snapshot, 44, 0, 0);
+    try std.testing.expect(range.last - range.first > reliable_window_size);
+
+    var recv = try OrderedRecv.init(alloc);
+    defer recv.deinit();
+    var assembler = try SnapshotAssembler.init(alloc);
+    defer assembler.deinit();
+    var completed: ?CompletedSnapshot = null;
+    defer if (completed) |value| value.deinit(alloc);
+
+    var dropped_seven = false;
+    var now: i64 = 1;
+    var rounds: usize = 0;
+    while (send.hasPending() and rounds < 1000) : (rounds += 1) {
+        var batch = try send.collectTransmissions(alloc, now, 1000);
+        defer batch.deinit(alloc);
+
+        var i = batch.items.len;
+        while (i > 0) {
+            i -= 1;
+            const packet = try parsePacket(batch.items[i]);
+            if (packet.seq == 7 and !dropped_seven) {
+                dropped_seven = true;
+                continue;
+            }
+
+            _ = try recv.push(packet);
+            while (recv.popReady()) |ready| {
+                defer ready.deinit();
+                const frame = try parseSnapshotFrame(ready.payload);
+                if (try assembler.accept(frame)) |value| completed = value;
+            }
+        }
+
+        send.ack(recv.ack(), recv.ackBits());
+        now += 2 * std.time.ns_per_ms;
+    }
+
+    try std.testing.expect(dropped_seven);
+    try std.testing.expect(!send.hasPending());
+    try std.testing.expect(rounds < 1000);
+    try std.testing.expect(completed != null);
+    try std.testing.expectEqual(@as(u32, 19), completed.?.generation);
+    try std.testing.expectEqual(@as(u32, 44), completed.?.resume_output_seq);
+    try std.testing.expectEqualSlices(u8, snapshot, completed.?.data);
+}
 
 test "output receiver reorders a modest packet gap" {
     const alloc = std.testing.allocator;

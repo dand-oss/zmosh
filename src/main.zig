@@ -190,6 +190,7 @@ const Daemon = struct {
         pty_fd: i32,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
+        restore: bool,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
 
@@ -204,8 +205,30 @@ const Daemon = struct {
         _ = c.ioctl(pty_fd, c.TIOCSWINSZ, &ws);
         try term.resize(self.alloc, resize.cols, resize.rows);
 
-        // A terminal snapshot is synthetic output; attach and resize never
-        // send one. Genuine PTY bytes are all an attaching client receives.
+        // A terminal snapshot is synthetic output. Send one only when the
+        // attaching client explicitly asks to restore the existing screen.
+        if (restore) {
+            const cursor = &term.screens.active.cursor;
+            std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
+            if (serializeTerminalState(self.alloc, term, resize.rows)) |term_output| {
+                std.log.debug("serialize terminal state", .{});
+                defer self.alloc.free(term_output);
+                // Only clear on a repeated restore. For the first request on a
+                // fresh socket,
+                // write_buf may contain queued non-Output replies (e.g. Info)
+                // from earlier messages in the same read batch.
+                if (client.initialized) {
+                    // Drop stale output buffered before Restore so the requested
+                    // snapshot is the first payload rendered.
+                    client.write_buf.clearRetainingCapacity();
+                }
+                ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
+                    std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
+                };
+                client.has_pending_output = true;
+            }
+        }
+
         client.initialized = true;
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
@@ -381,12 +404,15 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var session_name: []const u8 = "";
         var remote_host: ?[]const u8 = null;
+        var restore = false;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
                 remote_host = args.next();
+            } else if (session_name.len == 0 and std.mem.eql(u8, arg, "--restore")) {
+                restore = true;
             } else if (session_name.len == 0) {
                 session_name = arg;
             } else {
@@ -414,12 +440,12 @@ pub fn main() !void {
                 _ = posix.write(posix.STDERR_FILENO, msg) catch {};
                 std.process.exit(2);
             };
-            remote.remoteAttach(alloc, session) catch |err| switch (err) {
+            remote.remoteAttach(alloc, session, restore) catch |err| switch (err) {
                 error.ConnectionLost, error.OutputStreamLost => {
                     const message = if (err == error.ConnectionLost)
                         "zmx: connection lost\n"
                     else
-                        "zmx: terminal output stream lost\n";
+                        "zmx: terminal output stream lost; reconnect with --restore\n";
                     _ = posix.write(posix.STDERR_FILENO, message) catch {};
                     std.process.exit(3);
                 },
@@ -452,7 +478,7 @@ pub fn main() !void {
         };
         daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, sesh);
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(&daemon);
+        return attach(&daemon, restore);
     } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
         var command_args: std.ArrayList([]const u8) = .empty;
@@ -584,17 +610,17 @@ fn help() !void {
         \\Usage: zmosh <command> [args]
         \\
         \\Commands:
-        \\  [a]ttach <name> [command...]  Attach without repainting
-        \\  [a]ttach -r <host> <name> [command...]  Attach remotely without repainting
+        \\  [a]ttach [--restore] <name> [command...]  Attach without repainting by default
+        \\  [a]ttach -r <host> [--restore] <name> [command...]  Attach remotely without repainting
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [s]erve <name>                 Start UDP gateway for remote access
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist [--short]               List active sessions
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
         \\  [k]ill <name>                  Kill a session and all attached clients
-        \\  preserve-scrollback            Move the visible screen into scrollback and clear
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
         \\  [w]ait <name>...               Wait for session tasks to complete
+        \\  preserve-scrollback            Move the visible screen into scrollback and clear
         \\  [v]ersion                      Show version information
         \\  [h]elp                         Show this help message
         \\
@@ -975,7 +1001,7 @@ fn ensureSession(daemon: *Daemon) !EnsureSessionResult {
     return .{ .created = false, .is_daemon = false };
 }
 
-fn attach(daemon: *Daemon) !void {
+fn attach(daemon: *Daemon, restore: bool) !void {
     if (std.posix.getenv("ZMX_SESSION")) |_| {
         return error.CannotAttachToSessionInSession;
     }
@@ -1015,7 +1041,7 @@ fn attach(daemon: *Daemon) !void {
 
     _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSANOW, &raw_termios);
 
-    try clientLoop(daemon.cfg, client_sock);
+    try clientLoop(daemon.cfg, client_sock, restore);
 }
 
 fn run(daemon: *Daemon, command_args: [][]const u8) !void {
@@ -1119,7 +1145,7 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     return error.NoAckReceived;
 }
 
-fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
+fn clientLoop(_: *Cfg, client_sock_fd: i32, restore: bool) !void {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -1136,7 +1162,8 @@ fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
 
     // Send init message with terminal size (buffered)
     const size = getTerminalSize(posix.STDOUT_FILENO);
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    const init_tag: ipc.Tag = if (restore) .Restore else .Init;
+    try ipc.appendMessage(alloc, &sock_write_buf, init_tag, std.mem.asBytes(&size));
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
@@ -1445,7 +1472,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(pty_fd, msg.payload),
-                        .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
+                        .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload, false),
+                        .Restore => try daemon.handleInit(client, pty_fd, &term, msg.payload, true),
                         .Resize => try daemon.handleResize(pty_fd, &term, msg.payload),
                         .Detach => {
                             daemon.handleDetach(client, i);

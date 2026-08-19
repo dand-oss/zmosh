@@ -61,6 +61,11 @@ pub const Gateway = struct {
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.OrderedRecv,
 
+    awaiting_restore: bool,
+    snapshot_active: bool,
+    snapshot_generation: u32,
+    snapshot_seq_range: transport.SnapshotSeqRange,
+
     config: udp.Config,
     running: bool,
 
@@ -125,6 +130,10 @@ pub const Gateway = struct {
             .unix_write_buf = unix_write_buf,
             .reliable_send = reliable_send,
             .reliable_recv = reliable_recv,
+            .awaiting_restore = false,
+            .snapshot_active = false,
+            .snapshot_generation = 0,
+            .snapshot_seq_range = .{ .first = 0, .last = 0 },
             .config = config,
             .running = true,
             .last_ack_send_ns = now,
@@ -151,6 +160,7 @@ pub const Gateway = struct {
             }
 
             try self.flushReliable(now);
+            self.updateSnapshotState();
 
             if (self.peer.addr != null) {
                 if (self.ack_dirty and (now - self.last_ack_send_ns >= ack_delay_ns)) {
@@ -290,11 +300,57 @@ pub const Gateway = struct {
         }
     }
 
+    fn trackClientMessages(self: *Gateway, payload: []const u8) void {
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const remaining = payload[offset..];
+            const msg_len = ipc.expectedLength(remaining) orelse break;
+            if (remaining.len < msg_len) break;
+
+            const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+            if (hdr.tag == .Restore and !self.snapshot_active) {
+                self.awaiting_restore = true;
+            }
+
+            offset += msg_len;
+        }
+    }
+
     fn appendUnixWrite(self: *Gateway, payload: []const u8) !void {
         if (self.unix_write_buf.items.len + payload.len > max_unix_write_buf) {
             return error.UnixWriteBackpressure;
         }
         try self.unix_write_buf.appendSlice(self.alloc, payload);
+    }
+
+    fn queueSnapshot(self: *Gateway, payload: []const u8) !void {
+        self.snapshot_generation +%= 1;
+        if (self.snapshot_generation == 0) self.snapshot_generation = 1;
+
+        self.snapshot_seq_range = try transport.queueSnapshot(
+            &self.reliable_send,
+            self.snapshot_generation,
+            payload,
+            1,
+            self.reliable_recv.ack(),
+            self.reliable_recv.ackBits(),
+        );
+        self.awaiting_restore = false;
+        self.snapshot_active = true;
+        log.info("queued terminal snapshot generation={d} bytes={d} reliable_seq={d}..{d}", .{
+            self.snapshot_generation,
+            payload.len,
+            self.snapshot_seq_range.first,
+            self.snapshot_seq_range.last,
+        });
+    }
+
+    fn updateSnapshotState(self: *Gateway) void {
+        if (!self.snapshot_active) return;
+        if (self.reliable_send.hasPendingRange(self.snapshot_seq_range.first, self.snapshot_seq_range.last)) return;
+
+        self.snapshot_active = false;
+        log.info("terminal snapshot acknowledged generation={d}", .{self.snapshot_generation});
     }
 
     fn handleTransportPacket(self: *Gateway, plaintext: []const u8) !void {
@@ -310,7 +366,7 @@ pub const Gateway = struct {
             .output => {
                 // Client never sends output channel packets.
             },
-            .reliable_ipc, .control => {
+            .reliable_ipc, .control, .snapshot => {
                 self.ack_dirty = true;
                 const action = try self.reliable_recv.push(packet);
                 if (action == .stale) {
@@ -328,6 +384,7 @@ pub const Gateway = struct {
     fn handleReliablePacket(self: *Gateway, channel: transport.Channel, payload: []const u8) !void {
         switch (channel) {
             .reliable_ipc => {
+                self.trackClientMessages(payload);
                 self.appendUnixWrite(payload) catch |err| {
                     log.warn("unix write buffer overflow: {s}", .{@errorName(err)});
                     self.running = false;
@@ -341,7 +398,7 @@ pub const Gateway = struct {
                     log.warn("ignored automatic terminal snapshot request", .{});
                 }
             },
-            .heartbeat, .output => {},
+            .heartbeat, .output, .snapshot => {},
         }
     }
 
@@ -374,6 +431,10 @@ pub const Gateway = struct {
 
     fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8) !void {
         if (tag == .Output) {
+            if (self.awaiting_restore) {
+                try self.queueSnapshot(payload);
+                return;
+            }
             // Terminal bytes are a stateful stream: losing one cursor escape
             // corrupts every following update. Put Output on the same ordered,
             // retransmitted channel as the rest of IPC.
