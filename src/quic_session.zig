@@ -594,6 +594,11 @@ pub const QuicSession = struct {
                 self.send_stopped = true;
                 return;
             },
+            // A close is already in flight — the session is done.
+            error.ConnectionClosed => {
+                self.closed = true;
+                return;
+            },
             else => return e,
         };
         self.pending_control.clearRetainingCapacity();
@@ -710,6 +715,11 @@ pub const QuicSession = struct {
                     self.send_stopped = true;
                     return;
                 },
+                // A close is already in flight — the session is done.
+                error.ConnectionClosed => {
+                    self.closed = true;
+                    return;
+                },
                 else => return e,
             };
             self.counters.output_bytes += n;
@@ -720,6 +730,18 @@ pub const QuicSession = struct {
         if (fin_wanted and self.output_opened and !self.output_fin_sent) {
             conn.sendOnStream(output_stream_id, &.{}, true) catch |e| switch (e) {
                 error.FlowControlBlocked => return,
+                // The peer STOPPED_SENDING this stream: the FIN has no
+                // receiver to reach — treat the output side as done.
+                error.StreamClosed => {
+                    self.output_fin_sent = true;
+                    self.send_stopped = true;
+                    return;
+                },
+                // A close is already in flight — the session is done.
+                error.ConnectionClosed => {
+                    self.closed = true;
+                    return;
+                },
                 else => return e,
             };
             self.output_fin_sent = true;

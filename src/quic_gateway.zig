@@ -676,7 +676,13 @@ pub const QuicGateway = struct {
             const due_from = if (self.keepalive_queued) self.keepalive_attempt_ns else self.last_output_ns;
             if (now - due_from >= keepalive_interval_ns) {
                 if (!self.keepalive_queued and budget.outbound > 0) {
-                    try self.candidate().transport.connection().sendPing();
+                    self.candidate().transport.connection().sendPing() catch |e| switch (e) {
+                        // The application session already closed the
+                        // connection: there is nothing left to keep
+                        // alive and no PING to queue.
+                        error.ConnectionClosed => {},
+                        else => return e,
+                    };
                     self.keepalive_queued = true;
                 }
                 self.keepalive_attempt_ns = now;
