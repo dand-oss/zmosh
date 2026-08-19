@@ -1,9 +1,11 @@
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
-pub const version: u8 = 1;
+pub const version: u8 = 2;
 pub const max_payload_len: usize = 1100;
 const header_len: usize = 20;
+pub const reliable_window_size: u32 = 32;
+pub const output_reorder_window: u32 = 32;
 
 pub const Channel = enum(u8) {
     heartbeat = 0,
@@ -52,8 +54,10 @@ pub const RecvState = struct {
 
         if (seq > self.latest) {
             const shift = seq - self.latest;
-            if (shift >= 32) {
+            if (shift > 32) {
                 self.mask = 0;
+            } else if (shift == 32) {
+                self.mask = @as(u32, 1) << 31;
             } else {
                 self.mask <<= @intCast(shift);
                 self.mask |= @as(u32, 1) << @intCast(shift - 1);
@@ -81,29 +85,171 @@ pub const RecvState = struct {
     }
 };
 
-pub const OutputRecvState = struct {
-    latest: u32 = 0,
-    has_latest: bool = false,
+fn nextSequence(seq: u32) u32 {
+    const next = seq +% 1;
+    return if (next == 0) 1 else next;
+}
 
-    pub fn onPacket(self: *OutputRecvState, seq: u32) OutputAction {
-        if (!self.has_latest) {
-            self.latest = seq;
-            self.has_latest = true;
-            return .accept;
-        }
+pub const OwnedPacket = struct {
+    alloc: std.mem.Allocator,
+    channel: Channel,
+    seq: u32,
+    payload: []u8,
 
-        if (seq == self.latest + 1) {
-            self.latest = seq;
-            return .accept;
-        }
+    pub fn deinit(self: OwnedPacket) void {
+        self.alloc.free(self.payload);
+    }
+};
 
-        if (seq <= self.latest) {
+/// Selectively acknowledges reliable packets immediately, but exposes them to
+/// the caller strictly in sequence order. The sender's matching 32-packet
+/// flight window guarantees that a missing packet cannot fall out of the ACK
+/// bitmap while later packets continue advancing.
+pub const OrderedRecv = struct {
+    alloc: std.mem.Allocator,
+    ack_state: RecvState = .{},
+    next_seq: u32 = 1,
+    buffered: std.ArrayList(OwnedPacket),
+
+    pub fn init(alloc: std.mem.Allocator) !OrderedRecv {
+        return .{
+            .alloc = alloc,
+            .buffered = try std.ArrayList(OwnedPacket).initCapacity(alloc, reliable_window_size),
+        };
+    }
+
+    pub fn deinit(self: *OrderedRecv) void {
+        for (self.buffered.items) |packet| packet.deinit();
+        self.buffered.deinit(self.alloc);
+    }
+
+    pub fn ack(self: *const OrderedRecv) u32 {
+        return self.ack_state.ack();
+    }
+
+    pub fn ackBits(self: *const OrderedRecv) u32 {
+        return self.ack_state.ackBits();
+    }
+
+    pub fn push(self: *OrderedRecv, packet: Packet) !ReliableAction {
+        if (packet.seq == 0) return .stale;
+
+        if (packet.seq < self.next_seq) {
+            _ = self.ack_state.onReliable(packet.seq);
             return .duplicate;
         }
 
-        // seq jumped ahead.
-        self.latest = seq;
-        return .gap;
+        if (packet.seq - self.next_seq >= reliable_window_size) {
+            return .stale;
+        }
+
+        const action = self.ack_state.onReliable(packet.seq);
+        if (action != .accept) return action;
+
+        const payload = try self.alloc.dupe(u8, packet.payload);
+        errdefer self.alloc.free(payload);
+        try self.buffered.append(self.alloc, .{
+            .alloc = self.alloc,
+            .channel = packet.channel,
+            .seq = packet.seq,
+            .payload = payload,
+        });
+        return .accept;
+    }
+
+    pub fn popReady(self: *OrderedRecv) ?OwnedPacket {
+        for (self.buffered.items, 0..) |packet, i| {
+            if (packet.seq != self.next_seq) continue;
+            const ready = self.buffered.swapRemove(i);
+            self.next_seq = nextSequence(self.next_seq);
+            return ready;
+        }
+        return null;
+    }
+};
+
+pub const OutputRecvState = struct {
+    const Buffered = struct {
+        seq: u32,
+        payload: []u8,
+    };
+
+    alloc: std.mem.Allocator,
+    next_seq: u32 = 1,
+    buffered: std.ArrayList(Buffered),
+    gap_started_ns: ?i64 = null,
+
+    pub fn init(alloc: std.mem.Allocator) !OutputRecvState {
+        return .{
+            .alloc = alloc,
+            .buffered = try std.ArrayList(Buffered).initCapacity(alloc, output_reorder_window),
+        };
+    }
+
+    pub fn deinit(self: *OutputRecvState) void {
+        self.clear();
+        self.buffered.deinit(self.alloc);
+    }
+
+    pub fn reset(self: *OutputRecvState, next_seq: u32) void {
+        self.clear();
+        self.next_seq = if (next_seq == 0) 1 else next_seq;
+    }
+
+    pub fn clear(self: *OutputRecvState) void {
+        for (self.buffered.items) |item| self.alloc.free(item.payload);
+        self.buffered.clearRetainingCapacity();
+        self.gap_started_ns = null;
+    }
+
+    pub fn onPacket(self: *OutputRecvState, seq: u32, payload: []const u8, now_ns: i64) !OutputAction {
+        if (seq == 0 or seq < self.next_seq) return .duplicate;
+
+        const distance = seq - self.next_seq;
+        if (distance >= output_reorder_window) return .gap;
+
+        for (self.buffered.items) |item| {
+            if (item.seq == seq) return .duplicate;
+        }
+
+        const owned = try self.alloc.dupe(u8, payload);
+        errdefer self.alloc.free(owned);
+        try self.buffered.append(self.alloc, .{ .seq = seq, .payload = owned });
+
+        if (distance > 0 and self.gap_started_ns == null) {
+            self.gap_started_ns = now_ns;
+        }
+        return .accept;
+    }
+
+    pub fn popReady(self: *OutputRecvState) ?[]u8 {
+        for (self.buffered.items, 0..) |item, i| {
+            if (item.seq != self.next_seq) continue;
+            const ready = self.buffered.swapRemove(i).payload;
+            self.next_seq = nextSequence(self.next_seq);
+            return ready;
+        }
+        return null;
+    }
+
+    pub fn noteDrain(self: *OutputRecvState, made_progress: bool, now_ns: i64) void {
+        if (self.buffered.items.len == 0) {
+            self.gap_started_ns = null;
+        } else if (made_progress) {
+            self.gap_started_ns = now_ns;
+        } else if (self.gap_started_ns == null) {
+            self.gap_started_ns = now_ns;
+        }
+    }
+
+    pub fn gapExpired(self: *const OutputRecvState, now_ns: i64, timeout_ns: i64) bool {
+        const started = self.gap_started_ns orelse return false;
+        return now_ns - started >= timeout_ns;
+    }
+
+    pub fn gapRemainingNs(self: *const OutputRecvState, now_ns: i64, timeout_ns: i64) ?i64 {
+        const started = self.gap_started_ns orelse return null;
+        return @max(@as(i64, 0), timeout_ns - (now_ns - started));
     }
 };
 
@@ -111,10 +257,11 @@ pub const ReliableSend = struct {
     alloc: std.mem.Allocator,
     next_seq: u32 = 1,
     pending: std.ArrayList(Pending),
+    pending_bytes: usize = 0,
 
     const Pending = struct {
         seq: u32,
-        sent_ns: i64,
+        sent_ns: ?i64,
         retries: u8,
         packet: []u8,
     };
@@ -137,18 +284,22 @@ pub const ReliableSend = struct {
         return self.pending.items.len > 0;
     }
 
-    pub fn buildAndTrack(
+    pub fn pendingBytes(self: *const ReliableSend) usize {
+        return self.pending_bytes;
+    }
+
+    pub fn queue(
         self: *ReliableSend,
         channel: Channel,
         payload: []const u8,
         ack_seq: u32,
         ack_bits: u32,
-        now_ns: i64,
-    ) ![]const u8 {
+    ) !u32 {
         const seq = self.next_seq;
-        self.next_seq +%= 1;
+        self.next_seq = nextSequence(self.next_seq);
 
         const packet = try self.alloc.alloc(u8, header_len + payload.len);
+        errdefer self.alloc.free(packet);
         writeHeader(packet[0..header_len], channel, seq, ack_seq, ack_bits, payload.len);
         if (payload.len > 0) {
             @memcpy(packet[header_len..], payload);
@@ -156,12 +307,13 @@ pub const ReliableSend = struct {
 
         try self.pending.append(self.alloc, .{
             .seq = seq,
-            .sent_ns = now_ns,
+            .sent_ns = null,
             .retries = 0,
             .packet = packet,
         });
+        self.pending_bytes += packet.len;
 
-        return packet;
+        return seq;
     }
 
     pub fn ack(self: *ReliableSend, ack_seq: u32, ack_bits: u32) void {
@@ -170,13 +322,14 @@ pub const ReliableSend = struct {
             i -= 1;
             const p = self.pending.items[i];
             if (isAcked(p.seq, ack_seq, ack_bits)) {
+                self.pending_bytes -= p.packet.len;
                 self.alloc.free(p.packet);
                 _ = self.pending.swapRemove(i);
             }
         }
     }
 
-    pub fn collectRetransmits(
+    pub fn collectTransmissions(
         self: *ReliableSend,
         alloc: std.mem.Allocator,
         now_ns: i64,
@@ -185,15 +338,29 @@ pub const ReliableSend = struct {
         var out = try std.ArrayList([]const u8).initCapacity(alloc, 4);
         const interval_ns = @max(@as(i64, 1), rto_us) * std.time.ns_per_us;
 
+        var oldest_seq = self.next_seq;
+        for (self.pending.items) |p| oldest_seq = @min(oldest_seq, p.seq);
+
         for (self.pending.items) |*p| {
-            if (now_ns - p.sent_ns >= interval_ns) {
-                p.sent_ns = now_ns;
+            if (p.seq - oldest_seq >= reliable_window_size) continue;
+
+            if (p.sent_ns) |sent_ns| {
+                if (now_ns - sent_ns < interval_ns) continue;
                 p.retries +%= 1;
-                try out.append(alloc, p.packet);
             }
+
+            p.sent_ns = now_ns;
+            try out.append(alloc, p.packet);
         }
 
         return out;
+    }
+
+    pub fn hasPendingRange(self: *const ReliableSend, first: u32, last: u32) bool {
+        for (self.pending.items) |p| {
+            if (p.seq >= first and p.seq <= last) return true;
+        }
+        return false;
     }
 
     fn isAcked(seq: u32, ack_seq: u32, ack_bits: u32) bool {
@@ -209,6 +376,7 @@ pub const ReliableSend = struct {
         return (ack_bits & bit) != 0;
     }
 };
+
 
 pub fn writeHeader(dst: []u8, channel: Channel, seq: u32, ack: u32, ack_bits: u32, payload_len: usize) void {
     std.debug.assert(dst.len >= header_len);
@@ -310,9 +478,107 @@ test "reliable recv window" {
     try std.testing.expectEqual(@as(u32, 11), recv.ack());
 }
 
-test "output gap detection" {
-    var out = OutputRecvState{};
-    try std.testing.expect(out.onPacket(1) == .accept);
-    try std.testing.expect(out.onPacket(3) == .gap);
-    try std.testing.expect(out.onPacket(2) == .duplicate);
+test "ordered reliable receive buffers reordering" {
+    const alloc = std.testing.allocator;
+    var recv = try OrderedRecv.init(alloc);
+    defer recv.deinit();
+
+    var packet_buf: [64]u8 = undefined;
+    for ([_]u32{ 3, 1, 2 }) |seq| {
+        var payload_buf: [8]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buf, "{d}", .{seq});
+        const wire = try buildUnreliable(.reliable_ipc, seq, 0, 0, payload, &packet_buf);
+        try std.testing.expect(try recv.push(try parsePacket(wire)) == .accept);
+    }
+
+    for ([_]u32{ 1, 2, 3 }) |seq| {
+        const packet = recv.popReady().?;
+        defer packet.deinit();
+        var expected_buf: [8]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "{d}", .{seq});
+        try std.testing.expectEqualStrings(expected, packet.payload);
+    }
+    try std.testing.expect(recv.popReady() == null);
+}
+
+test "reliable send window stays pinned behind a missing packet" {
+    const alloc = std.testing.allocator;
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    var seq: u32 = 1;
+    while (seq <= 64) : (seq += 1) {
+        _ = try send.queue(.control, "x", 0, 0);
+    }
+
+    var transmissions = try send.collectTransmissions(alloc, 1, 1000);
+    defer transmissions.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, reliable_window_size), transmissions.items.len);
+
+    // ACK 2..32 while leaving packet 1 missing. No later packet may leave the
+    // sender until packet 1 is retransmitted and acknowledged.
+    send.ack(32, 0x3fff_ffff);
+    var early = try send.collectTransmissions(alloc, 500 * std.time.ns_per_us, 1000);
+    defer early.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), early.items.len);
+
+    var retry = try send.collectTransmissions(alloc, 2 * std.time.ns_per_ms, 1000);
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), retry.items.len);
+    try std.testing.expectEqual(@as(u32, 1), (try parsePacket(retry.items[0])).seq);
+
+    send.ack(32, 0x7fff_ffff);
+    var second_window = try send.collectTransmissions(alloc, 2 * std.time.ns_per_ms + 1, 1000);
+    defer second_window.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, reliable_window_size), second_window.items.len);
+}
+
+test "reliable send accounts queued bytes until acknowledgement" {
+    const alloc = std.testing.allocator;
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    const first = try send.queue(.reliable_ipc, "abc", 0, 0);
+    const first_bytes = header_len + 3;
+    try std.testing.expectEqual(first_bytes, send.pendingBytes());
+
+    const second = try send.queue(.reliable_ipc, "defgh", 0, 0);
+    try std.testing.expectEqual(first_bytes + header_len + 5, send.pendingBytes());
+
+    send.ack(first, 0);
+    try std.testing.expectEqual(header_len + 5, send.pendingBytes());
+    send.ack(second, 0);
+    try std.testing.expectEqual(@as(usize, 0), send.pendingBytes());
+}
+
+
+test "output receiver reorders a modest packet gap" {
+    const alloc = std.testing.allocator;
+    var out = try OutputRecvState.init(alloc);
+    defer out.deinit();
+    out.reset(1);
+
+    try std.testing.expect(try out.onPacket(3, "three", 100) == .accept);
+    try std.testing.expect(try out.onPacket(1, "one", 101) == .accept);
+
+    const one = out.popReady().?;
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings("one", one);
+    out.noteDrain(true, 101);
+
+    try std.testing.expect(try out.onPacket(2, "two", 102) == .accept);
+    const two = out.popReady().?;
+    defer alloc.free(two);
+    const three = out.popReady().?;
+    defer alloc.free(three);
+    try std.testing.expectEqualStrings("two", two);
+    try std.testing.expectEqualStrings("three", three);
+    out.noteDrain(true, 102);
+    try std.testing.expect(!out.gapExpired(1000, 50));
+
+    out.reset(10);
+    try std.testing.expect(try out.onPacket(11, "later", 200) == .accept);
+    try std.testing.expect(!out.gapExpired(249, 50));
+    try std.testing.expect(out.gapExpired(250, 50));
+    try std.testing.expect(try out.onPacket(10 + output_reorder_window, "far", 250) == .gap);
 }

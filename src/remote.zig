@@ -9,7 +9,6 @@ const builtin = @import("builtin");
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 4 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
 const c = switch (builtin.os.tag) {
     .macos => @cImport({
@@ -36,7 +35,7 @@ pub const RemoteSession = struct {
     key: crypto.Key,
 };
 
-/// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp <port> <base64_key>\n"
+/// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp-v2 <port> <base64_key>\n"
 pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key } {
     const trimmed = std.mem.trimRight(u8, line, "\r\n");
     var it = std.mem.splitScalar(u8, trimmed, ' ');
@@ -45,7 +44,8 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
     if (!std.mem.eql(u8, prefix, "ZMX_CONNECT")) return error.InvalidConnectLine;
 
     const proto = it.next() orelse return error.InvalidConnectLine;
-    if (!std.mem.eql(u8, proto, "udp")) return error.UnsupportedProtocol;
+    if (std.mem.eql(u8, proto, "udp")) return error.TransportVersionMismatch;
+    if (!std.mem.eql(u8, proto, "udp-v2")) return error.UnsupportedProtocol;
 
     const port_str = it.next() orelse return error.InvalidConnectLine;
     const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
@@ -140,7 +140,7 @@ pub fn connectRemote(
     const result = parseConnectLine(buf[0..total]) catch |err| {
         log.err("failed to parse connect line: {s}", .{@errorName(err)});
         _ = child.wait() catch {};
-        return error.InvalidConnectLine;
+        return err;
     };
 
     // Close our end of the pipes — we have the connect info.
@@ -194,7 +194,7 @@ fn isKittyCtrlBackslash(buf: []const u8) bool {
 fn sendHeartbeat(
     peer: *udp_mod.Peer,
     sock: *udp_mod.UdpSocket,
-    reliable_recv: *const transport.RecvState,
+    reliable_recv: *const transport.OrderedRecv,
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     now: i64,
@@ -214,40 +214,29 @@ fn sendHeartbeat(
 }
 
 fn sendReliablePayload(
-    peer: *udp_mod.Peer,
-    sock: *udp_mod.UdpSocket,
     reliable_send: *transport.ReliableSend,
-    reliable_recv: *const transport.RecvState,
+    reliable_recv: *const transport.OrderedRecv,
     channel: transport.Channel,
     payload: []const u8,
-    now: i64,
 ) !void {
-    const packet = try reliable_send.buildAndTrack(
+    _ = try reliable_send.queue(
         channel,
         payload,
         reliable_recv.ack(),
         reliable_recv.ackBits(),
-        now,
     );
-    peer.send(sock, packet) catch |err| {
-        if (err == error.NoPeerAddress or err == error.WouldBlock) return;
-        return err;
-    };
 }
 
 fn sendIpcReliable(
-    peer: *udp_mod.Peer,
-    sock: *udp_mod.UdpSocket,
     reliable_send: *transport.ReliableSend,
-    reliable_recv: *const transport.RecvState,
+    reliable_recv: *const transport.OrderedRecv,
     tag: ipc.Tag,
     payload: []const u8,
-    now: i64,
 ) !void {
     if (payload.len <= max_ipc_payload) {
         var buf: [transport.max_payload_len]u8 = undefined;
         const ipc_bytes = transport.buildIpcBytes(tag, payload, &buf);
-        try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
+        try sendReliablePayload(reliable_send, reliable_recv, .reliable_ipc, ipc_bytes);
         return;
     }
 
@@ -256,25 +245,151 @@ fn sendIpcReliable(
         const end = @min(off + max_ipc_payload, payload.len);
         var buf: [transport.max_payload_len]u8 = undefined;
         const ipc_bytes = transport.buildIpcBytes(tag, payload[off..end], &buf);
-        try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
+        try sendReliablePayload(reliable_send, reliable_recv, .reliable_ipc, ipc_bytes);
         off = end;
     }
 }
 
-fn requestResync(
+fn flushReliable(
+    alloc: std.mem.Allocator,
     peer: *udp_mod.Peer,
     sock: *udp_mod.UdpSocket,
     reliable_send: *transport.ReliableSend,
-    reliable_recv: *const transport.RecvState,
-    last_resync_request_ns: *i64,
     now: i64,
 ) !void {
-    if ((now - last_resync_request_ns.*) < resync_cooldown_ns) return;
+    var transmissions = try reliable_send.collectTransmissions(alloc, now, peer.rto_us());
+    defer transmissions.deinit(alloc);
+    for (transmissions.items) |packet| {
+        peer.send(sock, packet) catch |err| {
+            if (err == error.NoPeerAddress or err == error.WouldBlock) continue;
+            return err;
+        };
+    }
+}
 
-    var ctrl_buf: [8]u8 = undefined;
-    const payload = transport.buildControl(.resync_request, &ctrl_buf);
-    try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .control, payload, now);
-    last_resync_request_ns.* = now;
+const ReceiveAction = enum {
+    none,
+    stream_lost,
+};
+
+const RemoteReceiveState = struct {
+    alloc: std.mem.Allocator,
+    reliable_recv: transport.OrderedRecv,
+    output_recv: transport.OutputRecvState,
+    stdout_buf: std.ArrayList(u8),
+    stdout_limit: usize = max_stdout_buf,
+    session_ended: bool = false,
+
+    fn init(alloc: std.mem.Allocator) !RemoteReceiveState {
+        var reliable_recv = try transport.OrderedRecv.init(alloc);
+        errdefer reliable_recv.deinit();
+        var output_recv = try transport.OutputRecvState.init(alloc);
+        errdefer output_recv.deinit();
+        const stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+
+        return .{
+            .alloc = alloc,
+            .reliable_recv = reliable_recv,
+            .output_recv = output_recv,
+            .stdout_buf = stdout_buf,
+        };
+    }
+
+    fn deinit(self: *RemoteReceiveState) void {
+        self.reliable_recv.deinit();
+        self.output_recv.deinit();
+        self.stdout_buf.deinit(self.alloc);
+    }
+
+    fn appendStdout(self: *RemoteReceiveState, payload: []const u8) !bool {
+        if (self.stdout_buf.items.len > self.stdout_limit or
+            payload.len > self.stdout_limit - self.stdout_buf.items.len)
+        {
+            return false;
+        }
+        try self.stdout_buf.appendSlice(self.alloc, payload);
+        return true;
+    }
+
+    fn consumeStdout(self: *RemoteReceiveState, len: usize) !void {
+        try self.stdout_buf.replaceRange(self.alloc, 0, len, &[_]u8{});
+        if (self.stdout_buf.items.len == 0) self.stdout_limit = max_stdout_buf;
+    }
+
+    fn handlePacket(self: *RemoteReceiveState, packet: transport.Packet, now: i64) !ReceiveAction {
+        switch (packet.channel) {
+            .heartbeat => return .none,
+            .reliable_ipc, .control => {
+                const recv_action = try self.reliable_recv.push(packet);
+                if (recv_action == .stale) {
+                    log.warn("reliable packet outside receive window seq={d}", .{packet.seq});
+                }
+
+                var result: ReceiveAction = .none;
+                while (self.reliable_recv.popReady()) |ready| {
+                    defer ready.deinit();
+                    if (try self.handleReliablePayload(ready.channel, ready.payload) == .stream_lost) {
+                        result = .stream_lost;
+                    }
+                }
+                return result;
+            },
+            .output => {
+                switch (try self.output_recv.onPacket(packet.seq, packet.payload, now)) {
+                    .accept => {
+                        var made_progress = false;
+                        while (self.output_recv.popReady()) |payload| {
+                            defer self.alloc.free(payload);
+                            if (!try self.appendStdout(payload)) {
+                                return .stream_lost;
+                            }
+                            made_progress = true;
+                        }
+                        self.output_recv.noteDrain(made_progress, now);
+                    },
+                    .gap => return .stream_lost,
+                    .duplicate, .stale => {},
+                }
+                return .none;
+            },
+        }
+    }
+
+    fn handleReliablePayload(self: *RemoteReceiveState, channel: transport.Channel, payload: []const u8) !ReceiveAction {
+        switch (channel) {
+            .reliable_ipc => {
+                var offset: usize = 0;
+                while (offset < payload.len) {
+                    const remaining = payload[offset..];
+                    const msg_len = ipc.expectedLength(remaining) orelse break;
+                    if (remaining.len < msg_len) break;
+
+                    const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+                    const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
+                    if (hdr.tag == .Output and msg_payload.len > 0) {
+                        if (!try self.appendStdout(msg_payload)) {
+                            return .stream_lost;
+                        }
+                    } else if (hdr.tag == .SessionEnd) {
+                        self.session_ended = true;
+                    }
+                    offset += msg_len;
+                }
+                return .none;
+            },
+            .heartbeat, .output, .control => return .none,
+        }
+    }
+
+    fn expireOutputGap(self: *RemoteReceiveState, now: i64, timeout_ns: i64) bool {
+        return self.output_recv.gapExpired(now, timeout_ns);
+    }
+};
+
+fn outputReorderTimeoutNs(peer: *const udp_mod.Peer) i64 {
+    const srtt_us = peer.srtt_us orelse 25_000;
+    const timeout_us = std.math.clamp(2 * srtt_us, @as(i64, 50_000), @as(i64, 250_000));
+    return timeout_us * std.time.ns_per_us;
 }
 
 /// Remote attach: connect to a remote zmx session via UDP.
@@ -302,21 +417,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
     var reliable_send = try transport.ReliableSend.init(alloc);
     defer reliable_send.deinit();
-    var reliable_recv = transport.RecvState{};
-    var output_recv = transport.OutputRecvState{};
+    var receive_state = try RemoteReceiveState.init(alloc);
+    defer receive_state.deinit();
 
     // Set terminal to raw mode
     var orig_termios: c.termios = undefined;
     _ = c.tcgetattr(posix.STDIN_FILENO, &orig_termios);
     defer {
         _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSAFLUSH, &orig_termios);
-        const restore_seq = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" ++
-            "\x1b[?2004l\x1b[?1004l\x1b[?1049l" ++
-            // Restore pre-attach Kitty keyboard protocol mode so Ctrl combos
-            // return to legacy encoding in the user's outer shell.
-            "\x1b[<u" ++
-            "\x1b[?25h";
-        _ = posix.write(posix.STDOUT_FILENO, restore_seq) catch {};
     }
 
     var raw_termios = orig_termios;
@@ -327,10 +435,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     raw_termios.c_cc[c.VTIME] = 0;
     _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSANOW, &raw_termios);
 
-    // Clear screen before attaching. We do NOT use the alternate screen
-    // (\x1b[?1049h) because it has no scrollback buffer.
-    _ = try posix.write(posix.STDOUT_FILENO, "\x1b[2J\x1b[H");
-
     setupSigwinchHandler();
 
     // Make stdin non-blocking
@@ -338,56 +442,44 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     _ = try posix.fcntl(posix.STDIN_FILENO, posix.F.SETFL, stdin_flags | posix.SOCK.NONBLOCK);
 
     const config = udp_mod.Config{};
-    var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
-    defer stdout_buf.deinit(alloc);
-    var was_disconnected = false;
-    var session_ended = false;
-
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
-    var last_resync_request_ns: i64 = 0;
 
-    // Send Init message with terminal size (reliable)
+    // Initialize dimensions without requesting a synthetic terminal repaint.
     const size = getTerminalSize();
     var init_buf: [64]u8 = undefined;
     const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
-    try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, last_ack_send_ns);
+    try sendReliablePayload(&reliable_send, &receive_state.reliable_recv, .reliable_ipc, init_ipc);
 
     while (true) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
+        const reorder_timeout_ns = outputReorderTimeoutNs(&peer);
+
+        if (receive_state.expireOutputGap(now, reorder_timeout_ns)) {
+            return error.OutputStreamLost;
+        }
 
         // Check SIGWINCH
         if (sigwinch_received.swap(false, .acq_rel)) {
             const new_size = getTerminalSize();
-            try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Resize, std.mem.asBytes(&new_size), now);
+            try sendIpcReliable(&reliable_send, &receive_state.reliable_recv, .Resize, std.mem.asBytes(&new_size));
         }
 
-        // Retransmit reliable packets based on adaptive RTO.
-        var retransmits = try reliable_send.collectRetransmits(alloc, now, peer.rto_us());
-        defer retransmits.deinit(alloc);
-        for (retransmits.items) |pkt| {
-            peer.send(&udp_sock, pkt) catch {};
-        }
+        // Send new reliable packets and retransmit due packets within the
+        // bounded flight window.
+        try flushReliable(alloc, &peer, &udp_sock, &reliable_send, now);
 
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &receive_state.reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
         } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &receive_state.reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
         }
 
         // State check
         const state = peer.updateState(now, config);
         if (state == .dead) {
-            _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: connection lost permanently\r\n") catch {};
             return error.ConnectionLost;
-        }
-        if (state == .disconnected and !was_disconnected) {
-            _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b[7mzmx: connection lost — waiting to reconnect...\x1b[27m\x1b8") catch {};
-            was_disconnected = true;
-        } else if (state == .connected and was_disconnected) {
-            _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
-            was_disconnected = false;
         }
 
         // Build poll fds
@@ -395,7 +487,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         var poll_count: usize = 2;
         poll_fds[0] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 };
         poll_fds[1] = .{ .fd = udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
-        if (stdout_buf.items.len > 0) {
+        if (receive_state.stdout_buf.items.len > 0) {
             poll_fds[2] = .{ .fd = posix.STDOUT_FILENO, .events = posix.POLL.OUT, .revents = 0 };
             poll_count = 3;
         }
@@ -406,6 +498,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
+        if (receive_state.output_recv.gapRemainingNs(now, reorder_timeout_ns)) |remaining_ns| {
+            const remaining_ms = @divFloor(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+            poll_timeout = @min(poll_timeout, remaining_ms);
+        }
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
             if (err == error.Interrupted) continue;
@@ -422,11 +518,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             if (n_opt) |n| {
                 if (n > 0) {
                     if (input_raw[0] == 0x1C or isKittyCtrlBackslash(input_raw[0..n])) {
-                        try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Detach, "", now);
+                        try sendIpcReliable(&reliable_send, &receive_state.reliable_recv, .Detach, "");
+                        try flushReliable(alloc, &peer, &udp_sock, &reliable_send, now);
                         return;
                     }
-                    try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Input, input_raw[0..n], now);
+                    try sendIpcReliable(&reliable_send, &receive_state.reliable_recv, .Input, input_raw[0..n]);
                 } else {
+                    try sendIpcReliable(&reliable_send, &receive_state.reliable_recv, .Detach, "");
+                    try flushReliable(alloc, &peer, &udp_sock, &reliable_send, now);
                     return; // EOF on stdin
                 }
             }
@@ -442,78 +541,32 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                 const packet = transport.parsePacket(result.data) catch continue;
                 reliable_send.ack(packet.ack, packet.ack_bits);
 
-                switch (packet.channel) {
-                    .heartbeat => {},
-                    .control => {
-                        ack_dirty = true;
-                        if (reliable_recv.onReliable(packet.seq) != .accept) continue;
-                    },
-                    .reliable_ipc => {
-                        ack_dirty = true;
-                        if (reliable_recv.onReliable(packet.seq) != .accept) continue;
-
-                        var offset: usize = 0;
-                        while (offset < packet.payload.len) {
-                            const remaining = packet.payload[offset..];
-                            const msg_len = ipc.expectedLength(remaining) orelse break;
-                            if (remaining.len < msg_len) break;
-
-                            const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-                            const payload = remaining[@sizeOf(ipc.Header)..msg_len];
-
-                            if (hdr.tag == .Output and payload.len > 0) {
-                                if (stdout_buf.items.len + payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, payload);
-                                }
-                            } else if (hdr.tag == .SessionEnd) {
-                                session_ended = true;
-                            }
-
-                            offset += msg_len;
-                        }
-                    },
-                    .output => {
-                        switch (output_recv.onPacket(packet.seq)) {
-                            .accept => {
-                                if (packet.payload.len == 0) continue;
-                                if (stdout_buf.items.len + packet.payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, packet.payload);
-                                }
-                            },
-                            .gap => {
-                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                            },
-                            .duplicate, .stale => {},
-                        }
-                    },
+                if (packet.channel == .reliable_ipc or packet.channel == .control) {
+                    ack_dirty = true;
+                }
+                if (try receive_state.handlePacket(packet, now) == .stream_lost) {
+                    return error.OutputStreamLost;
                 }
             }
         }
 
         // Flush stdout
         if (poll_count == 3 and poll_fds[2].revents & posix.POLL.OUT != 0) {
-            if (stdout_buf.items.len > 0) {
-                const written = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
+            if (receive_state.stdout_buf.items.len > 0) {
+                const written = posix.write(posix.STDOUT_FILENO, receive_state.stdout_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     return err;
                 };
                 if (written > 0) {
-                    try stdout_buf.replaceRange(alloc, 0, written, &[_]u8{});
+                    try receive_state.consumeStdout(written);
                 }
             }
         }
 
-        if (session_ended) {
-            if (stdout_buf.items.len > 0) {
-                _ = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch {};
+        if (receive_state.session_ended) {
+            if (receive_state.stdout_buf.items.len > 0) {
+                _ = posix.write(posix.STDOUT_FILENO, receive_state.stdout_buf.items) catch {};
             }
-            _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: remote session ended\r\n") catch {};
             return;
         }
     }
@@ -524,7 +577,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 // ---------------------------------------------------------------------------
 
 test "parseConnectLine valid" {
-    const result = try parseConnectLine("ZMX_CONNECT udp 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
+    const result = try parseConnectLine("ZMX_CONNECT udp-v2 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
     try std.testing.expect(result.port == 60042);
 }
 
@@ -534,6 +587,10 @@ test "parseConnectLine invalid prefix" {
 
 test "parseConnectLine unsupported protocol" {
     try std.testing.expectError(error.UnsupportedProtocol, parseConnectLine("ZMX_CONNECT tcp 60042 key\n"));
+}
+
+test "parseConnectLine rejects legacy transport version" {
+    try std.testing.expectError(error.TransportVersionMismatch, parseConnectLine("ZMX_CONNECT udp 60042 key\n"));
 }
 
 test "remote bootstrap honors a safely quoted explicit binary" {
@@ -547,4 +604,91 @@ test "remote bootstrap honors a safely quoted explicit binary" {
     command.clearRetainingCapacity();
     try appendRemoteBinary(&command, alloc, "/tmp/zmosh test/zmosh");
     try std.testing.expectEqualStrings("'/tmp/zmosh test/zmosh'", command.items);
+}
+
+test "remote receive forwards reliable output without an automatic restore" {
+    const alloc = std.testing.allocator;
+    var state = try RemoteReceiveState.init(alloc);
+    defer state.deinit();
+
+    var ipc_buf: [transport.max_payload_len]u8 = undefined;
+    const ipc_bytes = transport.buildIpcBytes(.Output, "raw-output", &ipc_buf);
+    try std.testing.expect(try state.handlePacket(.{
+        .channel = .reliable_ipc,
+        .seq = 1,
+        .ack = 0,
+        .ack_bits = 0,
+        .payload = ipc_bytes,
+    }, 1) == .none);
+
+    try std.testing.expectEqualStrings("raw-output", state.stdout_buf.items);
+}
+
+test "remote receive reports a reorder gap without synthesizing a restore" {
+    const alloc = std.testing.allocator;
+    var state = try RemoteReceiveState.init(alloc);
+    defer state.deinit();
+    state.output_recv.reset(1);
+    try state.stdout_buf.appendSlice(alloc, "stable");
+
+    try std.testing.expect(try state.handlePacket(.{
+        .channel = .output,
+        .seq = 2,
+        .ack = 0,
+        .ack_bits = 0,
+        .payload = "later",
+    }, 100) == .none);
+    try std.testing.expectEqualStrings("stable", state.stdout_buf.items);
+    try std.testing.expect(!state.expireOutputGap(149, 50));
+    try std.testing.expect(state.expireOutputGap(150, 50));
+    try std.testing.expectEqualStrings("stable", state.stdout_buf.items);
+}
+
+test "reliable terminal output survives loss and reordering without resync" {
+    const alloc = std.testing.allocator;
+    var state = try RemoteReceiveState.init(alloc);
+    defer state.deinit();
+    var send = try transport.ReliableSend.init(alloc);
+    defer send.deinit();
+
+    for ([_][]const u8{ "initial-", "one-", "two-", "three" }) |output| {
+        var ipc_buf: [transport.max_payload_len]u8 = undefined;
+        const ipc_bytes = transport.buildIpcBytes(.Output, output, &ipc_buf);
+        _ = try send.queue(.reliable_ipc, ipc_bytes, 0, 0);
+    }
+
+    const dropped_seq = 3;
+    var dropped_once = false;
+    var stream_losses: usize = 0;
+    var now: i64 = 1;
+    var rounds: usize = 0;
+    while (send.hasPending() and rounds < 100) : (rounds += 1) {
+        var batch = try send.collectTransmissions(alloc, now, 1000);
+        defer batch.deinit(alloc);
+
+        // Deliver each flight backwards and discard one output packet on its
+        // first transmission. Ordered reliable receive must stall, then emit
+        // every terminal byte exactly once after the retry arrives.
+        var i = batch.items.len;
+        while (i > 0) {
+            i -= 1;
+            const packet = try transport.parsePacket(batch.items[i]);
+            if (packet.seq == dropped_seq and !dropped_once) {
+                dropped_once = true;
+                continue;
+            }
+            if (try state.handlePacket(packet, now) == .stream_lost) {
+                stream_losses += 1;
+            }
+        }
+
+        send.ack(state.reliable_recv.ack(), state.reliable_recv.ackBits());
+        now += 2 * std.time.ns_per_ms;
+    }
+
+    try std.testing.expect(dropped_once);
+    try std.testing.expect(!send.hasPending());
+    try std.testing.expect(rounds < 100);
+    try std.testing.expectEqual(@as(usize, 0), stream_losses);
+    try std.testing.expectEqualStrings("initial-one-two-three", state.stdout_buf.items);
 }
