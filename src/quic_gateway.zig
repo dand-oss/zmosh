@@ -41,6 +41,26 @@ pub const keepalive_interval_ns: i64 = 1 * std.time.ns_per_s;
 pub const max_inbound_per_turn: usize = 64;
 pub const max_outbound_per_turn: usize = 64;
 
+/// Which pool a send draws from. Ordinary output — including Retry —
+/// stops one slot short of the turn budget; the final slot serves
+/// deadline-critical output (daemon-close on EOF, otherwise due-PTO
+/// and keepalive), so a flood of ordinary output can never starve a
+/// due probe or the close frame.
+pub const SendClass = enum { ordinary, reserved };
+
+/// The one outbound budget every send site in a loop turn shares.
+pub const TurnBudget = struct {
+    outbound: usize = max_outbound_per_turn,
+
+    /// One decrement per attempted send, exactly once.
+    pub fn take(self: *TurnBudget, class: SendClass) bool {
+        const floor: usize = if (class == .ordinary) 1 else 0;
+        if (self.outbound <= floor) return false;
+        self.outbound -= 1;
+        return true;
+    }
+};
+
 /// Plan Q1: the address-validation token secret is HKDF-SHA256 of the
 /// bootstrap secret with salt `zmosh quic token v1`, expanded with
 /// info `zmosh-address-validation-v1`. The PRK is wiped by an
@@ -144,9 +164,14 @@ pub const QuicGateway = struct {
     bootstrap_emitted_ns: i64,
     counters: Counters = .{},
     handshake_duration_ns: i64 = 0,
+    /// Advanced ONLY by an actual successful send.
     last_output_ns: i64 = 0,
     /// Set while one keepalive PING is queued and not yet emitted.
     keepalive_queued: bool = false,
+    /// The last keepalive ATTEMPT (queued or not): a queued-but-unsent
+    /// PING is retried a full second later — never busy-looped, never
+    /// duplicated.
+    keepalive_attempt_ns: i64 = 0,
     /// Cleared when the owner's loop should exit.
     running: bool = true,
 
@@ -206,7 +231,7 @@ pub const QuicGateway = struct {
 
     /// Receive up to `max_inbound_per_turn` datagrams and dispatch by
     /// transaction state. Returns false when the gateway should exit.
-    pub fn receive(self: *QuicGateway, sock: *udp.UdpSocket, now: i64) !bool {
+    pub fn receive(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !bool {
         var received: usize = 0;
         while (received < max_inbound_per_turn) : (received += 1) {
             var buf: [quic_transport.max_udp_payload]u8 = undefined;
@@ -220,7 +245,7 @@ pub const QuicGateway = struct {
                 continue;
             };
             const arrival = quicz.endpoint.UdpTuple{ .local = self.local, .remote = remote };
-            try self.dispatch(sock, arrival, r.addr, buf[0..r.len], now);
+            try self.dispatch(sock, arrival, r.addr, buf[0..r.len], now, budget);
             if (!self.running) return false;
         }
         return self.running;
@@ -233,16 +258,17 @@ pub const QuicGateway = struct {
         src: lib_posix.Address,
         data: []const u8,
         now: i64,
+        budget: *TurnBudget,
     ) !void {
         switch (self.state) {
-            .awaiting_initial, .retry_sent => try self.handleInitial(sock, arrival, src, data, now),
+            .awaiting_initial, .retry_sent => try self.handleInitial(sock, arrival, src, data, now, budget),
             .candidate_uncommitted, .handshaking_committed, .established => {
                 const transport = self.candidate().transport;
                 if (try transport.handleDatagram(arrival, now, data, &self.challenge)) {
                     self.io.random(&self.challenge);
                     self.counters.challenges_issued += 1;
                 }
-                try self.drainCandidate(sock, now);
+                try self.drainCandidate(sock, now, budget);
                 if (!self.running) return;
                 if (self.state != .established and transport.handshakeConfirmed()) {
                     self.handshake_duration_ns = now - self.bootstrap_emitted_ns;
@@ -253,7 +279,7 @@ pub const QuicGateway = struct {
                     try transport.connection().sendHandshakeDone();
                     log.info("quic handshake confirmed duration_ns={d}", .{self.handshake_duration_ns});
                 }
-                if (self.state == .established) try self.rejectPreQ3StreamData(sock, now);
+                if (self.state == .established) try self.rejectPreQ3StreamData(sock, now, budget);
             },
             .closed => self.counters.datagrams_discarded += 1,
         }
@@ -266,6 +292,7 @@ pub const QuicGateway = struct {
         src: lib_posix.Address,
         data: []const u8,
         now: i64,
+        budget: *TurnBudget,
     ) !void {
         const supported = [_]quicz.packet.Version{.v1};
         const accept = (quicz.endpoint.peekInitialAcceptDatagram(arrival, data, &supported) catch {
@@ -304,7 +331,7 @@ pub const QuicGateway = struct {
                     self.counters.datagrams_discarded += 1;
                     return;
                 }
-                return self.openExchange(sock, arrival, src, accept, now);
+                return self.openExchange(sock, arrival, src, accept, now, budget);
             },
             // classify never allocates: every other failure is
             // network-data-driven.
@@ -316,8 +343,8 @@ pub const QuicGateway = struct {
         switch (decision) {
             // Matching retransmission: the STORED Retry and its nonce
             // are reused verbatim without extending the expiry.
-            .send_retry => |view| try self.sendRetryView(sock, view, src),
-            .validated => try self.adoptValidated(sock, arrival, accept, data, now),
+            .send_retry => |view| _ = try self.sendRetryView(sock, view, src, budget),
+            .validated => try self.adoptValidated(sock, arrival, accept, data, now, budget),
         }
     }
 
@@ -328,6 +355,7 @@ pub const QuicGateway = struct {
         src: lib_posix.Address,
         accept: anytype,
         now: i64,
+        budget: *TurnBudget,
     ) !void {
         // A fresh random nonce for every newly issued token.
         var nonce: quicz.address_validation_token.Nonce = undefined;
@@ -357,7 +385,7 @@ pub const QuicGateway = struct {
             return;
         };
         self.exchange_odcid = accept.original_destination_connection_id[0..8].*;
-        try self.sendRetryView(sock, view, src);
+        _ = try self.sendRetryView(sock, view, src, budget);
         self.state = .retry_sent;
     }
 
@@ -368,6 +396,7 @@ pub const QuicGateway = struct {
         accept: anytype,
         data: []const u8,
         now: i64,
+        budget: *TurnBudget,
     ) !void {
         // The candidate's token comes from the expiry-aware slot
         // accessor — a fixed owned source, never the reusable receive
@@ -384,10 +413,15 @@ pub const QuicGateway = struct {
             .token = token,
             .now_nanos = now,
         });
-        errdefer transport.destroy();
+        // From a successful registry.adopt onward the REGISTRY owns
+        // the record and the transport; these errdefers are disarmed
+        // so no post-adoption failure can free what the registry
+        // holds (the round-3 `ex_owned` pattern).
+        var adopted = false;
+        errdefer if (!adopted) transport.destroy();
         try transport.registerRoute(arrival.local, arrival.remote);
         const record = try self.alloc.create(GatewayRecord);
-        errdefer self.alloc.destroy(record);
+        errdefer if (!adopted) self.alloc.destroy(record);
         record.* = .{ .transport = transport };
         self.registry.adopt(1, record) catch {
             self.alloc.destroy(record);
@@ -395,15 +429,19 @@ pub const QuicGateway = struct {
             self.counters.datagrams_discarded += 1;
             return;
         };
+        adopted = true;
         self.state = .candidate_uncommitted;
 
         // Authenticate the follow-up Initial. A failure (wrong PSK,
-        // binder mismatch) retires the candidate WITHOUT committing;
-        // the slot remains usable to its absolute expiry and the Retry
-        // SCID is unchanged.
-        _ = try transport.handleDatagram(arrival, now, data, &self.challenge);
+        // binder mismatch) rolls back THROUGH THE REGISTRY; the slot
+        // remains usable to its absolute expiry and the Retry SCID is
+        // unchanged.
+        _ = transport.handleDatagram(arrival, now, data, &self.challenge) catch {
+            try self.rollbackCandidate();
+            return;
+        };
         transport.driveCrypto(.initial, now) catch {
-            self.rollbackCandidate();
+            try self.rollbackCandidate();
             return;
         };
 
@@ -412,80 +450,135 @@ pub const QuicGateway = struct {
         // ServerHello recovers through QUIC PTO, and any later fatal
         // error retires and exits.
         const sh = (transport.pollOutbound(now) catch {
-            self.rollbackCandidate();
+            try self.rollbackCandidate();
             return;
         }) orelse {
-            self.rollbackCandidate();
+            try self.rollbackCandidate();
             return;
         };
         self.slot.commit(&self.policy, now, token) catch {
             self.alloc.free(sh);
-            self.rollbackCandidate();
+            try self.rollbackCandidate();
             return;
         };
         self.state = .handshaking_committed;
-        try self.sendOwned(sock, sh, arrival.remote);
-        self.last_output_ns = now;
+        const sh_sent = self.sendOwned(sock, sh, arrival.remote, budget, .ordinary) catch {
+            // Post-commit fatal: retire and exit — never retry_sent.
+            try self.retireCandidate();
+            self.state = .closed;
+            self.running = false;
+            log.err("post-commit ServerHello send failed; gateway exiting", .{});
+            return;
+        };
+        if (sh_sent) self.last_output_ns = now;
     }
 
-    /// Pre-commit rollback: retire the candidate, keep the slot and
-    /// Retry SCID for the still-live exchange.
-    fn rollbackCandidate(self: *QuicGateway) void {
-        _ = self.registry.retire(self.candidate().transport.lifecycle, 1) catch {};
+    /// Retire the adopted candidate through the registry. On failure
+    /// the record's ownership is uncertain: fail CLOSED — stop the
+    /// gateway and propagate; `retry_sent` is never entered.
+    fn retireCandidate(self: *QuicGateway) !void {
+        _ = self.registry.retire(self.candidate().transport.lifecycle, 1) catch {
+            self.state = .closed;
+            self.running = false;
+            log.err("candidate retirement failed; failing closed", .{});
+            return error.RetireFailed;
+        };
+    }
+
+    /// Pre-commit rollback: successful retirement returns to
+    /// `retry_sent` with the slot and Retry SCID still live for this
+    /// exchange.
+    fn rollbackCandidate(self: *QuicGateway) !void {
+        try self.retireCandidate();
         self.state = .retry_sent;
         self.counters.datagrams_discarded += 1;
     }
 
-    /// Owned quicz output: ALWAYS freed after the send attempt —
-    /// WouldBlock drops the bytes and QUIC recovery retransmits.
-    fn sendOwned(self: *QuicGateway, sock: *udp.UdpSocket, dg: []u8, remote: quicz.endpoint.UdpAddress) !void {
+    /// The owned-send core, generic over a sendTo-compatible sender
+    /// (tests drive the WouldBlock branch with a fake). The budget is
+    /// consulted FIRST — an unsendable class never reaches the socket
+    /// — and the datagram is freed after every attempt. WouldBlock
+    /// drops the bytes and QUIC recovery retransmits; the counter
+    /// counts real sends only.
+    fn sendOwnedVia(
+        self: *QuicGateway,
+        sender: anytype,
+        dg: []u8,
+        remote: quicz.endpoint.UdpAddress,
+        budget: *TurnBudget,
+        class: SendClass,
+    ) !bool {
         defer self.alloc.free(dg);
-        sock.sendTo(dg, udpAddressToSockaddr(remote)) catch |err| switch (err) {
-            error.WouldBlock => {},
+        if (!budget.take(class)) return false;
+        sender.sendTo(dg, udpAddressToSockaddr(remote)) catch |err| switch (err) {
+            error.WouldBlock => return false,
             else => return err,
         };
         self.counters.datagrams_sent += 1;
+        return true;
+    }
+
+    fn sendOwned(
+        self: *QuicGateway,
+        sock: *udp.UdpSocket,
+        dg: []u8,
+        remote: quicz.endpoint.UdpAddress,
+        budget: *TurnBudget,
+        class: SendClass,
+    ) !bool {
+        return self.sendOwnedVia(sock, dg, remote, budget, class);
     }
 
     /// The Retry datagram is a BORROWED slot view: never freed; on
     /// WouldBlock the slot retains it and a matching retransmission
-    /// reissues the same bytes.
-    fn sendRetryView(self: *QuicGateway, sock: *udp.UdpSocket, view: []const u8, src: lib_posix.Address) !void {
+    /// reissues the same bytes. Ordinary class — a Retry flood stops
+    /// one slot short like every other ordinary send.
+    fn sendRetryView(
+        self: *QuicGateway,
+        sock: *udp.UdpSocket,
+        view: []const u8,
+        src: lib_posix.Address,
+        budget: *TurnBudget,
+    ) !bool {
+        if (!budget.take(.ordinary)) return false;
         sock.sendTo(view, src) catch |err| switch (err) {
-            error.WouldBlock => {},
+            error.WouldBlock => return false,
             else => return err,
         };
         self.counters.datagrams_sent += 1;
+        return true;
     }
 
-    /// Bounded outbound drain: at most `max_outbound_per_turn` owned
-    /// datagrams per turn, each path-tagged by the atomic egress API.
-    /// Crypto is driven first in every non-discarded space, so
-    /// handshake flights progress on arrival activity.
-    fn drainCandidate(self: *QuicGateway, sock: *udp.UdpSocket, now: i64) !void {
+    /// Bounded outbound drain, ordinary class only: the loop guard
+    /// checks the budget BEFORE each poll (an unsendable emission is
+    /// never even built), and each datagram is path-tagged by the
+    /// atomic egress API. `last_output_ns` advances and the pending
+    /// keepalive flag clears ONLY on actual sends — the flag clears
+    /// exactly when a sent datagram reported `emitted_ping`.
+    fn drainCandidate(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !void {
         if (!self.hasCandidate()) return;
         const transport = self.candidate().transport;
         try transport.driveCrypto(.initial, now);
         try transport.driveCrypto(.handshake, now);
-        var sent: usize = 0;
-        while (sent < max_outbound_per_turn) : (sent += 1) {
+        while (budget.outbound > 1) {
             const tagged = (try transport.pollOutboundPath(now)) orelse break;
-            try self.sendOwned(sock, tagged.dg, tagged.dst.remote);
+            if (try self.sendOwned(sock, tagged.dg, tagged.dst.remote, budget, .ordinary)) {
+                self.last_output_ns = now;
+                if (tagged.emitted_ping) self.keepalive_queued = false;
+            }
         }
-        // Any authenticated output satisfies the keepalive interval.
-        self.last_output_ns = now;
     }
 
     /// Pre-Q3 application stream data is rejected: the connection
     /// closes (counted, no Q2-frozen error code — Q3 owns stable wire
     /// codes) and the gateway exits; post-commit fatal errors never
     /// return to `retry_sent`.
-    fn rejectPreQ3StreamData(self: *QuicGateway, sock: *udp.UdpSocket, now: i64) !void {
+    fn rejectPreQ3StreamData(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !void {
         const conn = self.candidate().transport.connection();
         for (conn.recv_streams.items) |stream| {
             if (stream.data.items.len > stream.read_offset) {
                 try self.candidate().transport.shutdown(1, "pre-q3 stream data");
-                try self.drainCandidate(sock, now);
+                try self.drainCandidate(sock, now, budget);
                 self.state = .closed;
                 self.running = false;
                 return;
@@ -493,13 +586,40 @@ pub const QuicGateway = struct {
         }
     }
 
+    /// Daemon EOF: queue a CONNECTION_CLOSE and attempt it through
+    /// the RESERVED class — ordinary output stopped one slot short,
+    /// so no prior flood can consume the slot the close needs — then
+    /// terminate. Total output this turn stays within the budget.
+    pub fn closeForDaemonExit(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !void {
+        defer {
+            self.state = .closed;
+            self.running = false;
+        }
+        if (!self.hasCandidate()) return;
+        const transport = self.candidate().transport;
+        transport.shutdown(0, "daemon closed") catch return;
+        transport.driveCrypto(.initial, now) catch return;
+        transport.driveCrypto(.handshake, now) catch return;
+        while (budget.outbound > 0) {
+            const tagged = (try transport.pollOutboundPath(now)) orelse break;
+            _ = try self.sendOwned(sock, tagged.dg, tagged.dst.remote, budget, .reserved);
+        }
+    }
+
     /// Service due QUIC work with no fd readable. Returns false when
     /// the gateway should exit.
-    pub fn serviceDue(self: *QuicGateway, sock: *udp.UdpSocket, now: i64) !bool {
+    pub fn serviceDue(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !bool {
         if (self.hasCandidate()) {
             const transport = self.candidate().transport;
             switch (try transport.serviceDueDeadline(now)) {
-                .datagram => |tagged| try self.sendOwned(sock, tagged.dg, tagged.dst.remote),
+                .datagram => |tagged| {
+                    // Deadline-critical output: the reserved class can
+                    // take the final slot.
+                    if (try self.sendOwned(sock, tagged.dg, tagged.dst.remote, budget, .reserved)) {
+                        self.last_output_ns = now;
+                        if (tagged.emitted_ping) self.keepalive_queued = false;
+                    }
+                },
                 .idle_retired, .close_retired => {
                     // The lifecycle already retired the routes: DROP
                     // the record (remove, not retire) and terminate.
@@ -526,23 +646,28 @@ pub const QuicGateway = struct {
             self.running = false;
             log.info("quic handshake deadline exceeded; gateway exiting", .{});
         }
-        // One-second keepalive: at most one queued; any authenticated
-        // output also satisfies the interval.
-        if (self.state == .established and self.running and
-            now - self.last_output_ns >= keepalive_interval_ns and !self.keepalive_queued)
-        {
-            try self.candidate().transport.connection().sendPing();
-            self.keepalive_queued = true;
-            try self.drainCandidate(sock, now);
-            self.keepalive_queued = false;
-            self.last_output_ns = now;
+        // One-second keepalive. A queued-but-unsent PING is retried a
+        // full second after its ATTEMPT (no busy-loop); a new PING is
+        // queued only when none is pending AND the reserved capacity
+        // exists — an unsendable PING is never queued.
+        if (self.state == .established and self.running) {
+            const due_from = if (self.keepalive_queued) self.keepalive_attempt_ns else self.last_output_ns;
+            if (now - due_from >= keepalive_interval_ns) {
+                if (!self.keepalive_queued and budget.outbound > 0) {
+                    try self.candidate().transport.connection().sendPing();
+                    self.keepalive_queued = true;
+                }
+                self.keepalive_attempt_ns = now;
+                try self.drainCandidate(sock, now, budget);
+            }
         }
         return self.running;
     }
 
     /// The earliest QUIC deadline: transport recovery/idle/close, slot
     /// expiry, the absolute handshake deadline, and the keepalive
-    /// interval once established.
+    /// schedule once established (`last_output_ns + 1s`, or
+    /// `keepalive_attempt_ns + 1s` while a PING is queued and unsent).
     pub fn nextDeadline(self: *const QuicGateway) ?i64 {
         var next: ?i64 = null;
         if (self.hasCandidate()) next = self.candidateConst().transport.nextDeadlineNanos();
@@ -553,7 +678,8 @@ pub const QuicGateway = struct {
             next = minDeadline(next, self.bootstrap_emitted_ns + handshake_deadline_ns);
         }
         if (self.state == .established) {
-            next = minDeadline(next, self.last_output_ns + keepalive_interval_ns);
+            const due_from = if (self.keepalive_queued) self.keepalive_attempt_ns else self.last_output_ns;
+            next = minDeadline(next, due_from + keepalive_interval_ns);
         }
         return next;
     }

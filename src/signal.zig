@@ -33,8 +33,25 @@ pub fn ignoreSigpipe() void {
     lib_posix.sigaction(lib_posix.SIG.PIPE, &act, null);
 }
 
-pub fn openSignalPipe() !void {
+/// Idempotent, ownership-reporting pipe acquisition: true when THIS
+/// call created the pipe, false when one is already open. Callers
+/// close only pipes they opened, via `closeSignalPipe`.
+pub fn acquireSignalPipe() !bool {
+    if (sig_pipe[0] != -1) return false;
     sig_pipe = try lib_posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    return true;
+}
+
+pub fn openSignalPipe() !void {
+    _ = try acquireSignalPipe();
+}
+
+/// Close the pipe and reset both descriptors so a later acquire
+/// creates a fresh one. Only the owner of the current pipe calls this.
+pub fn closeSignalPipe() void {
+    if (sig_pipe[0] != -1) lib_posix.close(sig_pipe[0]);
+    if (sig_pipe[1] != -1) lib_posix.close(sig_pipe[1]);
+    sig_pipe = .{ -1, -1 };
 }
 
 pub fn drainSignalPipe() void {

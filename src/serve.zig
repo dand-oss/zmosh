@@ -35,8 +35,6 @@ const log = std.log.scoped(.serve);
 /// Bounded `ZMX_ERROR` emission: numeric code, sanitized single line,
 /// capped at this many bytes.
 const max_error_line = 256;
-/// The frozen pre-bootstrap failure code.
-const gateway_init_failed = 1;
 /// Bounded daemon discard per event-loop turn.
 const max_daemon_discard_per_turn = 64 * 1024;
 
@@ -62,20 +60,12 @@ fn portRangeFromEnv() PortRange {
     };
 }
 
-/// One sanitized single-line `ZMX_ERROR CODE MESSAGE`, capped at 256
-/// bytes. Only printable ASCII survives sanitization.
-fn emitInitError(message: []const u8) void {
-    var buf: [max_error_line]u8 = undefined;
-    var len = (std.fmt.bufPrint(buf[0..], "ZMX_ERROR {d} ", .{gateway_init_failed}) catch return).len;
-    for (message) |c| {
-        if (c < 0x20 or c > 0x7e) continue;
-        if (len + 2 > buf.len) break;
-        buf[len] = c;
-        len += 1;
-    }
-    buf[len] = '\n';
-    len += 1;
-    _ = lib_posix.write(lib_posix.STDOUT_FILENO, buf[0..len]) catch return;
+/// The frozen pre-bootstrap failure line: the exact static literal,
+/// sanitized by construction, 32 bytes — well inside the 256-byte cap.
+const init_error_line = "ZMX_ERROR 1 gateway-init-failed\n";
+
+fn emitInitError() void {
+    _ = lib_posix.write(lib_posix.STDOUT_FILENO, init_error_line) catch return;
 }
 
 fn emitBootstrapLine(port: u16, encoded_key: []const u8) !void {
@@ -108,11 +98,9 @@ pub const Gateway = struct {
         };
         var unix_read_buf = try ipc.SocketBuffer.init(alloc);
         errdefer unix_read_buf.deinit();
-        const quic = try quic_gateway.QuicGateway.init(alloc, io, psk, token_secret, local, 0);
-        errdefer {
-            var q = quic;
-            q.deinit();
-        }
+        var quic = try quic_gateway.QuicGateway.init(alloc, io, psk, token_secret, local, 0);
+        // Deinit in place: a copy would wipe only the copy's PSK.
+        errdefer quic.deinit();
         return .{
             .alloc = alloc,
             .udp_sock = udp_sock,
@@ -136,7 +124,7 @@ pub const Gateway = struct {
 
     pub fn run(self: *Gateway) !void {
         // SIGTERM wakes poll() through the shared self-pipe.
-        try signal.openSignalPipe();
+        _ = try signal.acquireSignalPipe();
         signal.installWakeHandler(@intFromEnum(lib_posix.SIG.TERM));
         while (self.running) {
             if (!try self.runOnce(self.computePollTimeoutMs())) break;
@@ -165,9 +153,11 @@ pub const Gateway = struct {
 
     /// The production processing helper: the signal fd FIRST (bounded
     /// network work can never starve shutdown), then bounded network
-    /// work, then due QUIC work. Tests drive this with synthetic
-    /// timestamps and inert revents.
+    /// work, then due QUIC work — all sharing ONE outbound turn
+    /// budget. Tests drive this with synthetic timestamps and inert
+    /// revents.
     pub fn processReadyAndDue(self: *Gateway, now: i64, poll_fds: [3]lib_posix.pollfd) !bool {
+        var budget = quic_gateway.TurnBudget{};
         if (poll_fds[1].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
             log.info("SIGTERM received, shutting down gateway", .{});
@@ -175,16 +165,16 @@ pub const Gateway = struct {
             return false;
         }
         if (poll_fds[0].revents & lib_posix.POLL.IN != 0) {
-            if (!try self.quic.receive(&self.udp_sock, now)) {
+            if (!try self.quic.receive(&self.udp_sock, now, &budget)) {
                 self.running = false;
                 return false;
             }
         }
         if (poll_fds[2].revents & (lib_posix.POLL.IN | lib_posix.POLL.HUP | lib_posix.POLL.ERR) != 0) {
-            try self.drainDaemon();
+            try self.drainDaemon(now, &budget);
             if (!self.running) return false;
         }
-        const alive = try self.quic.serviceDue(&self.udp_sock, now);
+        const alive = try self.quic.serviceDue(&self.udp_sock, now, &budget);
         if (!alive) self.running = false;
         return alive;
     }
@@ -203,8 +193,9 @@ pub const Gateway = struct {
     }
 
     /// Drain-and-discard the daemon socket (no relay in Q2), bounded
-    /// per turn; daemon closure closes the QUIC connection and exits.
-    fn drainDaemon(self: *Gateway) !void {
+    /// per turn. Daemon closure queues the QUIC CONNECTION_CLOSE and
+    /// attempts it through the reserved slot before exiting.
+    fn drainDaemon(self: *Gateway, now: i64, budget: *quic_gateway.TurnBudget) !void {
         var discarded: usize = 0;
         while (discarded < max_daemon_discard_per_turn) {
             const n = self.unix_read_buf.read(self.unix_fd) catch |err| switch (err) {
@@ -217,7 +208,9 @@ pub const Gateway = struct {
             };
             if (n == 0) {
                 log.info("daemon closed connection", .{});
-                self.running = false;
+                self.quic.closeForDaemonExit(&self.udp_sock, now, budget) catch |err| {
+                    log.warn("daemon-close drain failed: {s}", .{@errorName(err)});
+                };
                 return;
             }
             discarded += n;
@@ -229,58 +222,83 @@ pub const Gateway = struct {
         lib_posix.close(self.unix_fd);
         self.udp_sock.close();
         self.unix_read_buf.deinit();
-        var quic = self.quic;
-        quic.deinit();
+        // In place: deinitning a copy would wipe only the copy's PSK.
+        self.quic.deinit();
     }
 };
 
 /// Entry point for `zmx serve <session>`: every fallible step precedes
 /// the bootstrap line; pre-success failures emit the bounded
-/// `ZMX_ERROR`.
+/// `ZMX_ERROR`. FD ownership transfers to the Gateway exactly once —
+/// the errdefers here are disarmed at that point — and every secret
+/// original (key, derived PSK, token secret, encoded key) is wiped on
+/// EVERY path.
 pub fn serveMain(alloc: std.mem.Allocator, io: std.Io, cfg: *const Cfg, session_name: []const u8) !void {
-    const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, session_name);
+    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| {
+        log.err("failed to resolve daemon socket path: {s}", .{@errorName(err)});
+        emitInitError();
+        return err;
+    };
     defer alloc.free(socket_path);
 
     const unix_fd = socket.sessionConnect(socket_path) catch |err| {
         log.err("failed to connect to daemon socket={s} err={s}", .{ socket_path, @errorName(err) });
-        emitInitError(@errorName(err));
+        emitInitError();
         return err;
     };
-    errdefer lib_posix.close(unix_fd);
-    const flags = try lib_posix.fcntl(unix_fd, lib_posix.F.GETFL, 0);
-    _ = try lib_posix.fcntl(unix_fd, lib_posix.F.SETFL, flags | lib_posix.O_NONBLOCK);
+    // Disarmed the moment Gateway.init succeeds: from there `gw.deinit`
+    // is the sole closer of both descriptors.
+    var gateway_owns_fds = false;
+    errdefer if (!gateway_owns_fds) lib_posix.close(unix_fd);
+    const flags = lib_posix.fcntl(unix_fd, lib_posix.F.GETFL, 0) catch |err| {
+        log.err("fcntl GETFL failed: {s}", .{@errorName(err)});
+        emitInitError();
+        return err;
+    };
+    _ = lib_posix.fcntl(unix_fd, lib_posix.F.SETFL, flags | lib_posix.O_NONBLOCK) catch |err| {
+        log.err("fcntl SETFL failed: {s}", .{@errorName(err)});
+        emitInitError();
+        return err;
+    };
 
     const range = portRangeFromEnv();
     var udp_sock = udp.UdpSocket.bind(range.start, range.end) catch |err| {
-        emitInitError(@errorName(err));
+        log.err("udp bind failed: {s}", .{@errorName(err)});
+        emitInitError();
         return err;
     };
-    errdefer udp_sock.close();
+    errdefer if (!gateway_owns_fds) udp_sock.close();
 
-    const key = crypto.generateKey(io) catch |err| {
-        emitInitError(@errorName(err));
+    var key = crypto.generateKey(io) catch |err| {
+        log.err("key generation failed: {s}", .{@errorName(err)});
+        emitInitError();
         return err;
     };
+    defer std.crypto.secureZero(u8, &key);
     var psk: [32]u8 = undefined;
     quic_transport.derivePsk(&psk, &key);
+    defer std.crypto.secureZero(u8, &psk);
     var token_secret: [32]u8 = undefined;
     quic_gateway.deriveTokenSecret(&token_secret, &key);
+    defer std.crypto.secureZero(u8, &token_secret);
 
     var gw = Gateway.init(alloc, io, unix_fd, udp_sock, &psk, &token_secret) catch |err| {
-        emitInitError(@errorName(err));
+        log.err("gateway init failed: {s}", .{@errorName(err)});
+        emitInitError();
         return err;
     };
-    // The derived originals are dead: the gateway holds the sole
-    // copies and wipes them in its deinit.
-    std.crypto.secureZero(u8, &psk);
-    std.crypto.secureZero(u8, &token_secret);
+    gateway_owns_fds = true;
     defer gw.deinit();
+    // The derived originals are dead: the gateway holds the sole
+    // copies and wipes them in its deinit (the defers above still run).
 
     // Success: print, anchor the absolute handshake deadline at this
     // emission, close stdout so the SSH capture can finish.
-    const encoded_key = crypto.keyToBase64(key);
+    var encoded_key = crypto.keyToBase64(&key);
+    defer std.crypto.secureZero(u8, &encoded_key);
     emitBootstrapLine(udp_sock.bound_port, &encoded_key) catch |err| {
-        emitInitError(@errorName(err));
+        log.err("bootstrap write failed: {s}", .{@errorName(err)});
+        emitInitError();
         return err;
     };
     gw.quic.bootstrap_emitted_ns = lib_posix.nowNs();
@@ -297,8 +315,9 @@ pub fn serveMain(alloc: std.mem.Allocator, io: std.Io, cfg: *const Cfg, session_
 const testing = std.testing;
 
 test "bootstrap line format" {
-    const key = try crypto.generateKey(testing.io);
-    const encoded = crypto.keyToBase64(key);
+    var key = try crypto.generateKey(testing.io);
+    defer std.crypto.secureZero(u8, &key);
+    const encoded = crypto.keyToBase64(&key);
     const port: u16 = 60042;
 
     var buf: [256]u8 = undefined;
@@ -370,22 +389,18 @@ test "sockaddr conversions: IPv4, native IPv6, mapped, port, scope" {
     try testing.expectEqualSlices(u8, &mapped, &ma.v6);
 }
 
-test "emitInitError bounds and sanitizes" {
-    // A message with control characters and over-long input stays a
-    // single sanitized line capped at 256 bytes.
-    const long = [_]u8{0x41} ** 400 ++ [_]u8{ 0x01, 0x7f, 0x00 };
-    var buf: [max_error_line]u8 = undefined;
-    var len = (std.fmt.bufPrint(buf[0..], "ZMX_ERROR {d} ", .{gateway_init_failed}) catch return error.TestUnexpectedResult).len;
-    for (long) |c| {
-        if (c < 0x20 or c > 0x7e) continue;
-        if (len + 2 > buf.len) break;
-        buf[len] = c;
-        len += 1;
+test "emitInitError is the frozen literal line" {
+    // The exact static bytes the pre-bootstrap failure path writes:
+    // numeric code 1, the literal gateway-init-failed message, one
+    // newline, 32 bytes — well inside the 256-byte cap, printable
+    // ASCII by construction.
+    try testing.expectEqualStrings("ZMX_ERROR 1 gateway-init-failed\n", init_error_line);
+    try testing.expectEqual(@as(usize, 32), init_error_line.len);
+    try testing.expect(init_error_line.len <= max_error_line);
+    for (init_error_line[0 .. init_error_line.len - 1]) |c| {
+        try testing.expect(c >= 0x20 and c <= 0x7e);
     }
-    const line = buf[0..len];
-    try testing.expect(line.len < max_error_line);
-    try testing.expect(std.mem.startsWith(u8, line, "ZMX_ERROR 1 "));
-    for (line) |c| try testing.expect(c >= 0x20 and c <= 0x7e);
+    try testing.expectEqual(@as(u8, '\n'), init_error_line[init_error_line.len - 1]);
 }
 
 // ─── Loop-level integration: real sockets, real poll turns ───────────
@@ -404,6 +419,10 @@ const quic_test = struct {
         gw_port: u16,
         parked: std.ArrayList([]u8),
         parked_ready: std.ArrayList(bool),
+        /// Explicit signal-pipe ownership: this fixture closes only a
+        /// pipe it created — repeated fixtures never replace or leak
+        /// descriptor pairs.
+        owns_signal: bool,
 
         fn init(alloc: std.mem.Allocator, psk: *const [32]u8) !Loop {
             // A pipe stands in for the daemon socket: the drain-discard
@@ -414,7 +433,7 @@ const quic_test = struct {
             var token_secret: [32]u8 = undefined;
             quic_gateway.deriveTokenSecret(&token_secret, psk);
             defer std.crypto.secureZero(u8, &token_secret);
-            const gw = try Gateway.init(alloc, testing.io, fds[0], gw_sock, psk, &token_secret);
+            var gw = try Gateway.init(alloc, testing.io, fds[0], gw_sock, psk, &token_secret);
             const client = try Transport.createClient(alloc, .{
                 .psk = psk,
                 .scid = .{ 0x21, 0x22, 0x23, 0x24 },
@@ -425,12 +444,12 @@ const quic_test = struct {
                 quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, client_sock.bound_port),
                 quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, gw_sock.bound_port),
             );
-            try signal.openSignalPipe();
-            var anchored = gw;
-            anchored.quic.bootstrap_emitted_ns = lib_posix.nowNs();
+            const owns_signal = try signal.acquireSignalPipe();
+            // Anchor on the local var — one struct, no copies.
+            gw.quic.bootstrap_emitted_ns = lib_posix.nowNs();
             return .{
                 .alloc = alloc,
-                .gw = anchored,
+                .gw = gw,
                 .daemon_fd = fds[1],
                 .client_sock = client_sock,
                 .client = client,
@@ -438,6 +457,7 @@ const quic_test = struct {
                 .gw_port = gw_sock.bound_port,
                 .parked = .empty,
                 .parked_ready = .empty,
+                .owns_signal = owns_signal,
             };
         }
 
@@ -455,8 +475,8 @@ const quic_test = struct {
             self.client.destroy();
             self.client_sock.close();
             lib_posix.close(self.daemon_fd);
-            var gw = self.gw;
-            gw.deinit();
+            self.gw.deinit();
+            if (self.owns_signal) signal.closeSignalPipe();
         }
 
         fn clientPump(self: *Loop, now: i64) !void {

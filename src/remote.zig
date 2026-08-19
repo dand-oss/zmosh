@@ -171,6 +171,10 @@ pub fn connectRemote(
     };
     const result = parseConnectLine(connect_line) catch |err| {
         log.err("failed to parse connect line: {s}", .{@errorName(err)});
+        // Narrow propagation: only the protocol token survives — the
+        // old client must reject `quic` VISIBLY; every other parser
+        // failure stays InvalidConnectLine as before.
+        if (err != error.UnsupportedProtocol) return error.InvalidConnectLine;
         return err;
     };
 

@@ -31,9 +31,11 @@ pub fn generateKey(io: std.Io) !Key {
 const base64 = std.base64.standard;
 const encoded_key_len = base64.Encoder.calcSize(key_length);
 
-pub fn keyToBase64(key: Key) [encoded_key_len]u8 {
+/// Borrowed by pointer: the caller's key is never copied into this
+/// frame (it is wipe-on-exit secret material at the call sites).
+pub fn keyToBase64(key: *const Key) [encoded_key_len]u8 {
     var out: [encoded_key_len]u8 = undefined;
-    _ = base64.Encoder.encode(&out, &key);
+    _ = base64.Encoder.encode(&out, key);
     return out;
 }
 
@@ -177,7 +179,7 @@ test "nonce direction bit" {
 
 test "base64 key round-trip" {
     const key = try generateKey(std.testing.io);
-    const encoded = keyToBase64(key);
+    const encoded = keyToBase64(&key);
     const decoded = try keyFromBase64(&encoded);
     try std.testing.expectEqual(key, decoded);
 }
