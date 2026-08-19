@@ -207,12 +207,13 @@ pub const QuicGateway = struct {
         };
     }
 
-    /// Exactly-once cleanup: retire the adopted candidate if present,
-    /// release the registry and the policy (whose deinit wipes its
-    /// token secret), then wipe the owned PSK.
+    /// Exactly-once cleanup: retire the adopted candidate if present
+    /// (through the one fail-closed helper — best-effort here, since
+    /// teardown cannot propagate), release the registry and the policy
+    /// (whose deinit wipes its token secret), then wipe the owned PSK.
     pub fn deinit(self: *QuicGateway) void {
         if (self.hasCandidate()) {
-            _ = self.registry.retire(self.candidate().transport.lifecycle, 1) catch {};
+            self.retireCandidate() catch {};
         }
         self.registry.deinit();
         self.policy.deinit();
@@ -274,8 +275,11 @@ pub const QuicGateway = struct {
                     self.handshake_duration_ns = now - self.bootstrap_emitted_ns;
                     self.counters.handshakes_confirmed += 1;
                     self.state = .established;
-                    self.last_output_ns = now;
-                    // HANDSHAKE_DONE lets the client confirm too.
+                    // HANDSHAKE_DONE lets the client confirm too. The
+                    // output stamp is NOT advanced here: only a
+                    // successful send stamps it, so this queued frame
+                    // and the keepalive schedule stay honest until it
+                    // actually leaves.
                     try transport.connection().sendHandshakeDone();
                     log.info("quic handshake confirmed duration_ns={d}", .{self.handshake_duration_ns});
                 }
@@ -588,6 +592,18 @@ pub const QuicGateway = struct {
         }
     }
 
+    /// ONE reserved-class emission: deadline-critical output — here a
+    /// queued keepalive PING ordinary output could not send — may take
+    /// the final slot of the turn budget.
+    fn drainOneReserved(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !void {
+        if (!self.hasCandidate() or budget.outbound == 0) return;
+        const tagged = (try self.candidate().transport.pollOutboundPath(now)) orelse return;
+        if (try self.sendOwned(sock, tagged.dg, tagged.dst.remote, budget, .reserved)) {
+            self.last_output_ns = now;
+            if (tagged.emitted_ping) self.keepalive_queued = false;
+        }
+    }
+
     /// Daemon EOF: queue a CONNECTION_CLOSE and attempt it through
     /// the RESERVED class — ordinary output stopped one slot short,
     /// so no prior flood can consume the slot the close needs — then
@@ -639,19 +655,21 @@ pub const QuicGateway = struct {
             self.io.random(&self.retry_scid);
         }
         // The absolute handshake deadline, anchored at bootstrap
-        // emission and never extended.
+        // emission and never extended. Retirement goes through the
+        // one fail-closed helper.
         if (self.state != .established and self.state != .closed and
             now - self.bootstrap_emitted_ns >= handshake_deadline_ns)
         {
-            if (self.hasCandidate()) _ = self.registry.retire(self.candidate().transport.lifecycle, 1) catch {};
+            if (self.hasCandidate()) try self.retireCandidate();
             self.state = .closed;
             self.running = false;
             log.info("quic handshake deadline exceeded; gateway exiting", .{});
         }
-        // One-second keepalive. A queued-but-unsent PING is retried a
-        // full second after its ATTEMPT (no busy-loop); a new PING is
-        // queued only when none is pending AND the reserved capacity
-        // exists — an unsendable PING is never queued.
+        // One-second keepalive. A new PING is queued only when none is
+        // pending AND capacity exists — an unsendable PING is never
+        // queued — and the queued PING may take the FINAL slot through
+        // the reserved class when ordinary output has stopped one
+        // short.
         if (self.state == .established and self.running) {
             const due_from = if (self.keepalive_queued) self.keepalive_attempt_ns else self.last_output_ns;
             if (now - due_from >= keepalive_interval_ns) {
@@ -661,6 +679,9 @@ pub const QuicGateway = struct {
                 }
                 self.keepalive_attempt_ns = now;
                 try self.drainCandidate(sock, now, budget);
+                if (self.keepalive_queued and budget.outbound == 1) {
+                    try self.drainOneReserved(sock, now, budget);
+                }
             }
         }
         return self.running;

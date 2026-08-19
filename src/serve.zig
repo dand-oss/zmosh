@@ -123,8 +123,11 @@ pub const Gateway = struct {
     }
 
     pub fn run(self: *Gateway) !void {
-        // SIGTERM wakes poll() through the shared self-pipe.
-        _ = try signal.acquireSignalPipe();
+        // SIGTERM wakes poll() through the shared self-pipe. The
+        // gateway closes a pipe IT created — never one an owner
+        // elsewhere is responsible for.
+        const owns_signal = try signal.acquireSignalPipe();
+        defer if (owns_signal) signal.closeSignalPipe();
         signal.installWakeHandler(@intFromEnum(lib_posix.SIG.TERM));
         while (self.running) {
             if (!try self.runOnce(self.computePollTimeoutMs())) break;
@@ -910,30 +913,24 @@ test "gateway loop: keepalive queues once, retries a full second later, clears o
     try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t1 + 500 * std.time.ns_per_ms, &budget_half));
     try testing.expectEqual(sent_base + 1, loop.gw.quic.counters.datagrams_sent);
 
-    // A PING queued with no sendable slot STAYS queued: the next
-    // deadline is the ATTEMPT plus one second — a real future
-    // deadline, never a busy-loop.
+    // A PING queued with ONE slot left LEAVES through the RESERVED
+    // class — ordinary output stops one short, and the keepalive is
+    // exactly the deadline-critical output that slot exists for.
     const t2 = t1 + 2 * std.time.ns_per_s;
     var budget_one = quic_gateway.TurnBudget{ .outbound = 1 };
     try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t2, &budget_one));
-    try testing.expect(loop.gw.quic.keepalive_queued);
-    try testing.expectEqual(@as(usize, 1), conn.pending_ping_count);
-    try testing.expectEqual(sent_base + 1, loop.gw.quic.counters.datagrams_sent);
-    try testing.expectEqual(t2 + quic_gateway.keepalive_interval_ns, loop.gw.quic.nextDeadline().?);
-
-    // One second later with a full budget: the EXISTING PING is
-    // drained — no second one is queued (pending returns to zero) —
-    // and the successful emission clears the flag.
-    var budget_full = quic_gateway.TurnBudget{};
-    try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t2 + quic_gateway.keepalive_interval_ns, &budget_full));
-    try testing.expectEqual(sent_base + 2, loop.gw.quic.counters.datagrams_sent);
     try testing.expect(!loop.gw.quic.keepalive_queued);
     try testing.expectEqual(@as(usize, 0), conn.pending_ping_count);
-    try loop.clientDrain(t2 + quic_gateway.keepalive_interval_ns + 1);
-    try loop.clientPump(t2 + quic_gateway.keepalive_interval_ns + 1);
+    try testing.expectEqual(sent_base + 2, loop.gw.quic.counters.datagrams_sent);
+    try testing.expectEqual(t2, loop.gw.quic.last_output_ns);
+    try loop.clientDrain(t2 + 1);
+    try loop.clientPump(t2 + 1);
     _ = try loop.gw.runOnce(0);
 
-    // The budget-refused branch: an unsendable PING is never queued.
+    // The budget-refused branch: with an EMPTY budget no PING is ever
+    // queued (an unsendable PING is never queued) and nothing is sent.
+    // The expired deadline deliberately yields an immediate next turn
+    // with a FRESH budget — next-turn retry, not a stranded PING.
     const t3 = t2 + 4 * std.time.ns_per_s;
     var budget_zero = quic_gateway.TurnBudget{ .outbound = 0 };
     try testing.expect(try loop.gw.quic.serviceDue(&loop.gw.udp_sock, t3, &budget_zero));
