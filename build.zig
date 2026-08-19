@@ -6,6 +6,20 @@ const linux_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
 };
 
+/// Returns the 40-hex commit SHA at the end of a zon dependency URL
+/// (`...ghostty/#<sha>` or `...quicz#<sha>`), or null when the URL does
+/// not end in exactly 40 lowercase hex digits.
+fn extractCommitSha(url: []const u8) ?[]const u8 {
+    const hash_start = (std.mem.lastIndexOfScalar(u8, url, '#') orelse return null) + 1;
+    const sha = url[hash_start..];
+    if (sha.len != 40) return null;
+    for (sha) |c| {
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!is_hex) return null;
+    }
+    return sha;
+}
+
 const macos_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .x86_64, .os_tag = .macos },
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
@@ -22,6 +36,13 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version);
     const ghostty_ver = build_zig_zon.dependencies.ghostty.hash;
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
+    // The snapshot-abi fingerprint pairs the pin's commit (40 lowercase
+    // hex after the last '#' of the zon URL) with its package hash. A
+    // malformed pin fails the build loudly rather than silently
+    // producing a wrong fingerprint.
+    const ghostty_commit = extractCommitSha(build_zig_zon.dependencies.ghostty.url) orelse
+        @panic("build.zig.zon ghostty .url has no trailing 40-hex commit SHA");
+    options.addOption([]const u8, "ghostty_commit", ghostty_commit);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -95,6 +116,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         test_module.addImport("quicz", quicz_test_dep.module("quicz"));
+        // quic_wire.zig reads the fingerprint inputs at comptime; the
+        // test module must see the same build options as the binary.
+        test_module.addOptions("build_options", options);
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,
