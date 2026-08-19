@@ -587,6 +587,13 @@ pub const QuicGateway = struct {
         return self.candidate().transport;
     }
 
+    /// Bounded egress drain for the session's stream output: whatever
+    /// the application queued into quicz leaves in THIS turn, without
+    /// waiting for the next inbound datagram or a PTO.
+    pub fn drainEgress(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !void {
+        return self.drainCandidate(sock, now, budget);
+    }
+
     /// ONE reserved-class emission: deadline-critical output — here a
     /// queued keepalive PING ordinary output could not send — may take
     /// the final slot of the turn budget.

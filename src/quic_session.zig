@@ -141,6 +141,9 @@ pub const QuicSession = struct {
     end_reason_len: usize = 0,
     end_deadline_ns: i64 = 0,
     final_frame: FinalFrame = .none,
+    /// The peer STOPPED_SENDING a stream we relay onto: end cleanly
+    /// with session_ended at the next turn boundary.
+    send_stopped: bool = false,
     closed: bool = false,
 
     counters: Counters = .{},
@@ -217,6 +220,13 @@ pub const QuicSession = struct {
         return self.enterTerminal(now, .session_ended, "daemon closed", .session_end, null);
     }
 
+    /// An oversized daemon frame failed the bounded reader's cap before
+    /// its payload accumulated: fail closed (a large legacy VT replay
+    /// does not fit Q3; Q4's chunked snapshots are the durable fix).
+    pub fn onDaemonOversizedFrame(self: *QuicSession, now: i64) !void {
+        return self.enterTerminal(now, .internal_error, "oversized daemon frame", .error_frame, null);
+    }
+
     /// serve calls this once the daemon-bound buffer has fully flushed;
     /// it advances an ending_unix session to stream settlement.
     pub fn onUnixFlushed(self: *QuicSession, now: i64) !void {
@@ -239,6 +249,9 @@ pub const QuicSession = struct {
 
         try self.trySendPendingControl();
         try self.pumpPendingOutput(false);
+        if (self.send_stopped and !self.closedOrEnding()) {
+            return self.enterTerminal(now, .session_ended, "peer stopped the stream", .session_end, null);
+        }
 
         var byte_budget: usize = app_byte_budget_per_turn;
         var frame_budget: usize = control_frame_budget_per_turn;
@@ -522,6 +535,11 @@ pub const QuicSession = struct {
         const fin = self.pending_control_fin and n == self.pending_control.items.len;
         self.transport.connection().sendOnStream(control_stream_id, self.pending_control.items[0..n], fin) catch |e| switch (e) {
             error.FlowControlBlocked => return,
+            // The peer STOPPED_SENDING: stop relaying, close cleanly.
+            error.StreamClosed => {
+                self.send_stopped = true;
+                return;
+            },
             else => return e,
         };
         const remaining = self.pending_control.items.len - n;
@@ -624,6 +642,12 @@ pub const QuicSession = struct {
             };
             conn.sendOnStream(output_stream_id, self.pending_output.items[0..n], false) catch |e| switch (e) {
                 error.FlowControlBlocked => return,
+                // The peer STOP_SENDING the output stream: stop
+                // relaying and end the session cleanly.
+                error.StreamClosed => {
+                    self.send_stopped = true;
+                    return;
+                },
                 else => return e,
             };
             self.counters.output_bytes += n;

@@ -3,10 +3,15 @@
 //! One poll() loop bridges the daemon's Unix socket to the client's
 //! QUIC connection. QUIC is this branch's active transport; the custom
 //! UDP transport files stay untouched until the reviewed removal
-//! checkpoint. No daemon IPC bytes are relayed yet: Q3 owns the frozen
-//! stream preface and roles, so daemon output is drained and discarded
-//! (bounded) while the gateway stays alive for connection lifecycle
-//! and teardown.
+//! checkpoint. The Q3 relay carries application data both ways: daemon
+//! `.Output` flows to the epoch-1 output stream, input stream bytes and
+//! control frames map to daemon IPC (first RESIZE → `.Init`, later
+//! RESIZE → `.Resize`, DETACH → `.Detach`), daemon `.Resize` is
+//! answered locally with the last client size, and daemon EOF sends
+//! SESSION_END then settles both streams before closing (code 9). All
+//! daemon I/O is bounded: the reader caps one frame (header + 64 KiB,
+//! oversized declarations rejected before accumulation) and the writer
+//! is a 64 KiB buffer flushed on a dynamic POLL.OUT arm.
 //!
 //! Bootstrap ordering is contract: EVERY fallible initialization
 //! completes before the success line prints; pre-success failures emit
@@ -83,6 +88,14 @@ pub const Gateway = struct {
     unix_fd: i32,
     quic: quic_gateway.QuicGateway,
     unix_read_buf: ipc.SocketBuffer,
+    /// The ZMQ1 application session, attached exactly once when the
+    /// QUIC connection establishes. This Gateway owns it; the quic
+    /// gateway stays connection-lifecycle only.
+    session: ?quic_session.QuicSession = null,
+    /// Bounded daemon-bound writes, flushed on the dynamic POLL.OUT arm.
+    unix_out: quic_session.UnixWriteBuf,
+    daemon_frames_ignored: usize = 0,
+    daemon_oversized_frames: usize = 0,
     running: bool,
 
     /// The real constructor: serveMain and tests alike pass the
@@ -99,8 +112,10 @@ pub const Gateway = struct {
             log.err("failed to read local socket identity: {s}", .{@errorName(err)});
             return err;
         };
-        var unix_read_buf = try ipc.SocketBuffer.init(alloc);
+        var unix_read_buf = try ipc.SocketBuffer.initBounded(alloc, ipc.gateway_frame_cap);
         errdefer unix_read_buf.deinit();
+        var unix_out = quic_session.UnixWriteBuf.init(alloc);
+        errdefer unix_out.deinit();
         var quic = try quic_gateway.QuicGateway.init(alloc, io, psk, token_secret, local, 0);
         // Deinit in place: a copy would wipe only the copy's PSK.
         errdefer quic.deinit();
@@ -110,6 +125,7 @@ pub const Gateway = struct {
             .unix_fd = unix_fd,
             .quic = quic,
             .unix_read_buf = unix_read_buf,
+            .unix_out = unix_out,
             .running = true,
         };
     }
@@ -151,7 +167,16 @@ pub const Gateway = struct {
         var poll_fds: [3]lib_posix.pollfd = undefined;
         poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = lib_posix.POLL.IN, .revents = 0 };
         poll_fds[1] = .{ .fd = signal.sig_pipe[0], .events = lib_posix.POLL.IN, .revents = 0 };
-        poll_fds[2] = .{ .fd = self.unix_fd, .events = lib_posix.POLL.IN, .revents = 0 };
+        // The daemon fd: POLL.IN only while the session can accept
+        // output (flow-control backpressure stops the reads), plus a
+        // dynamic POLL.OUT arm while daemon-bound writes are pending.
+        const daemon_in = if (self.session) |*s| s.wantsDaemonRead() else true;
+        const daemon_events: i16 = if (daemon_in) @as(i16, lib_posix.POLL.IN) else 0;
+        poll_fds[2] = .{
+            .fd = self.unix_fd,
+            .events = daemon_events | (if (self.unix_out.empty()) @as(i16, 0) else @as(i16, lib_posix.POLL.OUT)),
+            .revents = 0,
+        };
         _ = try lib_posix.poll(&poll_fds, poll_timeout_ms);
         const now: i64 = lib_posix.nowNs();
         return self.processReadyAndDue(now, poll_fds);
@@ -176,13 +201,29 @@ pub const Gateway = struct {
                 return false;
             }
         }
+        // The session attaches exactly once, at establishment; its
+        // turn runs after the daemon relay so this turn's daemon
+        // output is pumped in the same pass.
+        self.ensureSession();
         if (poll_fds[2].revents & (lib_posix.POLL.IN | lib_posix.POLL.HUP | lib_posix.POLL.ERR) != 0) {
-            try self.drainDaemon(now, &budget);
+            try self.relayDaemon(now, &budget);
             if (!self.running) return false;
         }
+        if (poll_fds[2].revents & lib_posix.POLL.OUT != 0) {
+            try self.flushUnix(now);
+        }
+        if (self.session) |*s| {
+            try s.processTurn(now, &self.unix_out);
+        }
         const alive = try self.quic.serviceDue(&self.udp_sock, now, &budget);
-        if (!alive) self.running = false;
-        return alive;
+        if (!alive) {
+            self.running = false;
+            return false;
+        }
+        // Stream egress queued by the session leaves THIS turn — no
+        // waiting for the next inbound datagram or PTO.
+        try self.quic.drainEgress(&self.udp_sock, now, &budget);
+        return self.running;
     }
 
     /// The single composed timeout: the earliest QUIC deadline (recovery/
@@ -190,22 +231,46 @@ pub const Gateway = struct {
     /// one-second keepalive) as milliseconds remaining, bounded above
     /// by one second so staleness cannot accumulate.
     fn computePollTimeoutMs(self: *const Gateway) i32 {
-        const deadline = self.quic.nextDeadline() orelse return 1000;
         const now: i64 = lib_posix.nowNs();
-        const remaining_ns = deadline - now;
+        // The session's terminal deadline composes with the QUIC
+        // deadlines so it fires even when no fd is ready.
+        var deadline: ?i64 = self.quic.nextDeadline();
+        if (self.session) |*s| {
+            if (s.nextDeadline(now)) |sd| {
+                deadline = if (deadline) |d| @min(d, sd) else sd;
+            }
+        }
+        const d = deadline orelse return 1000;
+        const remaining_ns = d - now;
         if (remaining_ns <= 0) return 0;
         const ms = @divFloor(remaining_ns, std.time.ns_per_ms);
         return @intCast(@min(ms, 1000));
     }
 
-    /// Drain-and-discard the daemon socket (no relay in Q2), bounded
-    /// per turn. Daemon closure queues the QUIC CONNECTION_CLOSE and
-    /// attempts it through the reserved slot before exiting.
-    fn drainDaemon(self: *Gateway, now: i64, budget: *quic_gateway.TurnBudget) !void {
-        var discarded: usize = 0;
-        while (discarded < max_daemon_discard_per_turn) {
+    /// Relay the daemon socket: bounded reads through the bounded
+    /// reader (an oversized DECLARED frame fails closed), `.Output` to
+    /// the session's output stream, `.Resize` answered locally with the
+    /// last client size (never a second `.Init`), `.Switch` terminal
+    /// (Q5), everything else counted and ignored — the local attach
+    /// client's behavior. Daemon EOF runs the SESSION_END terminal
+    /// sequence when a session exists; the pre-session fallback keeps
+    /// the Q2 CONNECTION_CLOSE path.
+    fn relayDaemon(self: *Gateway, now: i64, budget: *quic_gateway.TurnBudget) !void {
+        if (self.session != null and !self.session.?.wantsDaemonRead()) return;
+        var read_total: usize = 0;
+        while (read_total < max_daemon_discard_per_turn) {
             const n = self.unix_read_buf.read(self.unix_fd) catch |err| switch (err) {
                 error.WouldBlock => return,
+                error.FrameTooLarge => {
+                    log.warn("oversized daemon frame rejected at the cap", .{});
+                    self.daemon_oversized_frames += 1;
+                    if (self.session) |*s| {
+                        try s.onDaemonOversizedFrame(now);
+                    } else {
+                        self.running = false;
+                    }
+                    return;
+                },
                 else => {
                     log.warn("unix read error: {s}", .{@errorName(err)});
                     self.running = false;
@@ -214,20 +279,64 @@ pub const Gateway = struct {
             };
             if (n == 0) {
                 log.info("daemon closed connection", .{});
-                self.quic.closeForDaemonExit(&self.udp_sock, now, budget) catch |err| {
-                    log.warn("daemon-close drain failed: {s}", .{@errorName(err)});
-                };
+                if (self.session) |*s| {
+                    try s.onDaemonEof(now);
+                } else {
+                    self.quic.closeForDaemonExit(&self.udp_sock, now, budget) catch |err| {
+                        log.warn("daemon-close drain failed: {s}", .{@errorName(err)});
+                    };
+                }
                 return;
             }
-            discarded += n;
-            while (self.unix_read_buf.next()) |_| {}
+            read_total += n;
+            while (self.unix_read_buf.next()) |msg| {
+                if (self.session) |*s| switch (msg.header.tag) {
+                    .Output => try s.offerDaemonOutput(msg.payload),
+                    .Resize => try s.onDaemonResize(now, &self.unix_out),
+                    .Switch => try s.onDaemonSwitch(now, &self.unix_out),
+                    else => self.daemon_frames_ignored += 1,
+                } else {
+                    // Pre-session daemon traffic is closed and counted.
+                    self.daemon_frames_ignored += 1;
+                }
+            }
         }
+    }
+
+    /// Flush daemon-bound writes on writability; when the buffer
+    /// empties, an ending_unix session advances to stream settlement.
+    fn flushUnix(self: *Gateway, now: i64) !void {
+        while (!self.unix_out.empty()) {
+            const n = lib_posix.write(self.unix_fd, self.unix_out.bytes()) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => {
+                    log.warn("unix write error: {s}", .{@errorName(err)});
+                    return;
+                },
+            };
+            if (n == 0) return;
+            self.unix_out.consume(n);
+        }
+        if (self.session) |*s| {
+            if (s.phase == .ending_unix) try s.onUnixFlushed(now);
+        }
+    }
+
+    /// Attaches the ZMQ1 session exactly once, when the QUIC
+    /// connection establishes.
+    fn ensureSession(self: *Gateway) void {
+        if (self.session != null) return;
+        const t = self.quic.establishedTransport() orelse return;
+        self.session = quic_session.QuicSession.init(self.alloc, t);
     }
 
     pub fn deinit(self: *Gateway) void {
         lib_posix.close(self.unix_fd);
         self.udp_sock.close();
         self.unix_read_buf.deinit();
+        if (self.session) |*s| s.deinit();
+        self.session = null;
+        self.unix_out.deinit();
         // In place: deinitning a copy would wipe only the copy's PSK.
         self.quic.deinit();
     }
@@ -433,9 +542,11 @@ const quic_test = struct {
         v6: bool,
 
         fn init(alloc: std.mem.Allocator, psk: *const [32]u8, v6: bool) !Loop {
-            // A pipe stands in for the daemon socket: the drain-discard
-            // and close-detection behavior under test is identical.
-            const fds = try lib_posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+            // A bidirectional nonblocking Unix socketpair stands in for
+            // the daemon's connected session socket: the relay writes
+            // daemon-bound frames and reads daemon output on the same
+            // descriptor.
+            const fds = try lib_posix.socketpairNonBlock();
             const gw_sock = try udp.UdpSocket.bind(60400, 60500);
             const client_sock = try udp.UdpSocket.bind(60600, 60700);
             var token_secret: [32]u8 = undefined;
@@ -584,39 +695,82 @@ const quic_test = struct {
         total: usize,
     };
 
-    fn peekUnixFrame(unix_out: *quic_session.UnixWriteBuf) ?UnixFrame {
-        const bytes = unix_out.bytes();
-        const total = ipc.expectedLength(bytes) orelse return null;
-        if (bytes.len < total) return null;
-        const hdr = std.mem.bytesToValue(ipc.Header, bytes[0..@sizeOf(ipc.Header)]);
-        return .{ .tag = hdr.tag, .payload = bytes[@sizeOf(ipc.Header)..total], .total = total };
+    /// Reads the daemon side of the fixture socketpair and yields one
+    /// complete frame per call (payload borrowed until the next call).
+    const DaemonReader = struct {
+        alloc: std.mem.Allocator,
+        buf: ipc.SocketBuffer,
+
+        fn init(alloc: std.mem.Allocator) !DaemonReader {
+            return .{ .alloc = alloc, .buf = try ipc.SocketBuffer.init(alloc) };
+        }
+
+        fn deinit(self: *DaemonReader) void {
+            self.buf.deinit();
+        }
+
+        fn next(self: *DaemonReader, fd: i32) !?UnixFrame {
+            while (true) {
+                _ = self.buf.read(fd) catch break;
+            }
+            const bytes = self.buf.buf.items[self.buf.head..];
+            const total = ipc.expectedLength(bytes) orelse return null;
+            if (bytes.len < total) return null;
+            const hdr = std.mem.bytesToValue(ipc.Header, bytes[0..@sizeOf(ipc.Header)]);
+            self.buf.head += total;
+            return .{ .tag = hdr.tag, .payload = bytes[@sizeOf(ipc.Header)..total], .total = total };
+        }
+    };
+
+    /// Feeds client datagrams, interleaving control-stream reads after
+    /// EACH datagram: terminal control bytes (ERROR/SESSION_END) must be
+    /// consumed before a later datagram — the CONNECTION_CLOSE of a
+    /// settled terminal sequence — makes buffered stream reads
+    /// unavailable. The Q5 attach client polls streams the same way.
+    fn clientDrainInterleaved(
+        loop: *Loop,
+        client: *quic_client.ClientSession,
+        now: i64,
+        ev: *?quic_client.ControlEvent,
+        out_acc: ?*std.ArrayList(u8),
+    ) !void {
+        var buf: [quic_transport.max_udp_payload]u8 = undefined;
+        while (true) {
+            const r = loop.client_sock.recvFrom(&buf) catch break;
+            _ = try loop.client.handleDatagram(loop.clientArrival(), now, buf[0..r.len], &challenge);
+            while (try client.pollControl()) |e| ev.* = e;
+            if (out_acc) |acc| {
+                var ob: [256]u8 = undefined;
+                while (try client.pollOutput(&ob, null)) |n| {
+                    try acc.appendSlice(loop.alloc, ob[0..n]);
+                }
+            }
+        }
     }
 
     /// One full exchange round at a synthetic timestamp: pump client
-    /// egress, run a gateway turn, feed the client, run the session
-    /// pump (which queues stream egress), and flush both directions.
-    /// The client PING after the session pump is the deterministic
-    /// inbound trigger for the gateway's egress drain (the relay
-    /// checkpoint wires a post-session drain into the production turn).
-    fn sessionRound(
+    /// egress, run the wired gateway turn (relay + session + the
+    /// post-session egress drain), feed the client — twice. Returns
+    /// the last control event observed (terminal frames must surface
+    /// even when they race the settled CONNECTION_CLOSE).
+    fn sessionRound(loop: *Loop, client: *quic_client.ClientSession, now: i64) !?quic_client.ControlEvent {
+        return sessionRoundWith(loop, client, now, null);
+    }
+
+    fn sessionRoundWith(
         loop: *Loop,
-        sess: *quic_session.QuicSession,
-        unix_out: *quic_session.UnixWriteBuf,
+        client: *quic_client.ClientSession,
         now: i64,
-    ) !void {
+        out_acc: ?*std.ArrayList(u8),
+    ) !?quic_client.ControlEvent {
+        var ev: ?quic_client.ControlEvent = null;
         try loop.clientPump(now);
         _ = try loop.gw.runOnce(0);
-        try loop.clientDrain(now);
-        try sess.processTurn(now, unix_out);
-        // The trigger PING is best-effort: after the session closes the
-        // connection it is refused — the drain already happened.
-        loop.client.connection().sendPing() catch {};
+        try clientDrainInterleaved(loop, client, now, &ev, out_acc);
         try loop.clientPump(now);
         _ = try loop.gw.runOnce(0);
-        try loop.clientDrain(now);
-        try loop.clientPump(now);
-        _ = try loop.gw.runOnce(0);
-        try loop.clientDrain(now);
+        try clientDrainInterleaved(loop, client, now, &ev, out_acc);
+        return ev;
     }
 };
 
@@ -643,43 +797,6 @@ test "gateway loop: real-socket Retry transaction commits exactly once" {
     try testing.expect(loop.gw.quic.handshake_duration_ns >= 0);
 
     // No daemon IPC bytes were relayed: the socketpair carries nothing.
-    var probe: [64]u8 = undefined;
-    const n = std.posix.read(loop.daemon_fd, &probe) catch 0;
-    try testing.expectEqual(@as(usize, 0), n);
-}
-
-test "gateway loop: established transport is exposed; stream dispatch belongs to the session" {
-    const alloc = testing.allocator;
-    var bootstrap: [32]u8 = undefined;
-    var psk: [32]u8 = undefined;
-    try testing.io.randomSecure(&bootstrap);
-    quic_transport.derivePsk(&psk, &bootstrap);
-    defer std.crypto.secureZero(u8, &bootstrap);
-    defer std.crypto.secureZero(u8, &psk);
-
-    var loop = try quic_test.Loop.init(alloc, &psk, false);
-    defer loop.deinit();
-    try quic_test.driveHandshake(&loop);
-
-    // The borrowed established transport is the session's seam. Stream
-    // data arriving before a session is attached is simply NOT consumed
-    // by the gateway itself: enforcement moved to quic_session.zig
-    // (wired by the relay checkpoint), which rejects it terminally.
-    const t = loop.gw.quic.establishedTransport();
-    try testing.expect(t != null);
-    const s = try loop.client.connection().openStream();
-    try loop.client.connection().sendOnStream(s, "pre-session", false);
-    const now: i64 = lib_posix.nowNs();
-    try loop.clientPump(now);
-    _ = try loop.gw.runOnce(0);
-    try loop.clientDrain(now);
-
-    try testing.expect(loop.gw.quic.state == .established);
-    try testing.expect(loop.gw.running);
-    // Unconsumed: quicz still buffers the bytes (no credit granted).
-    const st = (try t.?.connection().streamState(s)) orelse return error.NoStreamState;
-    try testing.expect((st.receive_buffered orelse 0) > (st.receive_read_offset orelse 0));
-    // The daemon pipe received nothing.
     var probe: [64]u8 = undefined;
     const n = std.posix.read(loop.daemon_fd, &probe) catch 0;
     try testing.expectEqual(@as(usize, 0), n);
@@ -1232,20 +1349,23 @@ test "gateway loop: daemon EOF close survives the ordinary budget floor" {
 
 fn zmq1Setup(alloc: std.mem.Allocator, psk: *const [32]u8) !struct {
     loop: quic_test.Loop,
-    sess: quic_session.QuicSession,
-    unix_out: quic_session.UnixWriteBuf,
     client: quic_client.ClientSession,
+
+    pub fn session(self: *@This()) !*quic_session.QuicSession {
+        return if (self.loop.gw.session) |*s| s else error.NoSession;
+    }
+
+    pub fn unixOut(self: *@This()) *quic_session.UnixWriteBuf {
+        return &self.loop.gw.unix_out;
+    }
 } {
     var loop = try quic_test.Loop.init(alloc, psk, false);
     errdefer loop.deinit();
     try quic_test.driveHandshake(&loop);
-    const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
-    var sess = quic_session.QuicSession.init(alloc, t);
-    errdefer sess.deinit();
-    var unix_out = quic_session.UnixWriteBuf.init(alloc);
-    errdefer unix_out.deinit();
+    // One gateway turn attaches the gateway-owned session.
+    _ = try loop.gw.runOnce(0);
     const client = try quic_client.ClientSession.init(alloc, loop.client);
-    return .{ .loop = loop, .sess = sess, .unix_out = unix_out, .client = client };
+    return .{ .loop = loop, .client = client };
 }
 
 test "zmq1 session: HELLO → ACK → RESIZE/.Init → input relay → output epoch 1" {
@@ -1259,21 +1379,25 @@ test "zmq1 session: HELLO → ACK → RESIZE/.Init → input relay → output ep
 
     var z = try zmq1Setup(alloc, &psk);
     defer z.loop.deinit();
-    defer z.sess.deinit();
-    defer z.unix_out.deinit();
     defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
     const base: i64 = lib_posix.nowNs();
 
     // HELLO flows; the client validates HELLO_ACK.
     var ack: ?quic_client.ControlEvent = null;
     for (0..8) |i| {
-        try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ack = e;
+            break;
+        }
         ack = try z.client.pollControl();
         if (ack != null) break;
     }
     try testing.expect(ack != null);
     try testing.expect(ack.? == .hello_ack);
-    try testing.expect(z.sess.phase == .awaiting_resize);
+    try testing.expect(sess.phase == .awaiting_resize);
 
     // The output stream opened with its header (epoch 1); the client
     // does NOT expose it until HELLO_ACK validated — which it now has.
@@ -1285,30 +1409,28 @@ test "zmq1 session: HELLO → ACK → RESIZE/.Init → input relay → output ep
 
     // First RESIZE → daemon `.Init` with the BE-decoded size.
     try z.client.sendResize(37, 101, 0, 0);
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
     {
-        const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInit;
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
         try testing.expectEqual(ipc.Tag.Init, f.tag);
         const rz = std.mem.bytesToValue(ipc.Resize, f.payload[0..@sizeOf(ipc.Resize)]);
         try testing.expectEqual(@as(u16, 37), rz.rows);
         try testing.expectEqual(@as(u16, 101), rz.cols);
-        z.unix_out.consume(f.total);
     }
-    try testing.expect(z.sess.phase == .active);
+    try testing.expect(sess.phase == .active);
 
     // Input bytes → daemon `.Input` frames.
     try z.client.sendInput("hello-zmq1");
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
     {
-        const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInput;
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInput;
         try testing.expectEqual(ipc.Tag.Input, f.tag);
         try testing.expectEqualStrings("hello-zmq1", f.payload);
-        z.unix_out.consume(f.total);
     }
 
     // Daemon output relays on the epoch-1 output stream.
-    try z.sess.offerDaemonOutput("relay-me");
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 300 + @as(i64, @intCast(i)));
+    try ipc.send(z.loop.daemon_fd, .Output, "relay-me");
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
     var got: []const u8 = "";
     for (0..4) |_| {
         const n = (try z.client.pollOutput(&obuf, null)) orelse continue;
@@ -1319,15 +1441,14 @@ test "zmq1 session: HELLO → ACK → RESIZE/.Init → input relay → output ep
 
     // A second RESIZE forwards as `.Resize` — never a second `.Init`.
     try z.client.sendResize(40, 120, 0, 0);
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 400 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
     {
-        const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoSecondResize;
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoSecondResize;
         try testing.expectEqual(ipc.Tag.Resize, f.tag);
         const rz = std.mem.bytesToValue(ipc.Resize, f.payload[0..@sizeOf(ipc.Resize)]);
         try testing.expectEqual(@as(u16, 40), rz.rows);
-        z.unix_out.consume(f.total);
     }
-    try testing.expect(!z.sess.closedOrEnding());
+    try testing.expect(!sess.closedOrEnding());
 }
 
 test "zmq1 session: HELLO mismatches reject with the frozen codes and never initialize the daemon" {
@@ -1349,11 +1470,11 @@ test "zmq1 session: HELLO mismatches reject with the frozen codes and never init
         var loop = try quic_test.Loop.init(alloc, &psk, false);
         defer loop.deinit();
         try quic_test.driveHandshake(&loop);
-        const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
-        var sess = quic_session.QuicSession.init(alloc, t);
-        defer sess.deinit();
-        var unix_out = quic_session.UnixWriteBuf.init(alloc);
-        defer unix_out.deinit();
+        // Attach the gateway-owned session.
+        _ = try loop.gw.runOnce(0);
+        const sess = if (loop.gw.session) |*x| x else return error.NoSession;
+        var dr = try quic_test.DaemonReader.init(alloc);
+        defer dr.deinit();
         var client = quic_client.ClientSession.initSilent(alloc, loop.client);
         defer client.deinit();
 
@@ -1380,7 +1501,10 @@ test "zmq1 session: HELLO mismatches reject with the frozen codes and never init
         const base: i64 = lib_posix.nowNs();
         var err_ev: ?quic_client.ControlEvent = null;
         for (0..10) |i| {
-            try quic_test.sessionRound(&loop, &sess, &unix_out, base + @as(i64, @intCast(i)));
+            if (try quic_test.sessionRound(&loop, &client, base + @as(i64, @intCast(i)))) |e| {
+                err_ev = e;
+                break;
+            }
             err_ev = try client.pollControl();
             if (err_ev != null) break;
         }
@@ -1389,8 +1513,9 @@ test "zmq1 session: HELLO mismatches reject with the frozen codes and never init
             .err => |e| try testing.expectEqual(c.code, e.code),
             else => return error.TestUnexpectedResult,
         }
-        // Authorization precedes session data: no `.Init` was sent.
-        try testing.expect(unix_out.empty());
+        // Authorization precedes session data: no `.Init` was ever
+        // written to the daemon socket.
+        try testing.expect((try dr.next(loop.daemon_fd)) == null);
         try testing.expect(sess.closedOrEnding());
     }
 }
@@ -1406,42 +1531,61 @@ test "zmq1 session: SNAPSHOT_REQUEST is answered nonterminally and the relay con
 
     var z = try zmq1Setup(alloc, &psk);
     defer z.loop.deinit();
-    defer z.sess.deinit();
-    defer z.unix_out.deinit();
     defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
     const base: i64 = lib_posix.nowNs();
 
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
-    const ev = try z.client.pollControl();
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
     try testing.expect(ev != null and ev.? == .hello_ack);
     try z.client.sendResize(24, 80, 0, 0);
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
-    if (quic_test.peekUnixFrame(&z.unix_out)) |f| z.unix_out.consume(f.total) else return error.NoInit;
-    try testing.expect(z.sess.phase == .active);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+    try testing.expect(sess.phase == .active);
 
     // Two SNAPSHOT_REQUESTs → two ERROR(unimplemented) responses, and
     // the session stays active.
     var errors_seen: usize = 0;
     for (0..2) |_| {
         try z.client.sendSnapshotRequest();
-        for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
-        while (try z.client.pollControl()) |e| {
-            switch (e) {
-                .err => |er| {
-                    try testing.expectEqual(quic_wire.ErrCode.unimplemented.code(), er.code);
-                    errors_seen += 1;
-                },
-                else => {},
+        for (0..8) |i| {
+            if (try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)))) |e| {
+                switch (e) {
+                    .err => |er| {
+                        try testing.expectEqual(quic_wire.ErrCode.unimplemented.code(), er.code);
+                        errors_seen += 1;
+                    },
+                    else => {},
+                }
+            }
+            while (try z.client.pollControl()) |e| {
+                switch (e) {
+                    .err => |er| {
+                        try testing.expectEqual(quic_wire.ErrCode.unimplemented.code(), er.code);
+                        errors_seen += 1;
+                    },
+                    else => {},
+                }
             }
         }
     }
     try testing.expectEqual(@as(usize, 2), errors_seen);
-    try testing.expect(!z.sess.closedOrEnding());
+    try testing.expect(!sess.closedOrEnding());
 
     // The relay still serves input after the nonterminal responses.
     try z.client.sendInput("still-alive");
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 300 + @as(i64, @intCast(i)));
-    const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInputAfterError;
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+    const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInputAfterError;
+    try testing.expectEqual(ipc.Tag.Input, f.tag);
     try testing.expectEqualStrings("still-alive", f.payload);
 }
 
@@ -1456,40 +1600,46 @@ test "zmq1 session: input before RESIZE is parked, then flows strictly after .In
 
     var z = try zmq1Setup(alloc, &psk);
     defer z.loop.deinit();
-    defer z.sess.deinit();
-    defer z.unix_out.deinit();
     defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
     const base: i64 = lib_posix.nowNs();
 
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
-    const ev = try z.client.pollControl();
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
     try testing.expect(ev != null and ev.? == .hello_ack);
 
     // Input legitimately arrives BEFORE the RESIZE. The session parks
     // it: nothing rejected, nothing consumed, no credit granted.
     try z.client.sendInput("early-input");
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
-    try testing.expect(z.sess.phase == .awaiting_resize);
-    try testing.expect(z.unix_out.empty());
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    try testing.expect(sess.phase == .awaiting_resize);
+    try testing.expect((try dr.next(z.loop.daemon_fd)) == null);
     {
-        const st = (try z.sess.transport.connection().streamState(quic_session.input_stream_id)) orelse return error.NoStreamState;
+        const st = (try sess.transport.connection().streamState(quic_session.input_stream_id)) orelse return error.NoStreamState;
         try testing.expect((st.receive_buffered orelse 0) > (st.receive_read_offset orelse 0));
     }
 
     // The first RESIZE maps to `.Init`; the parked input then flows —
     // strictly after it in the daemon-bound buffer.
     try z.client.sendResize(30, 90, 0, 0);
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
     {
-        const f1 = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInit;
+        const f1 = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
         try testing.expectEqual(ipc.Tag.Init, f1.tag);
-        z.unix_out.consume(f1.total);
-        const f2 = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoParkedInput;
+        const f2 = (try dr.next(z.loop.daemon_fd)) orelse return error.NoParkedInput;
         try testing.expectEqual(ipc.Tag.Input, f2.tag);
         try testing.expectEqualStrings("early-input", f2.payload);
-        z.unix_out.consume(f2.total);
     }
-    try testing.expect(!z.sess.closedOrEnding());
+    try testing.expect(!sess.closedOrEnding());
 }
 
 test "zmq1 session: a second control stream is rejected by the id scan" {
@@ -1503,13 +1653,19 @@ test "zmq1 session: a second control stream is rejected by the id scan" {
 
     var z = try zmq1Setup(alloc, &psk);
     defer z.loop.deinit();
-    defer z.sess.deinit();
-    defer z.unix_out.deinit();
     defer z.client.deinit();
+    const sess = try z.session();
     const base: i64 = lib_posix.nowNs();
 
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
-    const ev = try z.client.pollControl();
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
     try testing.expect(ev != null and ev.? == .hello_ack);
 
     // A second bidi stream (id 4) carrying a control preface.
@@ -1521,7 +1677,10 @@ test "zmq1 session: a second control stream is rejected by the id scan" {
 
     var err_ev: ?quic_client.ControlEvent = null;
     for (0..10) |i| {
-        try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)))) |e| {
+            err_ev = e;
+            break;
+        }
         err_ev = try z.client.pollControl();
         if (err_ev != null) break;
     }
@@ -1530,7 +1689,7 @@ test "zmq1 session: a second control stream is rejected by the id scan" {
         .err => |e| try testing.expectEqual(quic_wire.ErrCode.stream_cardinality.code(), e.code),
         else => return error.TestUnexpectedResult,
     }
-    try testing.expect(z.sess.closedOrEnding());
+    try testing.expect(sess.closedOrEnding());
 }
 
 test "zmq1 session: stream-2 data with no control stream closes immediately without a control write" {
@@ -1545,11 +1704,10 @@ test "zmq1 session: stream-2 data with no control stream closes immediately with
     var loop = try quic_test.Loop.init(alloc, &psk, false);
     defer loop.deinit();
     try quic_test.driveHandshake(&loop);
+    // Attach the gateway-owned session.
+    _ = try loop.gw.runOnce(0);
+    const sess = if (loop.gw.session) |*x| x else return error.NoSession;
     const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
-    var sess = quic_session.QuicSession.init(alloc, t);
-    defer sess.deinit();
-    var unix_out = quic_session.UnixWriteBuf.init(alloc);
-    defer unix_out.deinit();
 
     // The client never opens stream 0; input data arrives first. This
     // is the no-control-stream fatal arm: an immediate application
@@ -1564,11 +1722,11 @@ test "zmq1 session: stream-2 data with no control stream closes immediately with
     const base: i64 = lib_posix.nowNs();
     try loop.clientPump(base);
     _ = try loop.gw.runOnce(0);
-    try loop.clientDrain(base);
-    try sess.processTurn(base, &unix_out);
 
     try testing.expect(sess.closed);
-    try testing.expect(unix_out.empty());
+    var dr2 = try quic_test.DaemonReader.init(alloc);
+    defer dr2.deinit();
+    try testing.expect((try dr2.next(loop.daemon_fd)) == null);
     // No control send side was created on the server.
     const st = try t.connection().streamState(quic_session.control_stream_id);
     try testing.expect(st == null);
@@ -1585,43 +1743,345 @@ test "zmq1 session: daemon EOF sends SESSION_END and settles into a code-9 close
 
     var z = try zmq1Setup(alloc, &psk);
     defer z.loop.deinit();
-    defer z.sess.deinit();
-    defer z.unix_out.deinit();
     defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
     const base: i64 = lib_posix.nowNs();
 
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
-    const ev = try z.client.pollControl();
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
     try testing.expect(ev != null and ev.? == .hello_ack);
     try z.client.sendResize(24, 80, 0, 0);
-    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
-    if (quic_test.peekUnixFrame(&z.unix_out)) |f| z.unix_out.consume(f.total);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
 
-    // Pending output drains and FINs before SESSION_END settles.
-    try z.sess.offerDaemonOutput("last-words");
-    try z.sess.onDaemonEof(base + 200);
+    // Pending output plus a REAL daemon close in the same beat: the
+    // wired loop reads the buffered `.Output` frame, then EOF, then
+    // runs the SESSION_END terminal sequence.
+    try ipc.send(z.loop.daemon_fd, .Output, "last-words");
+    lib_posix.close(z.loop.daemon_fd);
+    z.loop.daemon_fd = -1;
 
     var end_seen = false;
-    var obuf: [64]u8 = undefined;
-    var got: []const u8 = "";
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(alloc);
     // The real client drains output every turn — before the server's
     // settle-close can make buffered bytes unreadable.
     for (0..12) |i| {
-        try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
+        if (try quic_test.sessionRoundWith(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)), &acc)) |e| {
+            if (e == .session_end) end_seen = true;
+        }
         while (try z.client.pollControl()) |e| {
             if (e == .session_end) end_seen = true;
         }
-        // Two passes per turn: the first may consume the output header
-        // alone; the second drains body bytes (real clients poll both
-        // streams every turn).
-        _ = try z.client.pollOutput(&obuf, null);
-        while (try z.client.pollOutput(&obuf, null)) |n| {
-            got = obuf[0..n];
-        }
-        if (z.sess.closed and end_seen and got.len > 0) break;
+        if (sess.closed and end_seen) break;
     }
     try testing.expect(end_seen);
-    try testing.expect(z.sess.closed);
+    try testing.expect(sess.closed);
     // The last output bytes reached the client before the end.
-    try testing.expectEqualStrings("last-words", got);
+    try testing.expect(std.mem.endsWith(u8, acc.items, "last-words"));
+}
+
+test "zmq1 relay: DETACH flushes to the daemon and closes cleanly with code 0" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
+    try testing.expect(ev != null and ev.? == .hello_ack);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+
+    try z.client.sendDetach();
+    for (0..12) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+
+    // The daemon received the `.Detach` (flushed before the close), and
+    // the session settled into a clean code-0 close.
+    const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoDetach;
+    try testing.expectEqual(ipc.Tag.Detach, f.tag);
+    try testing.expect(sess.closed);
+    try testing.expectEqual(quic_wire.ErrCode.none.code(), sess.end_code.code());
+}
+
+test "zmq1 relay: daemon .Resize is answered with .Resize, never a second .Init" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
+    try testing.expect(ev != null and ev.? == .hello_ack);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    const init_frame = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+    try testing.expectEqual(ipc.Tag.Init, init_frame.tag);
+
+    // The daemon asks for the client's size (leadership dance). The
+    // gateway replies `.Resize` with the LAST CLIENT size — a fresh
+    // `.Init` would re-trigger the terminal replay.
+    var daemon_size: ipc.Resize = .{ .rows = 10, .cols = 10 };
+    try ipc.send(z.loop.daemon_fd, .Resize, std.mem.asBytes(&daemon_size));
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+    const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoResizeReply;
+    try testing.expectEqual(ipc.Tag.Resize, f.tag);
+    const rz = std.mem.bytesToValue(ipc.Resize, f.payload[0..@sizeOf(ipc.Resize)]);
+    try testing.expectEqual(@as(u16, 24), rz.rows);
+    try testing.expectEqual(@as(u16, 80), rz.cols);
+    // Exactly ONE `.Init` for the whole session.
+    try testing.expect((try dr.next(z.loop.daemon_fd)) == null);
+    try testing.expect(!sess.closedOrEnding());
+}
+
+test "zmq1 relay: oversized daemon frame fails closed; a normal frame relays first" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
+    try testing.expect(ev != null and ev.? == .hello_ack);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+
+    // A normal 4 KiB PTY frame relays fine (the client drains output so
+    // the daemon read is not backpressured).
+    var pty: [4096]u8 = undefined;
+    @memset(&pty, 'p');
+    try ipc.send(z.loop.daemon_fd, .Output, &pty);
+    var pty_acc: std.ArrayList(u8) = .empty;
+    defer pty_acc.deinit(alloc);
+    for (0..8) |i| _ = try quic_test.sessionRoundWith(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)), &pty_acc);
+    try testing.expectEqual(@as(usize, 4096), pty_acc.items.len);
+
+    // An oversized DECLARED frame — the legacy whole-replay shape — is
+    // rejected before payload accumulation and fails the session closed.
+    const big = ipc.Header{ .tag = .Output, .len = 10 * 1024 * 1024 };
+    const big_bytes = std.mem.toBytes(big);
+    _ = try lib_posix.write(z.loop.daemon_fd, &big_bytes);
+    var err_ev: ?quic_client.ControlEvent = null;
+    for (0..10) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)))) |e| {
+            err_ev = e;
+            break;
+        }
+        err_ev = try z.client.pollControl();
+        if (err_ev != null) break;
+    }
+    try testing.expect(err_ev != null);
+    switch (err_ev.?) {
+        .err => |e| try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(z.loop.gw.daemon_oversized_frames == 1);
+    try testing.expect(sess.closedOrEnding());
+}
+
+test "zmq1 relay: terminal deadline closes with no fd events (composed timeout)" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    const base: i64 = lib_posix.nowNs();
+
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
+    try testing.expect(ev != null and ev.? == .hello_ack);
+
+    // Terminal state entered, then NO fd is ever ready and the final
+    // frame is never ACKed: the one-second composed deadline closes.
+    try sess.onDaemonEof(base + 100);
+    try testing.expect(z.loop.gw.computePollTimeoutMs() <= 1000);
+    const inert = [3]lib_posix.pollfd{
+        .{ .fd = 0, .events = 0, .revents = 0 },
+        .{ .fd = 0, .events = 0, .revents = 0 },
+        .{ .fd = 0, .events = 0, .revents = 0 },
+    };
+    _ = try z.loop.gw.processReadyAndDue(base + 100 + quic_session.settle_deadline_ns + 1, inert);
+    try testing.expect(sess.closed);
+}
+
+test "zmq1 relay: second-client Initial is discarded and the session continues" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
+    try testing.expect(ev != null and ev.? == .hello_ack);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+    const discarded_before = z.loop.gw.quic.counters.datagrams_discarded +
+        z.loop.gw.quic.registry.get(1).?.transport.counters.datagrams_discarded;
+
+    // A second client — same PSK, fresh SCID — fires its first Initial
+    // at the established gateway: discarded, session unaffected.
+    const second = try quic_transport.Transport.createClient(alloc, .{
+        .psk = &psk,
+        .scid = .{ 0x31, 0x32, 0x33, 0x34 },
+        .original_dcid = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 },
+    });
+    defer second.destroy();
+    try second.driveCrypto(.initial, base + 200);
+    if (try second.pollOutbound(base + 200)) |dg| {
+        defer alloc.free(dg);
+        try z.loop.client_sock.sendTo(dg, z.loop.gw_addr);
+    }
+    _ = try z.loop.gw.runOnce(0);
+    // The unknown-CID Initial is discarded at the transport's route
+    // layer; the gateway-level counter may also advance.
+    const transport_discards = z.loop.gw.quic.registry.get(1).?.transport.counters.datagrams_discarded;
+    try testing.expect(transport_discards + z.loop.gw.quic.counters.datagrams_discarded > discarded_before);
+    try testing.expect(!sess.closedOrEnding());
+
+    // The established relay still serves input.
+    try z.client.sendInput("still-relaying");
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+    const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInputAfterSecondClient;
+    try testing.expectEqual(ipc.Tag.Input, f.tag);
+    try testing.expectEqualStrings("still-relaying", f.payload);
+}
+
+test "zmq1 relay: client reset of the input stream ends input without an error" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    var ev: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
+    try testing.expect(ev != null and ev.? == .hello_ack);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+
+    // RESET_STREAM(input): the gateway observes the reset, stops the
+    // input relay, and the session continues (no protocol error).
+    try z.client.sendInput("before-reset");
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInputBeforeReset;
+    try z.client.transport.connection().resetStream(quic_session.input_stream_id, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+    try testing.expect(sess.input_done);
+    try testing.expect(!sess.closedOrEnding());
 }

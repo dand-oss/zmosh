@@ -1476,3 +1476,23 @@ pub fn nowNs() i64 {
     _ = system.clock_gettime(system.CLOCK.MONOTONIC, &ts);
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
+
+/// A bidirectional nonblocking Unix socketpair — the test stand-in for
+/// the daemon's connected session socket (a pipe is one-way and cannot
+/// carry the gateway's daemon-bound writes).
+pub fn socketpairNonBlock() SocketError![2]fd_t {
+    var fds: [2]fd_t = undefined;
+    const type_flags: u32 = SOCK.STREAM | SOCK.CLOEXEC | SOCK.NONBLOCK;
+    const rc = system.socketpair(AF.UNIX, type_flags, 0, &fds);
+    switch (errno(rc)) {
+        .SUCCESS => return fds,
+        .ACCES => return error.AccessDenied,
+        .AFNOSUPPORT => return error.AddressFamilyNotSupported,
+        .INVAL => return error.ProtocolFamilyNotAvailable,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS => return error.SystemResources,
+        .PROTONOSUPPORT => return error.ProtocolNotSupported,
+        else => |err| return unexpectedErrno(err),
+    }
+}
