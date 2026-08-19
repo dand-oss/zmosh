@@ -25,6 +25,7 @@ teardown() {
 }
 
 @test "remote attach rehydrates session output over UDP" {
+  skip "Q5: restored by functional remote attach once the QUIC client lands (gateway is QUIC-only since Q2 item 3)"
   run "$ZMX" run rt-output -d bash -c 'echo remote-attach-marker'
   [ "$status" -eq 0 ]
   sleep 1
@@ -44,6 +45,7 @@ teardown() {
 }
 
 @test "session prefix is applied exactly once" {
+  skip "Q5: restored by functional remote attach once the QUIC client lands (gateway is QUIC-only since Q2 item 3)"
   export ZMX_SESSION_PREFIX="pfx."
   run "$ZMX" run rt-prefix -d bash -c 'echo prefix-marker'
   [ "$status" -eq 0 ]
@@ -59,6 +61,7 @@ teardown() {
 }
 
 @test "args after the session name are not eaten as -r" {
+  skip "Q5: restored by functional remote attach once the QUIC client lands (gateway is QUIC-only since Q2 item 3)"
   run "$ZMX" run rt-args -d bash -c 'echo args-marker'
   [ "$status" -eq 0 ]
   sleep 1
@@ -74,6 +77,7 @@ teardown() {
 }
 
 @test "attach -r creates a new remote session running the forwarded command" {
+  skip "Q5: restored by functional remote attach once the QUIC client lands (gateway is QUIC-only since Q2 item 3)"
   run "$ZMX" list --short
   [[ "$output" != *"rt-new"* ]]
 
