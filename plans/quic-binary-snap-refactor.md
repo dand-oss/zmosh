@@ -1183,6 +1183,42 @@ own `Changed:` commit with `Refs: zmosh-8sd.9`, separate from every
 r7 correction commit, and the r7 correction round implements against
 q2-2.
 
+### Q3 correction addendum (2026-08-19) — supersedes the landing record's coverage claims
+
+The review of `22bcc2a` found the landing record and bead comment
+OVERSTATED coverage. **This addendum supersedes every coverage claim
+in "Q3 checkpoint landing record (2026-08-19)" above; the historical
+text is retained unchanged.** Claims that were made and NOT true at
+`22bcc2a`:
+
+1. "withheld-HELLO_ACK output parking (client)" — no such test
+   existed (only the parking GATE was implemented).
+2. Output-credit backpressure — implemented, never tested.
+3. "peer STOP_SENDING handled cleanly" — the send_stopped path
+   existed; no test ever called stopSending.
+4. Replayed-first-Initial proof — only a fresh second client was
+   tested; the captured first Initial was never replayed.
+5. HELLO mode 2 / mode 3 behavior — implemented, untested.
+6. The record's "disclosed gaps" section itself understated: also
+   missing were the client HELLO_ACK validation entirely (the client
+   accepted ANY decodable ACK — mixed-version/fingerprint rejection
+   did not exist client-side), empty-payload enforcement, malformed
+   receive handling (silently null), atomic client control writes,
+   the bounded client driver, split-boundary integration at the
+   wired level, control-credit exhaustion, zero-capacity input
+   backpressure, daemon-write fail-closed, coalesced-frame terminal
+   stop, and deterministic drop/PTO recovery.
+
+The r7 correction round (commits `9df7f24` → `69af018` → `a65c9d9` →
+`5c738f5` on q2-2) fixes all seven review findings and lands every
+proof above; 219/219 Debug and ReleaseSafe, check/builds/fmt/diff,
+adapter SLOC 467 unchanged, full Bats 58 ok / 0 failed / 4 Q5 skips.
+Remaining disclosed limitation: CLIENT-originated PTO retransmission
+of a dropped first-send datagram could not be driven through the bare
+-transport harness (the gateway-side drop recovery — the same quicz
+machinery — IS proven deterministically); the driver's pump drives the
+same serviceDueDeadline path in production.
+
 ## Phase Q4: Ghostty binary snapshot export
 
 The daemon owns the authoritative `ghostty_vt.Terminal`; the gateway cannot
