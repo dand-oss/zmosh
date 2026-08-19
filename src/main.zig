@@ -974,11 +974,11 @@ fn ensureSession(daemon: *Daemon) !EnsureSessionResult {
             defer daemon.alloc.free(session_log_path);
             try log_system.init(daemon.alloc, session_log_path);
 
-            errdefer {
+            const pty_fd = spawnPty(daemon) catch |err| {
                 posix.close(server_sock_fd);
                 dir.deleteFile(daemon.session_name) catch {};
-            }
-            const pty_fd = try spawnPty(daemon);
+                return err;
+            };
             defer {
                 posix.close(pty_fd);
                 posix.close(server_sock_fd);
