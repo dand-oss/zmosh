@@ -653,6 +653,79 @@ all new commits use the exact required `Changed:`/`Fixed:` prefixes.
 Q2 item 3 (poll-loop integration) stays LOCKED until this correction
 passes review.
 
+### Item-3 integration contract (frozen 2026-08-18)
+
+Reviewer-approved scope: complete Q2 items 3–7 on the GATEWAY ONLY.
+No runtime custom-UDP/QUIC switch (:73, :1219) — this branch's
+gateway active path becomes QUIC while the custom-transport FILES
+stay untouched until the reviewed removal checkpoint. No application
+relay: Q3 owns the frozen ZMQ1 stream preface and control/input/
+output roles; pre-Q3 application stream data is closed and counted
+with NO Q2-frozen error code. `remote.zig` keeps rejecting the
+`quic` token visibly (UnsupportedProtocol preserved instead of
+flattened into InvalidConnectLine at remote.zig:172). Exactly the
+four attach-success Bats cases (test/remote.bats:27/:46/:61/:76) are
+skipped with explicit Q5 restoration references; full Bats exits
+zero. `ZMX_UDP_PORT_RANGE` is decimal, END-EXCLUSIVE, validated as
+`1 <= start < end <= 65535`, default 60000:61000. Pre-bootstrap
+failures emit `ZMX_ERROR 1 gateway-init-failed` (sanitized single
+line, capped at 256 bytes); every fallible initialization completes
+before the success line prints, and the ABSOLUTE ten-second
+handshake deadline is anchored at that emission (covers the
+no-first-Initial case; retries never extend it; invalid traffic
+never resets state).
+
+Gateway transaction states: `awaiting_initial` → `retry_sent` →
+`candidate_uncommitted` → `handshaking_committed` (slot committed;
+ServerHello held or sent; awaiting confirmation) → `established`.
+Commit happens exactly once, before publication. The candidate's
+token comes from the expiry-aware slot accessor — never the
+reusable receive buffer. Pre-commit failure retires the candidate
+and returns to `retry_sent` with the slot still usable to its
+absolute expiry (retry SCID unchanged); after commit, a
+WouldBlock'd ServerHello send frees the datagram and QUIC recovery
+retransmits, and any later fatal error retires and exits. TWO send
+helpers: the Retry datagram is a BORROWED slot view — never freed,
+slot retained, reissued later on WouldBlock; every owned quicz
+datagram is freed after its send attempt. One poll() loop:
+compute timeout → poll → resample `nowNs()` →
+`processReadyAndDue(now)` (signal fd FIRST; ≤ 64 inbound, ≤ 64
+outbound, ≤ 64 KiB daemon discard per turn; then due work). The
+daemon socket is drained and discarded — no relay. After
+confirmation a one-second keepalive joins the deadline composition
+(at most one queued; any authenticated output satisfies it). The
+local arrival-tuple side is the STABLE wildcard socket identity
+from getsockname (honestly documented; no IP_PKTINFO in Q2;
+IPv4/native-IPv6/mapped/port/scope conversions tested).
+
+### Q2 quicz-correction contract (frozen 2026-08-18)
+
+The unchanged-q1-5 assumption is disproven by the pinned source; ONE
+narrow, contained fork correction is authorized (not a transport
+redesign). Verified defects with RED reproducers on
+`zmosh/q2-egress` (1907/1909 at d854133+tests): a timed-out bound
+challenge is requeued WITHOUT its path (connection.zig:9465 —
+`expect(requeued.path != null)` fails), and the address-neutral
+authenticated changed-path entry queues NO challenge
+(`expected 1, found 0`). The untagged correction commit provides:
+the atomic egress result `{ datagram, path_override: ?UdpTuple }`
+selected from the ACTUAL emitted frame (frame identity, not
+challenge existence), with BOTH pending PATH_CHALLENGE and
+PATH_RESPONSE bound to their paths and the path preserved through
+timeout requeue; `path_override == null` means the consumer
+resolves the committed route via its own local CID. The
+address-neutral changed-path receive entry accepts CALLER-SUPPLIED
+`[8]u8` challenge data and reports whether it queued exactly one.
+`PendingRetrySlot.storedToken(now_nanos) ?[]const u8` returns null
+when unoccupied OR expired (occupied, expired, and post-commit
+states tested). Adapter-side inspection of quicz arrays is
+forbidden. The zmosh dependency/adapter commit then repins
+`build.zig.zon` to the correction SHA + regenerated hash; the bead
+gets evidence/notes (no acceptance rewrite). The reviewed
+correction is tagged `zmosh-quic-q2-1` only after checkpoint
+approval, peel-verified, with a pin-only plan/report commit and
+exact-pin gate rerun.
+
 ### Round-3 correction contract (frozen 2026-08-18)
 
 Verdict on round 2: narrow send-back. The QUIC direction is correct
