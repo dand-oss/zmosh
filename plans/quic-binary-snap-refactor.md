@@ -1101,6 +1101,70 @@ ReleaseSafe build, fmt, diff, adapter SLOC unchanged, final full Bats);
 final evidence commit; STOP for review. No tag, no master push, no
 Q4/Q5/Q6 work, no Q5-skip restoration.
 
+### Q3 checkpoint landing record (2026-08-19) — STOPPED for review
+
+Commits (all `Refs: zmosh-8sd.9`, FF on `replant-zmx0.7`):
+`610d9a3` plan-only contract; `3f08877` quic_wire.zig + build
+ghostty_commit option + docs/quic-wire.md; `5b91b7b` ipc bounded
+reader + quic_session.zig + quic_client.zig + gateway handoff;
+`a7c4d75` serve relay (session ownership, bidirectional bounded daemon
+I/O, deadline composition, socketpair fixture) + the wired matrix.
+Bead is `zmosh-8sd.9` (bd auto-assigned the next id; the planned
+`.3` did not exist and cannot be forced).
+
+Gates at the final checkpoint: `zig build test --summary all`
+**195/195** in Debug AND ReleaseSafe (baseline 168/168 + 27 new);
+`zig build check` clean; ReleaseSafe build clean, Debug rebuilt
+afterward; `zig fmt --check` and `git diff --check` clean; frozen
+adapter SLOC **467** unchanged (`quic_transport.zig` untouched);
+full Bats **58 ok / 0 failed / 4 Q5 skips** on the second controlled
+sweep — the first sweep's single failure was `write.bats` test 4, the
+tracked pre-existing `zmosh-r3b` exact-128-KiB flake (isolated reruns
+4/5 clean with the same single signature; out of scope by the frozen
+contract).
+
+Covered by tests: golden/split/coalesced/truncated parser suites; the
+abi_id golden vector and sensitivity; the HELLO validation matrix
+(version/capability/fingerprint, each with its code, no `.Init` on
+rejection); nonterminal SNAPSHOT_REQUEST with continued relay;
+post-HELLO input parking (positive) and strictly-after-`.Init`
+delivery; withheld-HELLO_ACK output parking (client); the
+stream-2-without-stream-0 immediate arm; the second-control-stream id
+scan; the full wired round trip (HELLO → RESIZE/.Init → .Input →
+.Output → epoch 1 → second .Resize); daemon EOF → SESSION_END →
+code-9 settle with last output delivered; DETACH with `.Detach`
+flushed before a code-0 close; daemon `.Resize` answered with
+`.Resize` and exactly one `.Init` per session; oversized daemon frame
+fails closed after a normal 4 KiB frame relays; timer-only terminal
+expiry through the composed timeout; second-client Initial discarded
+with the relay intact; client reset of the input stream ends input
+without an error; peer STOP_SENDING handled cleanly.
+
+Known gaps disclosed for review (implemented, not separately proven):
+control-response backpressure through EXHAUSTED control credit with
+recovery (the test harness's interleaved drain reads control
+continuously, so credit never exhausts); input backpressure at ZERO
+unix-write capacity (the same drain keeps the buffer empty); the
+framed pre-HELLO arm (control stream present) is exercised only via
+the immediate arm plus the scan logic. Literal final-packet-drop
+injection is not available on the real-socket Loop fixture: the
+deadline bound is proven directly (timer-only expiry) and
+retransmission recovery is QUIC-intrinsic; Q1's fault-injection
+harness remains the venue for loss matrices.
+
+Notes: quic_client.zig landed in the session checkpoint (not the
+serve checkpoint) so session tests drive a real client without
+duplicating encoding; session-level tests live on the serve Loop pair
+(the repo's only Transport-pair machinery) — quic_session.zig hosts
+pair-free units. The wired tests exposed a real client-side
+constraint now recorded for Q5: terminal control/output bytes must be
+read between datagrams — a settled CONNECTION_CLOSE makes buffered
+stream reads unavailable in quicz — so the Q5 attach client must
+interleave stream drains with datagram processing (the test harness's
+`clientDrainInterleaved` is the pattern). The `a7c4d75` commit message
+contains one typo (".Dtach" for ".Detach"); pushed history is
+immutable and left as-is.
+
 ## Phase Q4: Ghostty binary snapshot export
 
 The daemon owns the authoritative `ghostty_vt.Terminal`; the gateway cannot
