@@ -1165,6 +1165,24 @@ interleave stream drains with datagram processing (the test harness's
 contains one typo (".Dtach" for ".Detach"); pushed history is
 immutable and left as-is.
 
+### Q3 correction round — dependency-sync amendment (2026-08-19)
+
+The quicz dependency advances to the upstream-synchronized successor
+**`zmosh-quic-q2-2`**: SHA `067e7bab687536c1327fb436484dee85d5368318`
+(annotated tag object `7707a10ddbddc58ea38bc3fe1a0673dcd6b2600d`,
+peel-verified local and remote), package hash
+`quicz-0.1.0-g2J976TtlwDuQSDnBkkRlktrSS35QF4F5zMq-v3prEAt`. **`zmosh-quic-q2-1`
+(`fc99692500610f1aa45aa8205bef0d239fe83eda`) remains the audited
+historical checkpoint** for everything landed through `22bcc2a`; all
+historical records above are unchanged. The repin passed compatibility
+with NO source adaptation (195/195 Debug and ReleaseSafe, check,
+ReleaseSafe build + Debug rebuild, fmt/diff, adapter SLOC 467 at
+q2-2). The fork's `backup/master-pre-q2-2-20260819-080934` branch is
+retained; nothing authorizes its deletion. This amendment lands as its
+own `Changed:` commit with `Refs: zmosh-8sd.9`, separate from every
+r7 correction commit, and the r7 correction round implements against
+q2-2.
+
 ## Phase Q4: Ghostty binary snapshot export
 
 The daemon owns the authoritative `ghostty_vt.Terminal`; the gateway cannot
