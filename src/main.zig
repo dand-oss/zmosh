@@ -12,6 +12,7 @@ const remote = @import("remote.zig");
 pub const version = build_options.version;
 pub const git_sha = build_options.git_sha;
 pub const ghostty_version = build_options.ghostty_version;
+const preserve_scrollback_sequence = "\x1b[22J";
 
 var log_system = log.LogSystem{};
 
@@ -346,6 +347,8 @@ pub fn main() !void {
         return printVersion(&cfg);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "-h")) {
         return help();
+    } else if (std.mem.eql(u8, cmd, "preserve-scrollback")) {
+        return preserveScrollback();
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
         return list(&cfg, short);
@@ -563,6 +566,17 @@ fn printCompletions(shell: completions.Shell) !void {
     try w.interface.flush();
 }
 
+fn preserveScrollback() !void {
+    var buf: [8]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try writePreserveScrollback(&w.interface);
+    try w.interface.flush();
+}
+
+fn writePreserveScrollback(writer: *std.Io.Writer) !void {
+    try writer.writeAll(preserve_scrollback_sequence);
+}
+
 fn help() !void {
     const help_text =
         \\zmosh - session persistence for terminal processes
@@ -578,6 +592,7 @@ fn help() !void {
         \\  [l]ist [--short]               List active sessions
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
         \\  [k]ill <name>                  Kill a session and all attached clients
+        \\  preserve-scrollback            Move the visible screen into scrollback and clear
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
         \\  [w]ait <name>...               Wait for session tasks to complete
         \\  [v]ersion                      Show version information
@@ -1903,6 +1918,14 @@ test "isKittyCtrlBackslash" {
     try std.testing.expect(!isKittyCtrlBackslash("\x1b[92;5:3u"));
     try std.testing.expect(!isKittyCtrlBackslash("\x1b[92;1u"));
     try std.testing.expect(!isKittyCtrlBackslash("garbage"));
+}
+
+test "preserve scrollback emits explicit scroll clear" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try writePreserveScrollback(&output.writer);
+    try std.testing.expectEqualStrings("\x1b[22J", output.writer.buffered());
 }
 
 test "writeSessionLine formats output for current session and short output" {
