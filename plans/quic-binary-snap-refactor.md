@@ -762,6 +762,97 @@ broadened. Q2 item 3 stays locked. Round-2 commits `aa58460` and
 `8173b7d` are immutable history including their missing `Refs:`
 trailers; both round-3 commits carry `Refs: zmosh-8sd.2`.
 
+### Item-3 review correction contract (frozen 2026-08-19)
+
+Verdict on the landed item-3 checkpoint (`b707bb4` → `d321d6e` →
+`ad6c477` → `eb293ea`): send-back — 2 critical, 5 major. Gates were
+independently green; the findings are production error paths and
+missing proofs. All verified against the pinned source before
+planning. Correction contracts (F1–F8), each mapping to a finding:
+
+1. **Adoption ownership (C1).** `registry.adopt` owns the record and
+   transport from its success onward; the local errdefers are guarded
+   by an `adopted` flag (the round-3 `ex_owned` pattern). Every
+   post-adoption failure routes through one fallible
+   `retireCandidate()`: on `registry.retire` failure the gateway
+   transitions `.closed`, stops, and the error propagates — retry
+   state is entered ONLY after successful retirement. `rollbackCandidate`
+   composes it and then re-enters `retry_sent`; post-commit fatal
+   retirement closes and exits. No bare `catch return` on these paths.
+2. **Bootstrap ownership and secrets (C2).** A `gateway_owns_fds`
+   flag disarms the Unix/UDP errdefers at `Gateway.init` success (no
+   double-close against `defer gw.deinit()`). `getSocketPath` and BOTH
+   fcntl failures emit the bounded error. `keyToBase64` takes
+   `*const Key`; `key`, `psk`, `token_secret`, AND `encoded_key` are
+   defer-wiped on every path. `Gateway.deinit` calls
+   `self.quic.deinit()` in place — no `var q = self.quic` copies (a
+   copy's PSK wipe leaves the original live).
+3. **Per-space deadline servicing (M1).** `pollOutbound` and
+   `pollOutboundPath` share one set of per-space helpers
+   (`pollInitialSpace`/`pollHandshakeSpace`/`pollShortSpace`) and one
+   `tagRouted` (errdefer-freed; `override orelse routePath()`) — no
+   duplicate polling bodies, one route-tag/allocation-cleanup site, no
+   datagram leak on route failure. `serviceDueDeadline` services
+   `processPendingWork`, returns the retirement arms, PRESERVES the
+   captured deadline kind (`!= .recovery` → `no_output` — a delayed
+   wakeup with key-discard earliest and recovery also due must NOT
+   emit), then dispatches on the AUTHORITATIVE
+   `work.recovery_serviced.timer.space` to exactly that space's
+   helper. Unrelated output can never replace the due probe.
+4. **Turn-level budget and honest output (M2).** `TurnBudget` with
+   `SendClass{ordinary, reserved}`: ordinary sends — including Retry
+   views — stop at one remaining slot; the final slot serves
+   deadline-critical output (daemon-close on EOF, otherwise due-PTO /
+   keepalive), decremented exactly once per attempted send. ALL
+   owned-datagram sends — deadline service included — go through one
+   generic send core (`sendOwnedVia`, sendTo-compatible sender;
+   budget checked BEFORE polling wherever possible; refused → free +
+   false; WouldBlock → free + false, no counter; success → count +
+   true). `last_output_ns` advances only on an actual send;
+   `keepalive_queued` clears only when the sent datagram reports
+   `emitted_ping`.
+5. **Keepalive scheduling (M2).** `keepalive_attempt_ns`: no PING
+   queued → deadline `last_output_ns + 1s`; queued →
+   `keepalive_attempt_ns + 1s`. At the deadline the existing PING is
+   drained and a new one is queued ONLY if none exists and reserved
+   capacity is available (an unsendable PING is never queued).
+   `keepalive_attempt_ns` updates after EVERY attempt. No busy-loop,
+   no stranded PING.
+6. **Daemon EOF closes QUIC (M5).** EOF queues a CONNECTION_CLOSE and
+   attempts it through the RESERVED slot — prior ordinary output
+   (capped one short) cannot starve it; total output ≤ 64; then close
+   and exit.
+7. **Frozen literals and narrow propagation (M5).** Pre-bootstrap
+   failures emit the exact static `ZMX_ERROR 1 gateway-init-failed\n`
+   (32 bytes ≤ 256); error specifics go to `log.err` only.
+   `remote.zig` preserves ONLY `UnsupportedProtocol`; every other
+   parser error flattens to `InvalidConnectLine`.
+8. **Signal-pipe ownership.** `acquireSignalPipe() !bool` is the
+   idempotent, ownership-reporting entry (gateway/tests);
+   `openSignalPipe() !void` delegates to it so `src/loop.zig` and
+   `src/remote.zig` stay unchanged; `closeSignalPipe()` closes both
+   descriptors and resets them to -1. Callers close only pipes they
+   opened — repeated fixtures never replace or leak fd pairs.
+
+Second quicz-correction commit (authorized by this round, untagged
+until approval): `fc99692` on `zmosh/q2-egress` — PATH_RESPONSE dedup
+keyed on the full `{data, path}` pair (same challenge on a second path
+queues a second, path-bound response), and `emitted_ping` on the
+atomic short-egress result derived from the packet actually built.
+RED reproducers first (`expected 2, found 1`; missing field), then the
+fix; 1914/1914. The zmosh dependency/adapter commit repins
+`build.zig.zon` to `fc99692500610f1aa45aa8205bef0d239fe83eda` +
+regenerated hash (PROVISIONAL until the checkpoint is approved and
+`zmosh-quic-q2-1` is tagged there). Nine loop-level proofs join the
+suite: wrong-PSK rollback with slot reuse through the reissued stored
+Retry; SIGTERM-first; invalid-traffic deadline stability; keepalive
+bookkeeping incl. a fake-sender WouldBlock; flood bounds (no exact
+ACK-count assertions — coalescing); the deterministic reserved-slot
+PTO send at `TurnBudget{ .outbound = 1 }`; migration through the loop;
+native IPv6 loopback; daemon EOF at the budget floor. The frozen
+adapter SLOC gate stays < 500 under the UNCHANGED counting command —
+shared-logic refactoring is the strategy, not compression.
+
 Do not remove the custom modules until the PSK QUIC loopback, migration, and
 shutdown tests pass in zmosh. Then remove custom XChaCha framing, packet ACKs,
 retransmission windows, replay window, heartbeat packets, reorder buffers, and
