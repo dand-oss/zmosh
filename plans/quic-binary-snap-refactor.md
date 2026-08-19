@@ -853,6 +853,33 @@ native IPv6 loopback; daemon EOF at the budget floor. The frozen
 adapter SLOC gate stays < 500 under the UNCHANGED counting command —
 shared-logic refactoring is the strategy, not compression.
 
+### Q2 item-3 closure (2026-08-19) — pin record
+
+APPROVED. The reviewed zmosh checkpoint is
+`1173141cda1586c7168fd6bec05cc9febd859c6e` on `replant-zmx0.7`
+(correction rounds 1–2 landed: `e55e6fa` → `1887af5` → `082abf8` →
+`ae03d62` → `1173141`; independently reproduced gates: 168/168 Debug
+and ReleaseSafe, check/build/fmt/diff clean, adapter SLOC 467, full
+Bats 58 ok / 0 failed / 4 Q5 skips). The quicz correction is frozen as
+the immutable annotated tag **`zmosh-quic-q2-1`** at exactly
+**`fc99692500610f1aa45aa8205bef0d239fe83eda`** on `zmosh/q2-egress`
+(tag object `b63842d2d1cc342006818bea149c68fcaf72d07d`), peel-verified
+on both sides: local `git rev-parse 'zmosh-quic-q2-1^{commit}'` and
+remote `git ls-remote origin 'refs/tags/zmosh-quic-q2-1^{}'` both
+resolve to that SHA. The production `build.zig.zon` pin is unchanged
+from the reviewed checkpoint —
+`git+https://github.com/dand-oss/quicz#fc99692500610f1aa45aa8205bef0d239fe83eda`,
+package hash
+`quicz-0.1.0-g2J972ZxlwDAXOpPpCgoeOkM0zOUhaDplBDgtL6Mj1jQ` — now
+FINAL, no longer provisional. Exact-pin gates rerun at the tag:
+quicz 1914/1914; zmosh 168/168 Debug and ReleaseSafe; check and
+ReleaseSafe build; fmt/diff clean; SLOC gate unchanged; full Bats
+zero failures with only the four Q5 skips.
+
+Q2 item 3 is CLOSED. The next checkpoint (Q3 — the client-side QUIC
+protocol: ZMQ1 stream preface, stream roles, and the application
+relay) is UNLOCKED but NOT STARTED as part of this closure.
+
 Do not remove the custom modules until the PSK QUIC loopback, migration, and
 shutdown tests pass in zmosh. Then remove custom XChaCha framing, packet ACKs,
 retransmission windows, replay window, heartbeat packets, reorder buffers, and
