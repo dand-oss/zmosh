@@ -114,7 +114,7 @@ pub const Gateway = struct {
         };
         var unix_read_buf = try ipc.SocketBuffer.initBounded(alloc, ipc.gateway_frame_cap);
         errdefer unix_read_buf.deinit();
-        var unix_out = quic_session.UnixWriteBuf.init(alloc);
+        var unix_out = try quic_session.UnixWriteBuf.init(alloc);
         errdefer unix_out.deinit();
         var quic = try quic_gateway.QuicGateway.init(alloc, io, psk, token_secret, local, 0);
         // Deinit in place: a copy would wipe only the copy's PSK.
@@ -204,7 +204,7 @@ pub const Gateway = struct {
         // The session attaches exactly once, at establishment; its
         // turn runs after the daemon relay so this turn's daemon
         // output is pumped in the same pass.
-        self.ensureSession();
+        try self.ensureSession();
         if (poll_fds[2].revents & (lib_posix.POLL.IN | lib_posix.POLL.HUP | lib_posix.POLL.ERR) != 0) {
             try self.relayDaemon(now, &budget);
             if (!self.running) return false;
@@ -257,8 +257,11 @@ pub const Gateway = struct {
     /// the Q2 CONNECTION_CLOSE path.
     fn relayDaemon(self: *Gateway, now: i64, budget: *quic_gateway.TurnBudget) !void {
         if (self.session != null and !self.session.?.wantsDaemonRead()) return;
+        // Exact bound: each read is ≤ 4096 B, so the loop stops while
+        // a full read would exceed the turn limit — it is never
+        // overshot.
         var read_total: usize = 0;
-        while (read_total < max_daemon_discard_per_turn) {
+        while (read_total + 4096 <= max_daemon_discard_per_turn) {
             const n = self.unix_read_buf.read(self.unix_fd) catch |err| switch (err) {
                 error.WouldBlock => return,
                 error.FrameTooLarge => {
@@ -290,16 +293,24 @@ pub const Gateway = struct {
             }
             read_total += n;
             while (self.unix_read_buf.next()) |msg| {
-                if (self.session) |*s| switch (msg.header.tag) {
-                    .Output => try s.offerDaemonOutput(msg.payload),
-                    .Resize => try s.onDaemonResize(now, &self.unix_out),
-                    .Switch => try s.onDaemonSwitch(now, &self.unix_out),
-                    else => self.daemon_frames_ignored += 1,
+                if (self.session) |*s| {
+                    // A frame that drives the session terminal ENDS
+                    // processing of the rest of this batch: later
+                    // coalesced frames belong to a session that is no
+                    // longer serving.
+                    if (s.closedOrEnding()) break;
+                    switch (msg.header.tag) {
+                        .Output => try s.offerDaemonOutput(msg.payload),
+                        .Resize => try s.onDaemonResize(now, &self.unix_out),
+                        .Switch => try s.onDaemonSwitch(now, &self.unix_out),
+                        else => self.daemon_frames_ignored += 1,
+                    }
                 } else {
                     // Pre-session daemon traffic is closed and counted.
                     self.daemon_frames_ignored += 1;
                 }
             }
+            if (self.session != null and self.session.?.closedOrEnding()) return;
         }
     }
 
@@ -309,8 +320,11 @@ pub const Gateway = struct {
         while (!self.unix_out.empty()) {
             const n = lib_posix.write(self.unix_fd, self.unix_out.bytes()) catch |err| switch (err) {
                 error.WouldBlock => return,
+                // A permanent write error (EPIPE/EBADF/…) must not
+                // leave POLL.OUT armed forever: fail closed.
                 else => {
-                    log.warn("unix write error: {s}", .{@errorName(err)});
+                    log.warn("unix write error, failing closed: {s}", .{@errorName(err)});
+                    self.running = false;
                     return;
                 },
             };
@@ -323,11 +337,17 @@ pub const Gateway = struct {
     }
 
     /// Attaches the ZMQ1 session exactly once, when the QUIC
-    /// connection establishes.
-    fn ensureSession(self: *Gateway) void {
+    /// connection establishes. The fallible (pre-allocating) session
+    /// construction failing is a local hard error: stop the gateway
+    /// rather than run an application-less connection.
+    fn ensureSession(self: *Gateway) !void {
         if (self.session != null) return;
         const t = self.quic.establishedTransport() orelse return;
-        self.session = quic_session.QuicSession.init(self.alloc, t);
+        self.session = quic_session.QuicSession.init(self.alloc, t) catch |e| {
+            log.err("session allocation failed: {s}", .{@errorName(e)});
+            self.running = false;
+            return e;
+        };
     }
 
     pub fn deinit(self: *Gateway) void {

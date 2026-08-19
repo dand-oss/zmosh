@@ -25,6 +25,14 @@ pub const input_chunk = 4096;
 pub const app_byte_budget_per_turn = 64 * 1024;
 pub const control_frame_budget_per_turn = 64;
 pub const settle_deadline_ns: i64 = std.time.ns_per_s;
+/// The control stash's hard bound: reads happen only while the stash
+/// is empty and are capped at min(4096, budget), so 4096 is its true
+/// maximum; it is preallocated once and never grown.
+pub const control_stash_cap = 4096;
+/// The largest single encoded control emission: preface 8 + header 8
+/// + ERROR payload 4 + reason 256.
+pub const max_control_emission = quic_wire.preface_len +
+    quic_wire.control_header_len + 4 + quic_wire.error_reason_max;
 
 // ---------------------------------------------------------------------------
 // Bounded daemon-bound write buffer (owned by serve.Gateway, the fd
@@ -35,8 +43,14 @@ pub const UnixWriteBuf = struct {
     alloc: std.mem.Allocator,
     list: std.ArrayList(u8) = .empty,
 
-    pub fn init(alloc: std.mem.Allocator) UnixWriteBuf {
-        return .{ .alloc = alloc };
+    /// Fallible construction that RESERVES the full bounded capacity
+    /// up front: after this, `append` performs only the logical bound
+    /// check and writes with assumed capacity — no allocation exists
+    /// on the consume path to fail after QUIC bytes were consumed.
+    pub fn init(alloc: std.mem.Allocator) error{OutOfMemory}!UnixWriteBuf {
+        var list: std.ArrayList(u8) = .empty;
+        try list.ensureTotalCapacity(alloc, unix_write_cap);
+        return .{ .alloc = alloc, .list = list };
     }
 
     pub fn deinit(self: *UnixWriteBuf) void {
@@ -45,7 +59,8 @@ pub const UnixWriteBuf = struct {
 
     /// Appends one framed IPC message; error.Full means the bounded
     /// buffer cannot accept it whole — the caller applies backpressure
-    /// (never a silent drop).
+    /// (never a silent drop). With the reserved capacity, the write
+    /// itself cannot allocate.
     pub fn append(self: *UnixWriteBuf, tag: ipc.Tag, payload: []const u8) error{ Full, OutOfMemory }!void {
         if (self.list.items.len + @sizeOf(ipc.Header) + payload.len > unix_write_cap) {
             return error.Full;
@@ -122,7 +137,10 @@ pub const QuicSession = struct {
     output_opened: bool = false,
     output_fin_sent: bool = false,
     control_fin_sent: bool = false,
-    control_preface_sent: bool = false,
+    /// True until a whole encoded control buffer (which begins with
+    /// the stream preface) has been SENT. A parked frame was never
+    /// sent, so a terminal replacement re-emits the preface.
+    control_preface_pending: bool = true,
 
     /// Daemon→client bytes awaiting stream credit (the output header
     /// sits at its head).
@@ -148,11 +166,27 @@ pub const QuicSession = struct {
 
     counters: Counters = .{},
 
-    pub fn init(alloc: std.mem.Allocator, transport: *quic_transport.Transport) QuicSession {
+    /// Fallible construction that PRE-ALLOCATES every bounded buffer
+    /// the turn loop writes into with assumed capacity: the control
+    /// stash (its read bound), the pending control frame (its ≤ 276 B
+    /// maximum), and the pending output (cap + header). After this,
+    /// the input-stream → UnixWriteBuf consume path performs no
+    /// allocation. The ControlParser payload buffer may still allocate
+    /// (validated, bounded).
+    pub fn init(alloc: std.mem.Allocator, transport: *quic_transport.Transport) error{OutOfMemory}!QuicSession {
+        var stash: std.ArrayList(u8) = .empty;
+        try stash.ensureTotalCapacity(alloc, control_stash_cap);
+        var pending: std.ArrayList(u8) = .empty;
+        try pending.ensureTotalCapacity(alloc, max_control_emission);
+        var output: std.ArrayList(u8) = .empty;
+        try output.ensureTotalCapacity(alloc, pending_output_cap + quic_wire.output_header_len);
         return .{
             .alloc = alloc,
             .transport = transport,
             .control = quic_wire.ControlParser.init(alloc),
+            .control_stash = stash,
+            .pending_control = pending,
+            .pending_output = output,
         };
     }
 
@@ -310,16 +344,21 @@ pub const QuicSession = struct {
         // control-response backpressure).
         if (self.pending_control.items.len != 0) return;
 
-        var rbuf: [input_chunk]u8 = undefined;
-        const n = self.transport.connection().recvOnStream(control_stream_id, &rbuf) catch |e| switch (e) {
-            error.StreamClosed => return self.enterTerminal(now, .protocol_violation, "control stream reset", .error_frame, unix_out),
-            error.ConnectionClosed => return self.enterTerminal(now, .session_ended, "connection closing", .session_end, null),
-            else => return e,
-        } orelse 0;
-
-        if (n > 0) {
-            byte_budget.* -|= n;
-            try self.control_stash.appendSlice(self.alloc, rbuf[0..n]);
+        // Read ONLY while the stash is empty and the shared byte budget
+        // allows, capped at the stash's hard bound: the stash can never
+        // exceed one bounded read.
+        if (self.control_stash.items.len == 0 and byte_budget.* > 0) {
+            var rbuf: [control_stash_cap]u8 = undefined;
+            const want = @min(rbuf.len, byte_budget.*);
+            const n = self.transport.connection().recvOnStream(control_stream_id, rbuf[0..want]) catch |e| switch (e) {
+                error.StreamClosed => return self.enterTerminal(now, .protocol_violation, "control stream reset", .error_frame, unix_out),
+                error.ConnectionClosed => return self.enterTerminal(now, .session_ended, "connection closing", .session_end, null),
+                else => return e,
+            } orelse 0;
+            if (n > 0) {
+                byte_budget.* -|= n;
+                try self.control_stash.appendSlice(self.alloc, rbuf[0..n]);
+            }
         }
         if (self.control_stash.items.len == 0) {
             return self.checkControlTruncation(now, unix_out);
@@ -364,7 +403,12 @@ pub const QuicSession = struct {
                     try self.handleControlFrame(t, self.control.payload(), now, unix_out);
                     self.control.reset();
                     frame_budget.* -= 1;
-                    if (frame_budget.* == 0 or self.closedOrEnding()) return;
+                    // A response that remains parked STOPS parsing — a
+                    // later frame can never be answered (or dropped)
+                    // while one is pending. Bytes stay in the stash.
+                    if (frame_budget.* == 0 or
+                        self.pending_control.items.len != 0 or
+                        self.closedOrEnding()) return;
                 },
             }
         }
@@ -422,6 +466,9 @@ pub const QuicSession = struct {
                     };
                 },
                 .detach => {
+                    if (payload.len != 0) {
+                        return self.enterTerminal(now, .protocol_violation, "bad DETACH length", .error_frame, unix_out);
+                    }
                     unix_out.append(.Detach, "") catch |e| switch (e) {
                         error.Full => return self.enterTerminal(now, .internal_error, "unix write buffer full", .error_frame, unix_out),
                         error.OutOfMemory => return error.OutOfMemory,
@@ -429,10 +476,18 @@ pub const QuicSession = struct {
                     return self.enterTerminal(now, .none, "detach", .none, unix_out);
                 },
                 .snapshot_request => {
+                    if (payload.len != 0) {
+                        return self.enterTerminal(now, .protocol_violation, "bad SNAPSHOT_REQUEST length", .error_frame, unix_out);
+                    }
                     // NONTERMINAL: answered, session continues.
                     return self.queueError(.unimplemented, "snapshot is Q4", false);
                 },
-                .snapshot_installed => return self.enterTerminal(now, .protocol_violation, "SNAPSHOT_INSTALLED before Q4", .error_frame, unix_out),
+                .snapshot_installed => {
+                    if (payload.len != 0) {
+                        return self.enterTerminal(now, .protocol_violation, "bad SNAPSHOT_INSTALLED length", .error_frame, unix_out);
+                    }
+                    return self.enterTerminal(now, .protocol_violation, "SNAPSHOT_INSTALLED before Q4", .error_frame, unix_out);
+                },
                 .hello, .hello_ack, .session_end, .err => {
                     return self.enterTerminal(now, .protocol_violation, "client may not send that frame", .error_frame, unix_out);
                 },
@@ -491,19 +546,23 @@ pub const QuicSession = struct {
     }
 
     /// Encodes one bounded response frame; the send is attempted at
-    /// queue time and retried each turn while credit is withheld. A
-    /// terminal frame replaces a parked nonterminal response. The
-    /// control stream's own preface precedes the first frame.
+    /// queue time and retried each turn while credit is withheld. The
+    /// control stream's preface precedes the first frame and is
+    /// re-emitted by a terminal replacement of a parked (never sent)
+    /// nonterminal response — atomic sends make partial states
+    /// impossible, so the preface can never be half-transmitted.
+    /// A nonterminal queue while one is pending is an invariant
+    /// violation (the parse stop forbids it) and errors loudly.
     fn queueControl(self: *QuicSession, t: quic_wire.ControlType, payload: []const u8, fin: bool) !void {
         if (self.pending_control.items.len != 0) {
-            if (!fin or self.pending_control_fin) return;
+            if (!fin) return error.ControlResponsePending;
+            if (self.pending_control_fin) return error.ControlResponsePending;
             self.pending_control.clearRetainingCapacity();
         }
-        if (!self.control_preface_sent) {
+        if (self.control_preface_pending) {
             var pre: [quic_wire.preface_len]u8 = undefined;
             quic_wire.writePreface(&pre, .control);
             try self.pending_control.appendSlice(self.alloc, &pre);
-            self.control_preface_sent = true;
         }
         var hdr: [quic_wire.control_header_len]u8 = undefined;
         quic_wire.writeControlHeader(&hdr, t, payload.len);
@@ -521,19 +580,14 @@ pub const QuicSession = struct {
         return self.queueControl(.err, buf[0..n], fin);
     }
 
+    /// Sends the WHOLE encoded buffer (≤ 276 B, preface included) in
+    /// ONE all-or-nothing sendOnStream: quicz accepts it entirely or
+    /// not at all, so a parked frame is never partially transmitted
+    /// and a later frame can never truncate it. FlowControlBlocked
+    /// parks it whole; parsing stays paused until it leaves.
     fn trySendPendingControl(self: *QuicSession) !void {
         if (self.pending_control.items.len == 0 or self.control_fin_sent) return;
-        // The send-side stream state is created lazily by quicz at the
-        // first sendOnStream — before that there is no capacity hint,
-        // and the whole buffer is attempted (it is small).
-        const cap = self.sendCapacityHint(control_stream_id);
-        const n: usize = switch (cap) {
-            .unknown => self.pending_control.items.len,
-            .known_zero => return, // blocked; control parsing stays paused
-            .known => |c| @intCast(@min(self.pending_control.items.len, c)),
-        };
-        const fin = self.pending_control_fin and n == self.pending_control.items.len;
-        self.transport.connection().sendOnStream(control_stream_id, self.pending_control.items[0..n], fin) catch |e| switch (e) {
+        self.transport.connection().sendOnStream(control_stream_id, self.pending_control.items, self.pending_control_fin) catch |e| switch (e) {
             error.FlowControlBlocked => return,
             // The peer STOPPED_SENDING: stop relaying, close cleanly.
             error.StreamClosed => {
@@ -542,10 +596,9 @@ pub const QuicSession = struct {
             },
             else => return e,
         };
-        const remaining = self.pending_control.items.len - n;
-        std.mem.copyForwards(u8, self.pending_control.items[0..remaining], self.pending_control.items[n..]);
-        self.pending_control.items.len = remaining;
-        if (remaining == 0 and fin) self.control_fin_sent = true;
+        self.pending_control.clearRetainingCapacity();
+        self.control_preface_pending = false;
+        if (self.pending_control_fin) self.control_fin_sent = true;
     }
 
     // -- input stream ------------------------------------------------------
@@ -555,8 +608,13 @@ pub const QuicSession = struct {
         const conn = self.transport.connection();
 
         if (!self.input_preface.done) {
+            // Read EXACTLY the missing preface bytes (capped by the
+            // leftover shared budget): surplus body bytes can never be
+            // consumed into this read, so nothing can be lost.
             var pbuf: [quic_wire.preface_len]u8 = undefined;
-            const n = conn.recvOnStream(input_stream_id, &pbuf) catch |e| switch (e) {
+            const want = @min(self.input_preface.remaining(), byte_budget.*);
+            if (want == 0) return;
+            const n = conn.recvOnStream(input_stream_id, pbuf[0..want]) catch |e| switch (e) {
                 error.StreamClosed => {
                     self.input_done = true;
                     return;
@@ -565,21 +623,18 @@ pub const QuicSession = struct {
                 else => return e,
             } orelse return;
             if (n == 0) return;
-            var rest: []const u8 = pbuf[0..n];
-            while (rest.len > 0) {
-                const r = self.input_preface.feed(rest);
-                rest = rest[r.consumed..];
-                switch (r.result) {
-                    .done => |role| {
-                        if (role != .input) {
-                            return self.enterTerminal(now, quic_wire.prefaceErrCode(error.UnknownRole), "wrong role on input stream", .error_frame, unix_out);
-                        }
-                    },
-                    .need => break,
-                    .invalid => |e| {
-                        return self.enterTerminal(now, quic_wire.prefaceErrCode(e), "bad input preface", .error_frame, unix_out);
-                    },
-                }
+            byte_budget.* -|= n;
+            const r = self.input_preface.feed(pbuf[0..n]);
+            switch (r.result) {
+                .done => |role| {
+                    if (role != .input) {
+                        return self.enterTerminal(now, quic_wire.prefaceErrCode(error.UnknownRole), "wrong role on input stream", .error_frame, unix_out);
+                    }
+                },
+                .need => return,
+                .invalid => |e| {
+                    return self.enterTerminal(now, quic_wire.prefaceErrCode(e), "bad input preface", .error_frame, unix_out);
+                },
             }
             const finished = conn.recvStreamFinished(input_stream_id) catch false;
             if (finished and !self.input_preface.done) {
@@ -590,11 +645,15 @@ pub const QuicSession = struct {
 
         // Capacity BEFORE consuming: recvOnStream consumes and grants
         // credit, so consumed bytes can never be dropped afterward.
+        // The unix_out capacity is RESERVED, so the append cannot
+        // allocate; Full is unreachable through the precheck and fails
+        // closed rather than dropping accepted bytes.
         while (byte_budget.* > 0) {
             const free = unix_write_cap - unix_out.list.items.len;
             if (free < input_chunk + @sizeOf(ipc.Header)) return;
+            const want = @min(input_chunk, byte_budget.*);
             var buf: [input_chunk]u8 = undefined;
-            const n = conn.recvOnStream(input_stream_id, &buf) catch |e| switch (e) {
+            const n = conn.recvOnStream(input_stream_id, buf[0..want]) catch |e| switch (e) {
                 error.StreamClosed => {
                     self.input_done = true;
                     return;
@@ -603,7 +662,10 @@ pub const QuicSession = struct {
                 else => return e,
             } orelse return;
             if (n == 0) return;
-            unix_out.append(.Input, buf[0..n]) catch return; // capacity checked above
+            unix_out.append(.Input, buf[0..n]) catch |e| switch (e) {
+                error.Full => return self.enterTerminal(now, .internal_error, "unix write buffer full", .error_frame, unix_out),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
             self.counters.input_bytes += n;
             byte_budget.* -|= n;
         }
@@ -757,7 +819,7 @@ pub const QuicSession = struct {
 const testing = std.testing;
 
 test "UnixWriteBuf append bound and consume" {
-    var b = UnixWriteBuf.init(testing.allocator);
+    var b = try UnixWriteBuf.init(testing.allocator);
     defer b.deinit();
     try b.append(.Input, "hello");
     try testing.expectEqual(@as(usize, @sizeOf(ipc.Header) + 5), b.bytes().len);

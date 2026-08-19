@@ -157,6 +157,13 @@ pub const PrefaceParser = struct {
     pub fn expecting(self: *const PrefaceParser) bool {
         return !self.done and self.filled > 0;
     }
+
+    /// Bytes still missing before the preface can validate. Callers
+    /// read EXACTLY this many bytes so surplus consumption (and the
+    /// body-byte loss that would follow) is impossible.
+    pub fn remaining(self: *const PrefaceParser) usize {
+        return if (self.done) 0 else preface_len - self.filled;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -469,6 +476,14 @@ pub const OutputHeaderParser = struct {
             .consumed = chunk.len - rest.len,
             .result = .{ .done = std.mem.readInt(u64, &self.epoch_buf, .big) },
         };
+    }
+
+    /// Bytes still missing before the output header can complete
+    /// (preface + epoch). Callers read EXACTLY this many.
+    pub fn remaining(self: *const OutputHeaderParser) usize {
+        if (self.done) return 0;
+        const pre = self.preface.remaining();
+        return pre + (8 - self.epoch_filled);
     }
 };
 
