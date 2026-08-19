@@ -656,10 +656,11 @@ const RetryBoundary = struct {
         };
     }
 
-    /// Idempotent full cleanup: removes the adopted candidate (whose
-    /// deinit_record destroys the transport through its single wipe
-    /// path) before releasing the registry and the policy (whose
-    /// deinit wipes its retained token secret).
+    /// Full cleanup, run exactly once per boundary: removes the
+    /// adopted candidate if present (whose deinit_record destroys the
+    /// transport through its single wipe path), then releases the
+    /// registry and the policy (whose deinit wipes its retained token
+    /// secret).
     fn deinit(self: *RetryBoundary) void {
         self.registry.remove(1) catch {};
         self.registry.deinit();
@@ -674,7 +675,7 @@ const original_dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
 /// Create the server candidate and adopt it into the boundary's
 /// private capacity-one registry WITHOUT installing a CID route. On
 /// success the registry owns the record and the transport; the caller
-/// cleans up through `RetryBoundary.deinit` (idempotent).
+/// cleans up through `RetryBoundary.deinit` (exactly once).
 fn adoptCandidate(
     alloc: std.mem.Allocator,
     boundary: *RetryBoundary,
@@ -813,15 +814,29 @@ const TestPair = struct {
     parked_from_server: std.ArrayList(bool) = .empty,
     followup: []u8,
     token: []u8,
+    /// Test-only injection: normal initialization uses 16 attempts; a
+    /// zero-attempt regression test forces failure after the ownership
+    /// transfer into the pair.
+    handshake_attempts: usize = 16,
 
     fn init(alloc: std.mem.Allocator, psk: *const [32]u8) !TestPair {
+        return initAttempts(alloc, psk, 16);
+    }
+
+    fn initAttempts(alloc: std.mem.Allocator, psk: *const [32]u8, handshake_attempts: usize) !TestPair {
         var ex = try FirstExchange.open(alloc, psk);
-        errdefer ex.deinit(alloc);
+        // Exactly one owner cleans up on every return path: the
+        // exchange until the pair is constructed, the pair after —
+        // never both.
+        var ex_owned = true;
+        errdefer {
+            if (ex_owned) ex.deinit(alloc);
+        }
         const now = ex.now_nanos;
 
         // ── Create and PRIVATELY adopt the validated candidate. ──────
-        // Ownership transfers to the registry inside the helper; later
-        // failures unwind through `ex.deinit` (idempotent boundary).
+        // Ownership transfers to the registry inside the helper;
+        // failures in this window unwind through `ex.deinit` alone.
         const server = try createAndAdopt(alloc, &ex.boundary, .{
             .psk = psk,
             .retry_scid = retry_scid,
@@ -871,7 +886,11 @@ const TestPair = struct {
             .now_nanos = now,
             .followup = ex.followup,
             .token = ex.token,
+            .handshake_attempts = handshake_attempts,
         };
+        // Ownership transfer: disarm the exchange's cleanup BEFORE
+        // installing the pair's, so exactly one runs from here on.
+        ex_owned = false;
         errdefer pair.deinit(alloc);
         try pair.completeHandshake(alloc);
         return pair;
@@ -942,10 +961,12 @@ const TestPair = struct {
     }
 
     /// Drive both backends in the spike-proven flight order until the
-    /// handshake confirms on both sides (bounded attempts).
+    /// handshake confirms on both sides. The attempt limit is the
+    /// test-only injection point: 16 in normal initialization, 0 to
+    /// force failure after the ownership transfer.
     fn completeHandshake(self: *TestPair, alloc: std.mem.Allocator) !void {
         var attempt: usize = 0;
-        while (attempt < 16) : (attempt += 1) {
+        while (attempt < self.handshake_attempts) : (attempt += 1) {
             self.now_nanos += 1;
 
             // Flight 1-2: client Initial -> server drive -> ServerHello.
@@ -985,6 +1006,25 @@ const TestPair = struct {
 fn testPsk(bootstrap: *[32]u8, psk: *[32]u8) !void {
     try testing.io.randomSecure(bootstrap);
     derivePsk(psk, bootstrap);
+}
+
+/// Field-wise comparison of two InitialSecrets, both BORROWED by
+/// pointer: every secret/key/IV/header-protection array by slices and
+/// the cipher enums separately — the complete InitialSecrets value is
+/// never extracted or passed.
+fn expectInitialSecretsEqual(
+    expected: *const protection.InitialSecrets,
+    actual: *const protection.InitialSecrets,
+) !void {
+    try testing.expectEqualSlices(u8, &expected.initial_secret, &actual.initial_secret);
+    const sides = .{ .{ &expected.client, &actual.client }, .{ &expected.server, &actual.server } };
+    inline for (sides) |side| {
+        try testing.expectEqual(side[0].cipher, side[1].cipher);
+        try testing.expectEqualSlices(u8, &side[0].secret, &side[1].secret);
+        try testing.expectEqualSlices(u8, &side[0].key, &side[1].key);
+        try testing.expectEqualSlices(u8, &side[0].iv, &side[1].iv);
+        try testing.expectEqualSlices(u8, &side[0].hp, &side[1].hp);
+    }
 }
 
 test "Retry transaction loopback: adopt, authenticate, commit, echo both ways" {
@@ -1360,9 +1400,15 @@ test "malformed Retry: integrity-tag corruption discards without rekey" {
     const discards = client.counters.datagrams_discarded;
     try client.handleDatagram(client_path, now, corrupt);
     try testing.expectEqual(discards + 1, client.counters.datagrams_discarded);
-    // No rekey: no Retry SCID recorded, Initial secrets unchanged.
+    // No rekey: no Retry SCID recorded, Initial secrets unchanged —
+    // compared field-wise through borrowed pointers, never by
+    // extracting the stored value.
     try testing.expect(client.conn.retrySourceConnectionId() == null);
-    try testing.expectEqual(expected, client.secrets.?);
+    if (client.secrets) |*actual| {
+        try expectInitialSecretsEqual(&expected, actual);
+    } else {
+        return error.NoInitialSecrets;
+    }
     try testing.expect(client.conn.connectionState() == .active);
 }
 
@@ -1441,4 +1487,22 @@ test "datagram bounds: oversized inbound discarded, oversized outbound freed" {
     // allocator proves the free (a leak would fail the test).
     const oversize_out = try alloc.alloc(u8, max_udp_payload + 1);
     try testing.expectError(error.DatagramExceedsFixedCap, pair.client.checked(oversize_out));
+}
+
+test "failed handshake after ownership transfer cleans up exactly once" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testPsk(&bootstrap, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    // Zero attempts: completeHandshake fails immediately AFTER the
+    // pair owns every resource — exactly one cleanup (the pair's; the
+    // exchange's errdefer is disarmed by the transfer) must run. The
+    // testing allocator proves neither leaks nor double frees.
+    try testing.expectError(
+        error.HandshakeNotConfirmed,
+        TestPair.initAttempts(alloc, &psk, 0),
+    );
 }
