@@ -151,6 +151,12 @@ pub const PrefaceParser = struct {
         self.done = true;
         return .{ .consumed = take, .result = .{ .done = role } };
     }
+
+    /// True when bytes of an INCOMPLETE preface have arrived — a FIN
+    /// now is a truncation (terminal protocol_violation by the caller).
+    pub fn expecting(self: *const PrefaceParser) bool {
+        return !self.done and self.filled > 0;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -286,6 +292,17 @@ pub const ControlParser = struct {
     /// truncated frame (terminal protocol_violation by the caller).
     pub fn midFrame(self: *const ControlParser) bool {
         return self.state != .complete;
+    }
+
+    /// True when bytes of an INCOMPLETE frame have arrived (a partial
+    /// header or a partial payload). A FIN between complete frames —
+    /// parser reset to a fresh header with zero bytes — is clean.
+    pub fn expectingFrame(self: *const ControlParser) bool {
+        return switch (self.state) {
+            .header => self.hdr_filled > 0,
+            .payload => true,
+            .complete => false,
+        };
     }
 
     pub fn reset(self: *ControlParser) void {

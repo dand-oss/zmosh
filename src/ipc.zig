@@ -163,6 +163,11 @@ pub const SocketBuffer = struct {
     buf: std.ArrayList(u8),
     alloc: std.mem.Allocator,
     head: usize,
+    /// Zero (default) keeps the historic unbounded behavior. Non-zero
+    /// bounds a single frame's TOTAL length (header + payload): an
+    /// oversized DECLARED length is rejected as soon as its header is
+    /// readable, before the payload accumulates.
+    max_frame_len: usize = 0,
 
     pub fn init(alloc: std.mem.Allocator) !SocketBuffer {
         return .{
@@ -170,6 +175,14 @@ pub const SocketBuffer = struct {
             .alloc = alloc,
             .head = 0,
         };
+    }
+
+    /// Bounded construction for readers that must never grow past one
+    /// legal frame (the QUIC gateway's daemon reader).
+    pub fn initBounded(alloc: std.mem.Allocator, max_frame_len: usize) !SocketBuffer {
+        var sb = try SocketBuffer.init(alloc);
+        sb.max_frame_len = max_frame_len;
+        return sb;
     }
 
     pub fn deinit(self: *SocketBuffer) void {
@@ -180,6 +193,9 @@ pub const SocketBuffer = struct {
     /// Returns number of bytes read.
     /// Propagates error.WouldBlock and other errors to caller.
     /// Returns 0 on EOF.
+    /// Bounded buffers additionally return error.FrameTooLarge once the
+    /// pending frame's declared length exceeds `max_frame_len` — the
+    /// caller fails closed; the buffer state is then poisoned.
     pub fn read(self: *SocketBuffer, fd: i32) !usize {
         if (self.head > 0) {
             const remaining = self.buf.items.len - self.head;
@@ -196,6 +212,17 @@ pub const SocketBuffer = struct {
         const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
+        }
+        if (self.max_frame_len != 0 and self.buf.items.len >= @sizeOf(Header)) {
+            // Walk every frame whose header is readable — not just the
+            // first: a legal leading frame must not mask an oversized
+            // pending one accumulating behind it.
+            var pos: usize = 0;
+            while (pos + @sizeOf(Header) <= self.buf.items.len) {
+                const total = expectedLength(self.buf.items[pos..]).?;
+                if (total > self.max_frame_len) return error.FrameTooLarge;
+                pos += total;
+            }
         }
         return n;
     }
@@ -331,6 +358,68 @@ test "Tag wire values are frozen" {
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
         .{ Tag.Send, 18 },     .{ Tag.SessionEnd, 19 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+/// The Q3 gateway's per-frame cap: one header plus 64 KiB of payload.
+/// A large legacy `.Init` VT replay exceeds this by design and fails
+/// closed until Q4's chunked snapshots.
+pub const gateway_frame_cap: usize = @sizeOf(Header) + 64 * 1024;
+
+test "bounded SocketBuffer rejects an oversized declared length before payload accumulation" {
+    const alloc = std.testing.allocator;
+    // A nonblocking pipe stands in for the daemon socket, exactly as
+    // the serve fixtures do.
+    const fds = try lib_posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer lib_posix.close(fds[0]);
+    defer lib_posix.close(fds[1]);
+
+    var bounded = try SocketBuffer.initBounded(alloc, gateway_frame_cap);
+    defer bounded.deinit();
+
+    // A normal 4 KiB PTY-sized frame reads through fine (the reader
+    // pulls 4 KiB per call; drain until WouldBlock, then consume).
+    {
+        var payload: [4096]u8 = undefined;
+        @memset(&payload, 'x');
+        try send(fds[1], .Output, &payload);
+        while (true) {
+            _ = bounded.read(fds[0]) catch break;
+        }
+        var seen: usize = 0;
+        while (bounded.next()) |_| seen += 1;
+        try std.testing.expectEqual(@as(usize, 1), seen);
+    }
+
+    // An oversized DECLARED length: rejection fires as soon as the
+    // header is readable — only kilobytes accumulate, never the
+    // declared payload.
+    {
+        const hdr = Header{ .tag = .Output, .len = 10 * 1024 * 1024 };
+        const hdr_bytes = std.mem.toBytes(hdr);
+        _ = try lib_posix.write(fds[1], &hdr_bytes);
+        try std.testing.expectError(error.FrameTooLarge, bounded.read(fds[0]));
+        try std.testing.expect(bounded.buf.items.len < 8192);
+    }
+
+    // A legal leading frame must not mask an oversized pending one.
+    {
+        var sb = try SocketBuffer.initBounded(alloc, @sizeOf(Header) + 8);
+        defer sb.deinit();
+        try send(fds[1], .Input, "12345678");
+        const big = Header{ .tag = .Output, .len = 4096 };
+        const big_bytes = std.mem.toBytes(big);
+        _ = try lib_posix.write(fds[1], &big_bytes);
+        var rejected = false;
+        var attempts: usize = 0;
+        while (attempts < 8) : (attempts += 1) {
+            _ = sb.read(fds[0]) catch |e| {
+                try std.testing.expectEqual(error.FrameTooLarge, e);
+                rejected = true;
+                break;
+            };
+        }
+        try std.testing.expect(rejected);
+    }
 }
 
 pub fn roundTripForTag(

@@ -283,7 +283,8 @@ pub const QuicGateway = struct {
                     try transport.connection().sendHandshakeDone();
                     log.info("quic handshake confirmed duration_ns={d}", .{self.handshake_duration_ns});
                 }
-                if (self.state == .established) try self.rejectPreQ3StreamData(sock, now, budget);
+                // Established application streams are dispatched by the
+                // QuicSession (serve.Gateway-owned), not here.
             },
             .closed => self.counters.datagrams_discarded += 1,
         }
@@ -575,21 +576,15 @@ pub const QuicGateway = struct {
         }
     }
 
-    /// Pre-Q3 application stream data is rejected: the connection
-    /// closes (counted, no Q2-frozen error code — Q3 owns stable wire
-    /// codes) and the gateway exits; post-commit fatal errors never
-    /// return to `retry_sent`.
-    fn rejectPreQ3StreamData(self: *QuicGateway, sock: *udp.UdpSocket, now: i64, budget: *TurnBudget) !void {
-        const conn = self.candidate().transport.connection();
-        for (conn.recv_streams.items) |stream| {
-            if (stream.data.items.len > stream.read_offset) {
-                try self.candidate().transport.shutdown(1, "pre-q3 stream data");
-                try self.drainCandidate(sock, now, budget);
-                self.state = .closed;
-                self.running = false;
-                return;
-            }
-        }
+    /// The borrowed established transport, or null outside the
+    /// established state. The registry owns its lifetime: the session
+    /// consuming it must treat it as borrowed and stop at `running ==
+    /// false` or state changes. This gateway stays CONNECTION LIFECYCLE
+    /// ONLY — application stream dispatch lives in quic_session.zig,
+    /// driven by serve.Gateway.
+    pub fn establishedTransport(self: *QuicGateway) ?*quic_transport.Transport {
+        if (self.state != .established) return null;
+        return self.candidate().transport;
     }
 
     /// ONE reserved-class emission: deadline-critical output — here a

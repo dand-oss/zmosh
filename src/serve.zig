@@ -27,6 +27,9 @@ const lib_posix = @import("posix.zig");
 const quicz = @import("quicz");
 const quic_transport = @import("quic_transport.zig");
 const quic_gateway = @import("quic_gateway.zig");
+const quic_session = @import("quic_session.zig");
+const quic_client = @import("quic_client.zig");
+const quic_wire = @import("quic_wire.zig");
 
 const Cfg = cfg_mod.Cfg;
 
@@ -571,6 +574,50 @@ const quic_test = struct {
         }
         if (loop.gw.quic.state != .established) return error.HandshakeNotEstablished;
     }
+
+    // ── ZMQ1 session fixtures ─────────────────────────────────────
+
+    /// One borrowed frame view into the daemon-bound write buffer.
+    const UnixFrame = struct {
+        tag: ipc.Tag,
+        payload: []const u8,
+        total: usize,
+    };
+
+    fn peekUnixFrame(unix_out: *quic_session.UnixWriteBuf) ?UnixFrame {
+        const bytes = unix_out.bytes();
+        const total = ipc.expectedLength(bytes) orelse return null;
+        if (bytes.len < total) return null;
+        const hdr = std.mem.bytesToValue(ipc.Header, bytes[0..@sizeOf(ipc.Header)]);
+        return .{ .tag = hdr.tag, .payload = bytes[@sizeOf(ipc.Header)..total], .total = total };
+    }
+
+    /// One full exchange round at a synthetic timestamp: pump client
+    /// egress, run a gateway turn, feed the client, run the session
+    /// pump (which queues stream egress), and flush both directions.
+    /// The client PING after the session pump is the deterministic
+    /// inbound trigger for the gateway's egress drain (the relay
+    /// checkpoint wires a post-session drain into the production turn).
+    fn sessionRound(
+        loop: *Loop,
+        sess: *quic_session.QuicSession,
+        unix_out: *quic_session.UnixWriteBuf,
+        now: i64,
+    ) !void {
+        try loop.clientPump(now);
+        _ = try loop.gw.runOnce(0);
+        try loop.clientDrain(now);
+        try sess.processTurn(now, unix_out);
+        // The trigger PING is best-effort: after the session closes the
+        // connection it is refused — the drain already happened.
+        loop.client.connection().sendPing() catch {};
+        try loop.clientPump(now);
+        _ = try loop.gw.runOnce(0);
+        try loop.clientDrain(now);
+        try loop.clientPump(now);
+        _ = try loop.gw.runOnce(0);
+        try loop.clientDrain(now);
+    }
 };
 
 test "gateway loop: real-socket Retry transaction commits exactly once" {
@@ -601,7 +648,7 @@ test "gateway loop: real-socket Retry transaction commits exactly once" {
     try testing.expectEqual(@as(usize, 0), n);
 }
 
-test "gateway loop: pre-Q3 stream data closes the connection and exits" {
+test "gateway loop: established transport is exposed; stream dispatch belongs to the session" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     var psk: [32]u8 = undefined;
@@ -614,17 +661,25 @@ test "gateway loop: pre-Q3 stream data closes the connection and exits" {
     defer loop.deinit();
     try quic_test.driveHandshake(&loop);
 
-    // The client sends application stream data before Q3 exists.
+    // The borrowed established transport is the session's seam. Stream
+    // data arriving before a session is attached is simply NOT consumed
+    // by the gateway itself: enforcement moved to quic_session.zig
+    // (wired by the relay checkpoint), which rejects it terminally.
+    const t = loop.gw.quic.establishedTransport();
+    try testing.expect(t != null);
     const s = try loop.client.connection().openStream();
-    try loop.client.connection().sendOnStream(s, "pre-q3", false);
+    try loop.client.connection().sendOnStream(s, "pre-session", false);
     const now: i64 = lib_posix.nowNs();
     try loop.clientPump(now);
     _ = try loop.gw.runOnce(0);
     try loop.clientDrain(now);
 
-    try testing.expect(loop.gw.quic.state == .closed);
-    try testing.expect(!loop.gw.running);
-    // The daemon socket received nothing.
+    try testing.expect(loop.gw.quic.state == .established);
+    try testing.expect(loop.gw.running);
+    // Unconsumed: quicz still buffers the bytes (no credit granted).
+    const st = (try t.?.connection().streamState(s)) orelse return error.NoStreamState;
+    try testing.expect((st.receive_buffered orelse 0) > (st.receive_read_offset orelse 0));
+    // The daemon pipe received nothing.
     var probe: [64]u8 = undefined;
     const n = std.posix.read(loop.daemon_fd, &probe) catch 0;
     try testing.expectEqual(@as(usize, 0), n);
@@ -1171,4 +1226,402 @@ test "gateway loop: daemon EOF close survives the ordinary budget floor" {
     }
     try testing.expect(closed_seen);
     try testing.expect(loop.client.conn.connectionState() != .active);
+}
+
+// ─── ZMQ1 session tests: QuicSession + ClientSession on the Loop pair ──
+
+fn zmq1Setup(alloc: std.mem.Allocator, psk: *const [32]u8) !struct {
+    loop: quic_test.Loop,
+    sess: quic_session.QuicSession,
+    unix_out: quic_session.UnixWriteBuf,
+    client: quic_client.ClientSession,
+} {
+    var loop = try quic_test.Loop.init(alloc, psk, false);
+    errdefer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+    const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+    var sess = quic_session.QuicSession.init(alloc, t);
+    errdefer sess.deinit();
+    var unix_out = quic_session.UnixWriteBuf.init(alloc);
+    errdefer unix_out.deinit();
+    const client = try quic_client.ClientSession.init(alloc, loop.client);
+    return .{ .loop = loop, .sess = sess, .unix_out = unix_out, .client = client };
+}
+
+test "zmq1 session: HELLO → ACK → RESIZE/.Init → input relay → output epoch 1" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.sess.deinit();
+    defer z.unix_out.deinit();
+    defer z.client.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    // HELLO flows; the client validates HELLO_ACK.
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..8) |i| {
+        try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
+        ack = try z.client.pollControl();
+        if (ack != null) break;
+    }
+    try testing.expect(ack != null);
+    try testing.expect(ack.? == .hello_ack);
+    try testing.expect(z.sess.phase == .awaiting_resize);
+
+    // The output stream opened with its header (epoch 1); the client
+    // does NOT expose it until HELLO_ACK validated — which it now has.
+    var epoch: u64 = 0;
+    var obuf: [64]u8 = undefined;
+    const on0 = try z.client.pollOutput(&obuf, &epoch);
+    try testing.expect(on0 == null); // header consumed, no body yet
+    try testing.expectEqual(@as(u64, 1), epoch);
+
+    // First RESIZE → daemon `.Init` with the BE-decoded size.
+    try z.client.sendResize(37, 101, 0, 0);
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
+    {
+        const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInit;
+        try testing.expectEqual(ipc.Tag.Init, f.tag);
+        const rz = std.mem.bytesToValue(ipc.Resize, f.payload[0..@sizeOf(ipc.Resize)]);
+        try testing.expectEqual(@as(u16, 37), rz.rows);
+        try testing.expectEqual(@as(u16, 101), rz.cols);
+        z.unix_out.consume(f.total);
+    }
+    try testing.expect(z.sess.phase == .active);
+
+    // Input bytes → daemon `.Input` frames.
+    try z.client.sendInput("hello-zmq1");
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
+    {
+        const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInput;
+        try testing.expectEqual(ipc.Tag.Input, f.tag);
+        try testing.expectEqualStrings("hello-zmq1", f.payload);
+        z.unix_out.consume(f.total);
+    }
+
+    // Daemon output relays on the epoch-1 output stream.
+    try z.sess.offerDaemonOutput("relay-me");
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 300 + @as(i64, @intCast(i)));
+    var got: []const u8 = "";
+    for (0..4) |_| {
+        const n = (try z.client.pollOutput(&obuf, null)) orelse continue;
+        got = obuf[0..n];
+        break;
+    }
+    try testing.expectEqualStrings("relay-me", got);
+
+    // A second RESIZE forwards as `.Resize` — never a second `.Init`.
+    try z.client.sendResize(40, 120, 0, 0);
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 400 + @as(i64, @intCast(i)));
+    {
+        const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoSecondResize;
+        try testing.expectEqual(ipc.Tag.Resize, f.tag);
+        const rz = std.mem.bytesToValue(ipc.Resize, f.payload[0..@sizeOf(ipc.Resize)]);
+        try testing.expectEqual(@as(u16, 40), rz.rows);
+        z.unix_out.consume(f.total);
+    }
+    try testing.expect(!z.sess.closedOrEnding());
+}
+
+test "zmq1 session: HELLO mismatches reject with the frozen codes and never initialize the daemon" {
+    const alloc = testing.allocator;
+    const BadHelloKind = enum { version, capability, fingerprint };
+    const cases = [_]struct { kind: BadHelloKind, code: u32 }{
+        .{ .kind = .version, .code = quic_wire.ErrCode.version_mismatch.code() },
+        .{ .kind = .capability, .code = quic_wire.ErrCode.capability_mismatch.code() },
+        .{ .kind = .fingerprint, .code = quic_wire.ErrCode.fingerprint_mismatch.code() },
+    };
+    for (cases) |c| {
+        var bootstrap: [32]u8 = undefined;
+        var psk: [32]u8 = undefined;
+        try testing.io.randomSecure(&bootstrap);
+        quic_transport.derivePsk(&psk, &bootstrap);
+        defer std.crypto.secureZero(u8, &bootstrap);
+        defer std.crypto.secureZero(u8, &psk);
+
+        var loop = try quic_test.Loop.init(alloc, &psk, false);
+        defer loop.deinit();
+        try quic_test.driveHandshake(&loop);
+        const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+        var sess = quic_session.QuicSession.init(alloc, t);
+        defer sess.deinit();
+        var unix_out = quic_session.UnixWriteBuf.init(alloc);
+        defer unix_out.deinit();
+        var client = quic_client.ClientSession.initSilent(alloc, loop.client);
+        defer client.deinit();
+
+        // Craft the BAD HELLO as the client's first and only frame —
+        // a good HELLO must never precede it.
+        const cconn = client.transport.connection();
+        _ = try cconn.openStream();
+        var pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&pre, .control);
+        _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+        var hello = quic_wire.Hello.serverV1(quic_wire.mode_attach);
+        switch (c.kind) {
+            .version => hello.version_major = 2,
+            .capability => hello.required_capabilities = 0x1E,
+            .fingerprint => hello.snapshot_abi_id[0] ^= 0xFF,
+        }
+        var payload: [quic_wire.hello_payload_len]u8 = undefined;
+        hello.encode(&payload);
+        var hdr: [quic_wire.control_header_len]u8 = undefined;
+        quic_wire.writeControlHeader(&hdr, .hello, payload.len);
+        _ = try cconn.sendOnStream(quic_client.control_stream_id, &hdr, false);
+        _ = try cconn.sendOnStream(quic_client.control_stream_id, &payload, false);
+
+        const base: i64 = lib_posix.nowNs();
+        var err_ev: ?quic_client.ControlEvent = null;
+        for (0..10) |i| {
+            try quic_test.sessionRound(&loop, &sess, &unix_out, base + @as(i64, @intCast(i)));
+            err_ev = try client.pollControl();
+            if (err_ev != null) break;
+        }
+        try testing.expect(err_ev != null);
+        switch (err_ev.?) {
+            .err => |e| try testing.expectEqual(c.code, e.code),
+            else => return error.TestUnexpectedResult,
+        }
+        // Authorization precedes session data: no `.Init` was sent.
+        try testing.expect(unix_out.empty());
+        try testing.expect(sess.closedOrEnding());
+    }
+}
+
+test "zmq1 session: SNAPSHOT_REQUEST is answered nonterminally and the relay continues" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.sess.deinit();
+    defer z.unix_out.deinit();
+    defer z.client.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
+    const ev = try z.client.pollControl();
+    try testing.expect(ev != null and ev.? == .hello_ack);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
+    if (quic_test.peekUnixFrame(&z.unix_out)) |f| z.unix_out.consume(f.total) else return error.NoInit;
+    try testing.expect(z.sess.phase == .active);
+
+    // Two SNAPSHOT_REQUESTs → two ERROR(unimplemented) responses, and
+    // the session stays active.
+    var errors_seen: usize = 0;
+    for (0..2) |_| {
+        try z.client.sendSnapshotRequest();
+        for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
+        while (try z.client.pollControl()) |e| {
+            switch (e) {
+                .err => |er| {
+                    try testing.expectEqual(quic_wire.ErrCode.unimplemented.code(), er.code);
+                    errors_seen += 1;
+                },
+                else => {},
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), errors_seen);
+    try testing.expect(!z.sess.closedOrEnding());
+
+    // The relay still serves input after the nonterminal responses.
+    try z.client.sendInput("still-alive");
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 300 + @as(i64, @intCast(i)));
+    const f = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInputAfterError;
+    try testing.expectEqualStrings("still-alive", f.payload);
+}
+
+test "zmq1 session: input before RESIZE is parked, then flows strictly after .Init" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.sess.deinit();
+    defer z.unix_out.deinit();
+    defer z.client.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
+    const ev = try z.client.pollControl();
+    try testing.expect(ev != null and ev.? == .hello_ack);
+
+    // Input legitimately arrives BEFORE the RESIZE. The session parks
+    // it: nothing rejected, nothing consumed, no credit granted.
+    try z.client.sendInput("early-input");
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
+    try testing.expect(z.sess.phase == .awaiting_resize);
+    try testing.expect(z.unix_out.empty());
+    {
+        const st = (try z.sess.transport.connection().streamState(quic_session.input_stream_id)) orelse return error.NoStreamState;
+        try testing.expect((st.receive_buffered orelse 0) > (st.receive_read_offset orelse 0));
+    }
+
+    // The first RESIZE maps to `.Init`; the parked input then flows —
+    // strictly after it in the daemon-bound buffer.
+    try z.client.sendResize(30, 90, 0, 0);
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
+    {
+        const f1 = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoInit;
+        try testing.expectEqual(ipc.Tag.Init, f1.tag);
+        z.unix_out.consume(f1.total);
+        const f2 = quic_test.peekUnixFrame(&z.unix_out) orelse return error.NoParkedInput;
+        try testing.expectEqual(ipc.Tag.Input, f2.tag);
+        try testing.expectEqualStrings("early-input", f2.payload);
+        z.unix_out.consume(f2.total);
+    }
+    try testing.expect(!z.sess.closedOrEnding());
+}
+
+test "zmq1 session: a second control stream is rejected by the id scan" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.sess.deinit();
+    defer z.unix_out.deinit();
+    defer z.client.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
+    const ev = try z.client.pollControl();
+    try testing.expect(ev != null and ev.? == .hello_ack);
+
+    // A second bidi stream (id 4) carrying a control preface.
+    const s = try z.client.transport.connection().openStream();
+    try testing.expectEqual(@as(u64, 4), s);
+    var pre: [8]u8 = undefined;
+    quic_wire.writePreface(&pre, .control);
+    try z.client.transport.connection().sendOnStream(s, &pre, false);
+
+    var err_ev: ?quic_client.ControlEvent = null;
+    for (0..10) |i| {
+        try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
+        err_ev = try z.client.pollControl();
+        if (err_ev != null) break;
+    }
+    try testing.expect(err_ev != null);
+    switch (err_ev.?) {
+        .err => |e| try testing.expectEqual(quic_wire.ErrCode.stream_cardinality.code(), e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(z.sess.closedOrEnding());
+}
+
+test "zmq1 session: stream-2 data with no control stream closes immediately without a control write" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+    const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+    var sess = quic_session.QuicSession.init(alloc, t);
+    defer sess.deinit();
+    var unix_out = quic_session.UnixWriteBuf.init(alloc);
+    defer unix_out.deinit();
+
+    // The client never opens stream 0; input data arrives first. This
+    // is the no-control-stream fatal arm: an immediate application
+    // close — no sendOnStream(0) is ever attempted.
+    const s = try loop.client.connection().openUniStream();
+    try testing.expectEqual(@as(u64, 2), s);
+    var pre: [8]u8 = undefined;
+    quic_wire.writePreface(&pre, .input);
+    try loop.client.connection().sendOnStream(s, &pre, false);
+    try loop.client.connection().sendOnStream(s, "rogue", false);
+
+    const base: i64 = lib_posix.nowNs();
+    try loop.clientPump(base);
+    _ = try loop.gw.runOnce(0);
+    try loop.clientDrain(base);
+    try sess.processTurn(base, &unix_out);
+
+    try testing.expect(sess.closed);
+    try testing.expect(unix_out.empty());
+    // No control send side was created on the server.
+    const st = try t.connection().streamState(quic_session.control_stream_id);
+    try testing.expect(st == null);
+}
+
+test "zmq1 session: daemon EOF sends SESSION_END and settles into a code-9 close" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.sess.deinit();
+    defer z.unix_out.deinit();
+    defer z.client.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + @as(i64, @intCast(i)));
+    const ev = try z.client.pollControl();
+    try testing.expect(ev != null and ev.? == .hello_ack);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 100 + @as(i64, @intCast(i)));
+    if (quic_test.peekUnixFrame(&z.unix_out)) |f| z.unix_out.consume(f.total);
+
+    // Pending output drains and FINs before SESSION_END settles.
+    try z.sess.offerDaemonOutput("last-words");
+    try z.sess.onDaemonEof(base + 200);
+
+    var end_seen = false;
+    var obuf: [64]u8 = undefined;
+    var got: []const u8 = "";
+    // The real client drains output every turn — before the server's
+    // settle-close can make buffered bytes unreadable.
+    for (0..12) |i| {
+        try quic_test.sessionRound(&z.loop, &z.sess, &z.unix_out, base + 200 + @as(i64, @intCast(i)));
+        while (try z.client.pollControl()) |e| {
+            if (e == .session_end) end_seen = true;
+        }
+        // Two passes per turn: the first may consume the output header
+        // alone; the second drains body bytes (real clients poll both
+        // streams every turn).
+        _ = try z.client.pollOutput(&obuf, null);
+        while (try z.client.pollOutput(&obuf, null)) |n| {
+            got = obuf[0..n];
+        }
+        if (z.sess.closed and end_seen and got.len > 0) break;
+    }
+    try testing.expect(end_seen);
+    try testing.expect(z.sess.closed);
+    // The last output bytes reached the client before the end.
+    try testing.expectEqualStrings("last-words", got);
 }
