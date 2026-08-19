@@ -171,7 +171,7 @@ pub fn connectRemote(
     };
     const result = parseConnectLine(connect_line) catch |err| {
         log.err("failed to parse connect line: {s}", .{@errorName(err)});
-        return error.InvalidConnectLine;
+        return err;
     };
 
     // We have the connect info; close our end of the pipe. The child is
