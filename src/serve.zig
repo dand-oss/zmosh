@@ -1495,7 +1495,7 @@ test "zmq1 session: HELLO mismatches reject with the frozen codes and never init
         const sess = if (loop.gw.session) |*x| x else return error.NoSession;
         var dr = try quic_test.DaemonReader.init(alloc);
         defer dr.deinit();
-        var client = quic_client.ClientSession.initSilent(alloc, loop.client);
+        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
         defer client.deinit();
 
         // Craft the BAD HELLO as the client's first and only frame —
@@ -1609,7 +1609,7 @@ test "zmq1 session: SNAPSHOT_REQUEST is answered nonterminally and the relay con
     try testing.expectEqualStrings("still-alive", f.payload);
 }
 
-test "zmq1 session: input before RESIZE is parked, then flows strictly after .Init" {
+test "zmq1 session: network-reordered input is parked, then flows strictly after .Init" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     var psk: [32]u8 = undefined;
@@ -1637,10 +1637,26 @@ test "zmq1 session: input before RESIZE is parked, then flows strictly after .In
     }
     try testing.expect(ev != null and ev.? == .hello_ack);
 
-    // Input legitimately arrives BEFORE the RESIZE. The session parks
-    // it: nothing rejected, nothing consumed, no credit granted.
+    // Correct API order: RESIZE first, then input. The NETWORK
+    // delivery is then reordered — the resize datagram is withheld
+    // while the input datagram reaches the gateway first.
+    try z.client.sendResize(30, 90, 0, 0);
     try z.client.sendInput("early-input");
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+
+    const held = (try z.loop.client.pollOutbound(base + 100)) orelse return error.NoResizeDatagram;
+    defer alloc.free(held);
+    var sent_input = false;
+    for (0..4) |_| {
+        const dg = (try z.loop.client.pollOutbound(base + 100)) orelse break;
+        defer alloc.free(dg);
+        try z.loop.client_sock.sendTo(dg, z.loop.gw_addr);
+        sent_input = true;
+    }
+    try testing.expect(sent_input);
+    _ = try z.loop.gw.runOnce(0);
+
+    // The input arrived with no `.Init` yet: PARKED — nothing
+    // rejected, nothing consumed, no credit granted.
     try testing.expect(sess.phase == .awaiting_resize);
     try testing.expect((try dr.next(z.loop.daemon_fd)) == null);
     {
@@ -1648,13 +1664,15 @@ test "zmq1 session: input before RESIZE is parked, then flows strictly after .In
         try testing.expect((st.receive_buffered orelse 0) > (st.receive_read_offset orelse 0));
     }
 
-    // The first RESIZE maps to `.Init`; the parked input then flows —
-    // strictly after it in the daemon-bound buffer.
-    try z.client.sendResize(30, 90, 0, 0);
+    // Deliver the withheld resize: `.Init` queues first, then the
+    // parked input flows — strictly after it.
+    try z.loop.client_sock.sendTo(held, z.loop.gw_addr);
     for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
     {
         const f1 = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
         try testing.expectEqual(ipc.Tag.Init, f1.tag);
+        const rz = std.mem.bytesToValue(ipc.Resize, f1.payload[0..@sizeOf(ipc.Resize)]);
+        try testing.expectEqual(@as(u16, 30), rz.rows);
         const f2 = (try dr.next(z.loop.daemon_fd)) orelse return error.NoParkedInput;
         try testing.expectEqual(ipc.Tag.Input, f2.tag);
         try testing.expectEqualStrings("early-input", f2.payload);
