@@ -303,11 +303,23 @@ pub const Transport = struct {
     /// malformed packets never fail the caller's loop; authenticated
     /// protocol violations close the connection through quicz's own
     /// OrClose processors; local errors propagate.
-    pub fn handleDatagram(self: *Transport, arrival: quicz.endpoint.UdpTuple, now_nanos: i64, data: []const u8) !void {
+    /// Feed one received datagram with its arrival path and the
+    /// caller's pre-generated migration challenge. Returns whether the
+    /// challenge bytes were CONSUMED — queued as exactly one
+    /// path-bound PATH_CHALLENGE by authenticated changed-path
+    /// processing; Initial, Handshake, Retry, and invalid traffic never
+    /// consume it. The caller rotates its challenge only on `true`.
+    pub fn handleDatagram(
+        self: *Transport,
+        arrival: quicz.endpoint.UdpTuple,
+        now_nanos: i64,
+        data: []const u8,
+        challenge: *const [8]u8,
+    ) !bool {
         self.counters.datagrams_received += 1;
         if (data.len > max_udp_payload) {
             self.counters.datagrams_discarded += 1;
-            return;
+            return false;
         }
         const info = protection.peekProtectedLongPacketInfo(data) catch |peek_err| switch (peek_err) {
             // Retry packets are long headers that carry no header
@@ -319,15 +331,14 @@ pub const Transport = struct {
                 } else {
                     self.counters.datagrams_discarded += 1;
                 }
-                return;
+                return false;
             },
             // Anything the long-prefix parser rejects as non-long is a
             // short header: 1-RTT application data through the
             // canonical guarded entry that also commits validated
-            // route changes.
+            // route changes and carries the migration challenge.
             else => {
-                try self.processShort(arrival, now_nanos, data);
-                return;
+                return try self.processShort(arrival, now_nanos, data, challenge);
             },
         };
         switch (info.packet_type) {
@@ -337,6 +348,7 @@ pub const Transport = struct {
             // beyond the pinned version: both are foreign traffic.
             else => self.counters.datagrams_discarded += 1,
         }
+        return false;
     }
 
     /// Route-first dispatch for every long datagram: its DCID must
@@ -399,17 +411,28 @@ pub const Transport = struct {
         self.noteViolation(was_active);
     }
 
-    fn processShort(self: *Transport, arrival: quicz.endpoint.UdpTuple, now_nanos: i64, data: []const u8) !void {
+    fn processShort(
+        self: *Transport,
+        arrival: quicz.endpoint.UdpTuple,
+        now_nanos: i64,
+        data: []const u8,
+        challenge: *const [8]u8,
+    ) !bool {
         const was_active = self.conn.connectionState() == .active;
-        const res = self.lifecycle.processRoutedProtectedShortDatagramWithInstalledKeysAndUpdatePathOrCloseAddress(
+        const res = self.lifecycle.processRoutedProtectedShortDatagramWithInstalledKeysAndUpdatePathOrCloseAddressWithOptions(
             handle,
             self.conn,
             arrival,
             now_nanos,
             data,
-        ) catch |err| return self.classifyReceive(was_active, err);
+            .{ .path_challenge_data = challenge.* },
+        ) catch |err| {
+            try self.classifyReceive(was_active, err);
+            return false;
+        };
         self.noteViolation(was_active);
         if (res.updated_route != null) self.counters.migrations_committed += 1;
+        return res.path_challenge_queued;
     }
 
     /// The client's Retry sequence: validate the integrity tag, record
@@ -542,6 +565,109 @@ pub const Transport = struct {
         return dg;
     }
 
+    /// One outbound datagram together with the UDP path it must be
+    /// sent on — never inferred from pending state: short-space output
+    /// carries quicz's atomic egress binding (the frame the packet
+    /// actually contains); Initial/Handshake output uses the committed
+    /// route for THIS endpoint's own CID. Caller owns and frees `dg`.
+    pub const TaggedDatagram = struct {
+        dg: []u8,
+        dst: quicz.endpoint.UdpTuple,
+    };
+
+    pub fn pollOutboundPath(self: *Transport, now_nanos: i64) !?TaggedDatagram {
+        if (!self.conn.packetNumberSpaceDiscarded(.initial)) {
+            if (self.secrets) |*secrets| {
+                if (self.lifecycle.pollProtectedLongDatagram(
+                    handle,
+                    self.conn,
+                    now_nanos,
+                    self.initialDst(),
+                    &self.scid,
+                    &[_]u8{},
+                    .{ .initial = if (self.is_server) secrets.server else secrets.client },
+                )) |maybe| {
+                    if (maybe) |dg| {
+                        const checked_dg = try self.initialChecked(dg);
+                        return .{ .dg = checked_dg.?, .dst = try self.routePath() };
+                    }
+                } else |err| switch (err) {
+                    error.ConnectionClosed => {},
+                    else => return err,
+                }
+            }
+        }
+        if (!self.conn.packetNumberSpaceDiscarded(.handshake) and self.conn.hasHandshakeProtectionKeys()) {
+            if (self.lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(
+                handle,
+                self.conn,
+                now_nanos,
+                self.dstCid(),
+                &self.scid,
+            )) |maybe| {
+                if (maybe) |dg| return .{ .dg = (try self.checked(dg)).?, .dst = try self.routePath() };
+            } else |err| switch (err) {
+                error.ConnectionClosed => {},
+                else => return err,
+            }
+        }
+        if (self.conn.hasOneRttProtectionKeys()) {
+            if (self.lifecycle.pollProtectedShortDatagramWithInstalledKeysAndPath(
+                handle,
+                self.conn,
+                now_nanos,
+                self.dstCid(),
+            )) |maybe| {
+                if (maybe) |egress| {
+                    return .{
+                        .dg = (try self.checked(egress.datagram)).?,
+                        .dst = egress.path_override orelse try self.routePath(),
+                    };
+                }
+            } else |err| switch (err) {
+                error.ConnectionClosed => {},
+                else => return err,
+            }
+        }
+        return null;
+    }
+
+    /// The committed route for this endpoint's own CID — the
+    /// destination for every emission without an explicit path
+    /// binding.
+    fn routePath(self: *Transport) !quicz.endpoint.UdpTuple {
+        return self.lifecycle.currentRoutePathAddress(&self.scid) catch error.NoRegisteredPath;
+    }
+
+    /// The result of servicing a due QUIC deadline: the full tagged
+    /// datagram when recovery produced output, or the retirement arm
+    /// when the lifecycle retired the connection (its routes are
+    /// already gone — the owner drops the record, it does not
+    /// re-retire).
+    pub const ServiceResult = union(enum) {
+        datagram: TaggedDatagram,
+        idle_retired,
+        close_retired,
+        no_output,
+    };
+
+    /// Service the earliest due deadline: idle/close expiry retires
+    /// the connection through the lifecycle; key-discard and PTO
+    /// recovery are serviced, and a serviced PTO's retransmission is
+    /// returned path-tagged. Plain `nextDeadlineNanos` only REPORTS a
+    /// deadline — this services it.
+    pub fn serviceDueDeadline(self: *Transport, now_nanos: i64) !ServiceResult {
+        const deadline = self.lifecycle.nextDeadline(handle, self.conn) orelse return .no_output;
+        if (deadline.deadline_nanos > now_nanos) return .no_output;
+        const work = try self.lifecycle.processPendingWork(handle, self.conn, now_nanos);
+        if (work.idle_retired != null) return .idle_retired;
+        if (work.close_retired != null) return .close_retired;
+        if (work.recovery_serviced != null) {
+            if (try self.pollOutboundPath(now_nanos)) |tagged| return .{ .datagram = tagged };
+        }
+        return .no_output;
+    }
+
     /// Initial-space destination. The client sends to the Retry SCID
     /// once a Retry has been processed (else its first-flight ODCID);
     /// the server sends to the authenticated peer CID. All of it is
@@ -671,6 +797,7 @@ const RetryBoundary = struct {
 const client_scid = [_]u8{ 0x21, 0x22, 0x23, 0x24 };
 const retry_scid = [_]u8{ 0x31, 0x32, 0x33, 0x34 };
 const original_dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+const test_challenge = [_]u8{ 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78 };
 
 /// Create the server candidate and adopt it into the boundary's
 /// private capacity-one registry WITHOUT installing a CID route. On
@@ -747,7 +874,7 @@ const FirstExchange = struct {
         const token = try boundary.policy.issueTokenForPath(alloc, .retry, now, 10 * std.time.ns_per_s, server_path, boundary.nonce);
         errdefer alloc.free(token);
         const retry = try boundary.slot.open(alloc, now, 10 * std.time.ns_per_s, server_path, .v1, accept1.original_destination_connection_id, accept1.source_connection_id, &retry_scid, token);
-        try client.handleDatagram(client_path, now, retry);
+        _ = try client.handleDatagram(client_path, now, retry, &test_challenge);
 
         // ── Follow-up Initial: rekeyed, token echoed. ────────────────
         now += 1;
@@ -852,7 +979,7 @@ const TestPair = struct {
 
         // ── Authenticate the follow-up Initial (routed: its DCID must
         // be this candidate's Retry SCID). ───────────────────────────
-        try server.handleDatagram(ex.server_path, now, ex.followup);
+        _ = try server.handleDatagram(ex.server_path, now, ex.followup, &test_challenge);
         try server.driveCrypto(.initial, now);
         const sh = (try server.pollOutbound(now)) orelse return error.NotAuthenticated;
         defer alloc.free(sh);
@@ -875,7 +1002,7 @@ const TestPair = struct {
 
         // Publication: the ServerHello (already authenticated) is now
         // delivered to the client — routed like every datagram here.
-        try ex.client.handleDatagram(ex.client_path, now, sh);
+        _ = try ex.client.handleDatagram(ex.client_path, now, sh, &test_challenge);
 
         var pair = TestPair{
             .client = ex.client,
@@ -914,7 +1041,7 @@ const TestPair = struct {
     fn deliverOrPark(self: *TestPair, alloc: std.mem.Allocator, from_server: bool, dg: []const u8) !void {
         const receiver = if (from_server) self.client else self.server;
         const info = protection.peekProtectedLongPacketInfo(dg) catch {
-            try receiver.handleDatagram(self.arrivalFor(from_server), self.now_nanos, dg);
+            _ = try receiver.handleDatagram(self.arrivalFor(from_server), self.now_nanos, dg, &test_challenge);
             return;
         };
         if (info.packet_type == .handshake and !receiver.conn.hasHandshakeProtectionKeys()) {
@@ -922,7 +1049,7 @@ const TestPair = struct {
             try self.parked_from_server.append(alloc, from_server);
             return;
         }
-        try receiver.handleDatagram(self.arrivalFor(from_server), self.now_nanos, dg);
+        _ = try receiver.handleDatagram(self.arrivalFor(from_server), self.now_nanos, dg, &test_challenge);
     }
 
     fn arrivalFor(self: *const TestPair, from_server: bool) quicz.endpoint.UdpTuple {
@@ -941,7 +1068,7 @@ const TestPair = struct {
                 i += 1;
                 continue;
             }
-            try receiver.handleDatagram(self.arrivalFor(from_server), self.now_nanos, dg);
+            _ = try receiver.handleDatagram(self.arrivalFor(from_server), self.now_nanos, dg, &test_challenge);
             alloc.free(dg);
             _ = self.parked.orderedRemove(i);
             _ = self.parked_from_server.orderedRemove(i);
@@ -1052,7 +1179,7 @@ test "Retry transaction loopback: adopt, authenticate, commit, echo both ways" {
     while (up < 8) : (up += 1) {
         const dg = (try pair.client.pollOutbound(pair.now_nanos)) orelse break;
         defer alloc.free(dg);
-        try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg);
+        _ = try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg, &test_challenge);
     }
     var buf: [128]u8 = undefined;
     const n = (try pair.server.connection().recvOnStream(stream_id, &buf)) orelse return error.NoUplink;
@@ -1063,7 +1190,7 @@ test "Retry transaction loopback: adopt, authenticate, commit, echo both ways" {
     while (down < 8) : (down += 1) {
         const dg = (try pair.server.pollOutbound(pair.now_nanos)) orelse break;
         defer alloc.free(dg);
-        try pair.client.handleDatagram(pair.client_path, pair.now_nanos, dg);
+        _ = try pair.client.handleDatagram(pair.client_path, pair.now_nanos, dg, &test_challenge);
     }
     var cbuf: [128]u8 = undefined;
     const cn = (try pair.client.connection().recvOnStream(stream_id, &cbuf)) orelse return error.NoDownlink;
@@ -1114,21 +1241,24 @@ test "migration: rebind + validate through the guarded feed" {
 
     const s = try pair.client.connection().openStream();
     try pair.client.connection().sendOnStream(s, "from-new-path", false);
+    // The first authenticated changed-path packet CONSUMES the
+    // caller's pre-generated challenge — the bridge queues exactly
+    // one path-bound challenge — and no later packet consumes another.
+    var bridge_consumed: usize = 0;
     var up: usize = 0;
     while (up < 8) : (up += 1) {
         const dg = (try pair.client.pollOutbound(pair.now_nanos)) orelse break;
         defer alloc.free(dg);
-        try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg);
+        if (try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg, &test_challenge)) bridge_consumed += 1;
     }
+    try testing.expectEqual(@as(usize, 1), bridge_consumed);
     var buf: [128]u8 = undefined;
     const n = (try pair.server.connection().recvOnStream(s, &buf)) orelse return error.NoData;
     try testing.expectEqualStrings("from-new-path", buf[0..n]);
 
-    // The gateway initiates validation for a changed path by queueing
-    // an unpredictable challenge bound to the candidate path.
-    const challenge_data = [_]u8{ 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58 };
-    try pair.server.conn.sendPathChallengeForPath(challenge_data, pair.server_path);
-    // Queued as pending; it becomes outstanding once polled and sent.
+    // The bridge-queued challenge is pending; it becomes outstanding
+    // once polled and sent, and the server answers nothing else
+    // manually — the caller-supplied bytes were the only challenge.
     try testing.expectEqual(@as(usize, 1), pair.server.connection().pendingPathChallengeCount());
 
     // Transmit the challenge so it becomes outstanding, then answer it
@@ -1153,7 +1283,7 @@ test "migration: rebind + validate through the guarded feed" {
     while (up2 < 8) : (up2 += 1) {
         const dg = (try pair.client.pollOutbound(pair.now_nanos)) orelse break;
         defer alloc.free(dg);
-        try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg);
+        _ = try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg, &test_challenge);
     }
     const n2 = (try pair.server.connection().recvOnStream(s, &buf)) orelse return error.NoDataAfterMigration;
     try testing.expectEqualStrings("after-migration", buf[0..n2]);
@@ -1178,7 +1308,7 @@ test "shutdown: initiator closing, peer draining, single wipe path" {
     while (close_budget < 8) : (close_budget += 1) {
         const dg = (try pair.client.pollOutbound(pair.now_nanos)) orelse break;
         defer alloc.free(dg);
-        try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg);
+        _ = try pair.server.handleDatagram(pair.server_path, pair.now_nanos, dg, &test_challenge);
         saw_close = true;
     }
     try testing.expect(saw_close);
@@ -1226,7 +1356,7 @@ test "wrong-PSK candidate: binder failure, no commit, registry retirement" {
         .token = ex.token,
         .now_nanos = ex.now_nanos,
     }, ex.server_path.local, ex.server_path.remote);
-    try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup);
+    _ = try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup, &test_challenge);
 
     // The TLS drive fails at the pre-shared-key binder (surfaced by
     // the lifecycle as CryptoError).
@@ -1274,7 +1404,7 @@ test "unknown-CID Initial is discarded by routing; the same datagram is accepted
     // route-first dispatch is bypassed.
     try testing.expectEqual(@as(u64, 0), server.conn.nextPeerPacketNumber(.initial));
     const discards = server.counters.datagrams_discarded;
-    try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup);
+    _ = try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup, &test_challenge);
     try testing.expectEqual(discards + 1, server.counters.datagrams_discarded);
     try testing.expectEqual(@as(u64, 0), server.conn.nextPeerPacketNumber(.initial));
     try testing.expect(server.conn.connectionState() == .active);
@@ -1282,7 +1412,7 @@ test "unknown-CID Initial is discarded by routing; the same datagram is accepted
     // Positive control: install the route and the IDENTICAL datagram
     // is accepted — the rejection above was routing, not AEAD.
     try server.registerRoute(ex.server_path.local, ex.server_path.remote);
-    try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup);
+    _ = try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup, &test_challenge);
     try testing.expect(server.conn.nextPeerPacketNumber(.initial) > 0);
 }
 
@@ -1337,14 +1467,14 @@ test "changed-path Initial is discarded before state change; correct path still 
     moved.remote = quicz.endpoint.UdpAddress.init4([_]u8{ 127, 0, 0, 1 }, 40001);
     try testing.expectEqual(@as(u64, 0), server.conn.nextPeerPacketNumber(.initial));
     const discards = server.counters.datagrams_discarded;
-    try server.handleDatagram(moved, ex.now_nanos, ex.followup);
+    _ = try server.handleDatagram(moved, ex.now_nanos, ex.followup, &test_challenge);
     try testing.expectEqual(discards + 1, server.counters.datagrams_discarded);
     try testing.expectEqual(@as(u64, 0), server.conn.nextPeerPacketNumber(.initial));
     try testing.expect(server.conn.connectionState() == .active);
 
     // Delivered afterward on the registered path, the same datagram
     // still processes.
-    try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup);
+    _ = try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup, &test_challenge);
     try testing.expect(server.conn.nextPeerPacketNumber(.initial) > 0);
 }
 
@@ -1398,7 +1528,7 @@ test "malformed Retry: integrity-tag corruption discards without rekey" {
     var expected = try protection.deriveInitialSecrets(.v1, &original_dcid);
     defer protection.secureWipeInitialSecrets(&expected);
     const discards = client.counters.datagrams_discarded;
-    try client.handleDatagram(client_path, now, corrupt);
+    _ = try client.handleDatagram(client_path, now, corrupt, &test_challenge);
     try testing.expectEqual(discards + 1, client.counters.datagrams_discarded);
     // No rekey: no Retry SCID recorded, Initial secrets unchanged —
     // compared field-wise through borrowed pointers, never by
@@ -1443,7 +1573,7 @@ test "authenticated violation: fresh PN, closing, close via pollOutbound, peer d
     const violations = pair.server.counters.protocol_violations;
     // Returns NORMALLY: the authenticated violation closed the
     // connection; the close frame leaves through pollOutbound.
-    try pair.server.handleDatagram(pair.server_path, pair.now_nanos, bad);
+    _ = try pair.server.handleDatagram(pair.server_path, pair.now_nanos, bad, &test_challenge);
     try testing.expectEqual(violations + 1, pair.server.counters.protocol_violations);
     try testing.expect(pair.server.conn.connectionState() == .closing);
 
@@ -1452,7 +1582,7 @@ test "authenticated violation: fresh PN, closing, close via pollOutbound, peer d
     while (budget < 8) : (budget += 1) {
         const dg = (try pair.server.pollOutbound(pair.now_nanos)) orelse break;
         defer alloc.free(dg);
-        try pair.client.handleDatagram(pair.client_path, pair.now_nanos, dg);
+        _ = try pair.client.handleDatagram(pair.client_path, pair.now_nanos, dg, &test_challenge);
         saw_close = true;
     }
     try testing.expect(saw_close);
@@ -1478,7 +1608,8 @@ test "datagram bounds: oversized inbound discarded, oversized outbound freed" {
     @memset(oversize_in, 0);
     const discards = pair.server.counters.datagrams_discarded;
     const state = pair.server.conn.connectionState();
-    try pair.server.handleDatagram(pair.server_path, pair.now_nanos, oversize_in);
+    const oversize_queued = try pair.server.handleDatagram(pair.server_path, pair.now_nanos, oversize_in, &test_challenge);
+    try testing.expect(!oversize_queued);
     try testing.expectEqual(discards + 1, pair.server.counters.datagrams_discarded);
     try testing.expectEqual(state, pair.server.conn.connectionState());
 
@@ -1505,4 +1636,73 @@ test "failed handshake after ownership transfer cleans up exactly once" {
         error.HandshakeNotConfirmed,
         TestPair.initAttempts(alloc, &psk, 0),
     );
+}
+
+test "lost ServerHello recovers through Initial PTO via serviceDueDeadline" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testPsk(&bootstrap, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var ex = try FirstExchange.open(alloc, &psk);
+    defer ex.deinit(alloc);
+
+    const server = try createAndAdopt(alloc, &ex.boundary, .{
+        .psk = &psk,
+        .retry_scid = retry_scid,
+        .original_dcid = original_dcid,
+        .client_scid = client_scid,
+        .token = ex.token,
+        .now_nanos = ex.now_nanos,
+    }, ex.server_path.local, ex.server_path.remote);
+
+    _ = try server.handleDatagram(ex.server_path, ex.now_nanos, ex.followup, &test_challenge);
+    try server.driveCrypto(.initial, ex.now_nanos);
+    const sh = (try server.pollOutbound(ex.now_nanos)) orelse return error.NotAuthenticated;
+    // LOST: the ServerHello never reaches the client, no fd is
+    // readable, and only the QUIC timer can make progress — the exact
+    // scenario the installed-key-only due helper cannot service.
+    alloc.free(sh);
+
+    var now = ex.now_nanos;
+    var attempt: usize = 0;
+    while (attempt < 8) : (attempt += 1) {
+        const deadline = server.nextDeadlineNanos() orelse break;
+        now = @max(now, deadline) + 1;
+        const result = try server.serviceDueDeadline(now);
+        if (result == .datagram) {
+            const tagged = result.datagram;
+            defer alloc.free(tagged.dg);
+            // The Initial-space retransmission is path-tagged with the
+            // committed route for this endpoint's own CID.
+            try testing.expect(tagged.dg.len >= min_initial_dgram);
+            const committed = try server.lifecycle.currentRoutePathAddress(&retry_scid);
+            try testing.expect(tagged.dst.local.eql(committed.local));
+            try testing.expect(tagged.dst.remote.eql(committed.remote));
+            return;
+        }
+    }
+    return error.ExpectedInitialPto;
+}
+
+test "serviceDueDeadline surfaces idle retirement after the deadline" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testPsk(&bootstrap, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var pair = try TestPair.init(alloc, &psk);
+    defer pair.deinit(alloc);
+
+    // Established and idle: the earliest deadline is the idle timeout.
+    // Servicing past it retires the connection through the lifecycle;
+    // the record owner then DROPS the record rather than re-retiring.
+    const deadline = pair.server.nextDeadlineNanos() orelse return error.NoDeadline;
+    const result = try pair.server.serviceDueDeadline(deadline + 1);
+    try testing.expect(result == .idle_retired);
+    try testing.expect(pair.server.conn.connectionState() == .closed);
 }
