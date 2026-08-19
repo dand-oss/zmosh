@@ -9,8 +9,8 @@
             .hash = "ghostty-1.3.2-dev-5UdBCw7jLQVbzMzfCu-BNb7P4o6P3L9WjORwuelawrt6",
         },
         .quicz = .{
-            .url = "git+https://github.com/dand-oss/quicz#7ac9bf9c4053f3ec822608eb4e8c76e4bc74c337",
-            .hash = "quicz-0.1.0-g2J97-pSlwAi9hW_6U_sCXFXyiNIPpgQ5gss02lO6zq1",
+            .url = "git+https://github.com/dand-oss/quicz#fc99692500610f1aa45aa8205bef0d239fe83eda",
+            .hash = "quicz-0.1.0-g2J972ZxlwDAXOpPpCgoeOkM0zOUhaDplBDgtL6Mj1jQ",
         },
     },
     .paths = .{

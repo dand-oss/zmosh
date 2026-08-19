@@ -500,56 +500,89 @@ pub const Transport = struct {
     }
 
     /// Poll the next outbound datagram (Initial, Handshake, or 1-RTT
-    /// space, in that order). Caller owns and frees the result. Every
+    /// space, in that order) — the shared per-space helpers, path
+    /// facts discarded. Caller owns and frees the result. Every
     /// emission is checked against the fixed cap: an oversized
     /// datagram is freed and reported as a local error (never a
     /// debug-only assertion). Only polling a closed endpoint is a
     /// tolerated non-event; encoding/invariant errors propagate.
     pub fn pollOutbound(self: *Transport, now_nanos: i64) !?[]u8 {
-        if (!self.conn.packetNumberSpaceDiscarded(.initial)) {
-            if (self.secrets) |*secrets| {
-                if (self.lifecycle.pollProtectedLongDatagram(
-                    handle,
-                    self.conn,
-                    now_nanos,
-                    self.initialDst(),
-                    &self.scid,
-                    &[_]u8{},
-                    .{ .initial = if (self.is_server) secrets.server else secrets.client },
-                )) |maybe| {
-                    if (maybe) |dg| return self.initialChecked(dg);
-                } else |err| switch (err) {
-                    error.ConnectionClosed => {},
-                    else => return err,
-                }
-            }
-        }
-        if (!self.conn.packetNumberSpaceDiscarded(.handshake) and self.conn.hasHandshakeProtectionKeys()) {
-            if (self.lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(
+        if (try self.pollInitialSpace(now_nanos)) |e| return e.dg;
+        if (try self.pollHandshakeSpace(now_nanos)) |e| return e.dg;
+        if (try self.pollShortSpace(now_nanos)) |e| return e.dg;
+        return null;
+    }
+
+    /// One datagram in hand plus the egress facts quicz derived from
+    /// the packet actually built: the path-validation binding (null =
+    /// the committed route applies) and whether the packet carries a
+    /// PING frame.
+    const SpaceEgress = struct {
+        dg: []u8,
+        path_override: ?quicz.endpoint.UdpTuple = null,
+        emitted_ping: bool = false,
+    };
+
+    /// The Initial-space emission, invariant-checked
+    /// (`initialChecked`).
+    fn pollInitialSpace(self: *Transport, now_nanos: i64) !?SpaceEgress {
+        if (self.conn.packetNumberSpaceDiscarded(.initial)) return null;
+        if (self.secrets) |*secrets| {
+            if (self.lifecycle.pollProtectedLongDatagram(
                 handle,
                 self.conn,
                 now_nanos,
-                self.dstCid(),
+                self.initialDst(),
                 &self.scid,
+                &[_]u8{},
+                .{ .initial = if (self.is_server) secrets.server else secrets.client },
             )) |maybe| {
-                if (maybe) |dg| return self.checked(dg);
+                if (maybe) |dg| return .{ .dg = (try self.initialChecked(dg)).? };
             } else |err| switch (err) {
                 error.ConnectionClosed => {},
                 else => return err,
             }
         }
-        if (self.conn.hasOneRttProtectionKeys()) {
-            if (self.lifecycle.pollProtectedShortDatagramWithInstalledKeys(
-                handle,
-                self.conn,
-                now_nanos,
-                self.dstCid(),
-            )) |maybe| {
-                if (maybe) |dg| return self.checked(dg);
-            } else |err| switch (err) {
-                error.ConnectionClosed => {},
-                else => return err,
-            }
+        return null;
+    }
+
+    /// The Handshake-space emission with installed keys.
+    fn pollHandshakeSpace(self: *Transport, now_nanos: i64) !?SpaceEgress {
+        if (self.conn.packetNumberSpaceDiscarded(.handshake)) return null;
+        if (!self.conn.hasHandshakeProtectionKeys()) return null;
+        if (self.lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(
+            handle,
+            self.conn,
+            now_nanos,
+            self.dstCid(),
+            &self.scid,
+        )) |maybe| {
+            if (maybe) |dg| return .{ .dg = (try self.checked(dg)).? };
+        } else |err| switch (err) {
+            error.ConnectionClosed => {},
+            else => return err,
+        }
+        return null;
+    }
+
+    /// The 1-RTT short-space emission with installed keys, carrying
+    /// quicz's atomic egress facts.
+    fn pollShortSpace(self: *Transport, now_nanos: i64) !?SpaceEgress {
+        if (!self.conn.hasOneRttProtectionKeys()) return null;
+        if (self.lifecycle.pollProtectedShortDatagramWithInstalledKeysAndPath(
+            handle,
+            self.conn,
+            now_nanos,
+            self.dstCid(),
+        )) |maybe| {
+            if (maybe) |egress| return .{
+                .dg = (try self.checked(egress.datagram)).?,
+                .path_override = egress.path_override,
+                .emitted_ping = egress.emitted_ping,
+            };
+        } else |err| switch (err) {
+            error.ConnectionClosed => {},
+            else => return err,
         }
         return null;
     }
@@ -568,67 +601,30 @@ pub const Transport = struct {
     /// One outbound datagram together with the UDP path it must be
     /// sent on — never inferred from pending state: short-space output
     /// carries quicz's atomic egress binding (the frame the packet
-    /// actually contains); Initial/Handshake output uses the committed
-    /// route for THIS endpoint's own CID. Caller owns and frees `dg`.
+    /// actually contains, plus whether it holds a PING);
+    /// Initial/Handshake output uses the committed route for THIS
+    /// endpoint's own CID. Caller owns and frees `dg`.
     pub const TaggedDatagram = struct {
         dg: []u8,
         dst: quicz.endpoint.UdpTuple,
+        emitted_ping: bool = false,
     };
 
+    /// Bind one in-hand emission to its destination, freeing the
+    /// datagram when the committed route cannot be resolved.
+    fn tagRouted(self: *Transport, e: SpaceEgress) !TaggedDatagram {
+        errdefer self.alloc.free(e.dg);
+        return .{
+            .dg = e.dg,
+            .dst = e.path_override orelse try self.routePath(),
+            .emitted_ping = e.emitted_ping,
+        };
+    }
+
     pub fn pollOutboundPath(self: *Transport, now_nanos: i64) !?TaggedDatagram {
-        if (!self.conn.packetNumberSpaceDiscarded(.initial)) {
-            if (self.secrets) |*secrets| {
-                if (self.lifecycle.pollProtectedLongDatagram(
-                    handle,
-                    self.conn,
-                    now_nanos,
-                    self.initialDst(),
-                    &self.scid,
-                    &[_]u8{},
-                    .{ .initial = if (self.is_server) secrets.server else secrets.client },
-                )) |maybe| {
-                    if (maybe) |dg| {
-                        const checked_dg = try self.initialChecked(dg);
-                        return .{ .dg = checked_dg.?, .dst = try self.routePath() };
-                    }
-                } else |err| switch (err) {
-                    error.ConnectionClosed => {},
-                    else => return err,
-                }
-            }
-        }
-        if (!self.conn.packetNumberSpaceDiscarded(.handshake) and self.conn.hasHandshakeProtectionKeys()) {
-            if (self.lifecycle.pollProtectedHandshakeDatagramWithInstalledKeys(
-                handle,
-                self.conn,
-                now_nanos,
-                self.dstCid(),
-                &self.scid,
-            )) |maybe| {
-                if (maybe) |dg| return .{ .dg = (try self.checked(dg)).?, .dst = try self.routePath() };
-            } else |err| switch (err) {
-                error.ConnectionClosed => {},
-                else => return err,
-            }
-        }
-        if (self.conn.hasOneRttProtectionKeys()) {
-            if (self.lifecycle.pollProtectedShortDatagramWithInstalledKeysAndPath(
-                handle,
-                self.conn,
-                now_nanos,
-                self.dstCid(),
-            )) |maybe| {
-                if (maybe) |egress| {
-                    return .{
-                        .dg = (try self.checked(egress.datagram)).?,
-                        .dst = egress.path_override orelse try self.routePath(),
-                    };
-                }
-            } else |err| switch (err) {
-                error.ConnectionClosed => {},
-                else => return err,
-            }
-        }
+        if (try self.pollInitialSpace(now_nanos)) |e| return try self.tagRouted(e);
+        if (try self.pollHandshakeSpace(now_nanos)) |e| return try self.tagRouted(e);
+        if (try self.pollShortSpace(now_nanos)) |e| return try self.tagRouted(e);
         return null;
     }
 
@@ -653,19 +649,29 @@ pub const Transport = struct {
 
     /// Service the earliest due deadline: idle/close expiry retires
     /// the connection through the lifecycle; key-discard and PTO
-    /// recovery are serviced, and a serviced PTO's retransmission is
-    /// returned path-tagged. Plain `nextDeadlineNanos` only REPORTS a
-    /// deadline — this services it.
+    /// recovery are serviced. The CAPTURED deadline kind gates the
+    /// recovery arm — on a delayed wakeup an earlier key-discard and a
+    /// later recovery deadline can BOTH be due, and
+    /// `processPendingWork` services both; the frozen key-discard
+    /// contract stays `no_output`. The space dispatched is the
+    /// AUTHORITATIVE serviced timer, and a serviced PTO's
+    /// retransmission comes from exactly that space — never from
+    /// unrelated pending output. Plain `nextDeadlineNanos` only
+    /// REPORTS a deadline — this services it.
     pub fn serviceDueDeadline(self: *Transport, now_nanos: i64) !ServiceResult {
         const deadline = self.lifecycle.nextDeadline(handle, self.conn) orelse return .no_output;
         if (deadline.deadline_nanos > now_nanos) return .no_output;
         const work = try self.lifecycle.processPendingWork(handle, self.conn, now_nanos);
         if (work.idle_retired != null) return .idle_retired;
         if (work.close_retired != null) return .close_retired;
-        if (work.recovery_serviced != null) {
-            if (try self.pollOutboundPath(now_nanos)) |tagged| return .{ .datagram = tagged };
-        }
-        return .no_output;
+        if (deadline.kind != .recovery) return .no_output;
+        const serviced = work.recovery_serviced orelse return .no_output;
+        const egress = switch (serviced.timer.space) {
+            .initial => try self.pollInitialSpace(now_nanos),
+            .handshake => try self.pollHandshakeSpace(now_nanos),
+            .application => try self.pollShortSpace(now_nanos),
+        } orelse return .no_output;
+        return .{ .datagram = try self.tagRouted(egress) };
     }
 
     /// Initial-space destination. The client sends to the Retry SCID
@@ -1676,7 +1682,10 @@ test "lost ServerHello recovers through Initial PTO via serviceDueDeadline" {
             const tagged = result.datagram;
             defer alloc.free(tagged.dg);
             // The Initial-space retransmission is path-tagged with the
-            // committed route for this endpoint's own CID.
+            // committed route for this endpoint's own CID — and it IS
+            // an Initial: a long-header datagram, never a pending
+            // Handshake/1-RTT emission standing in for the due probe.
+            try testing.expect(tagged.dg[0] & 0x80 != 0);
             try testing.expect(tagged.dg.len >= min_initial_dgram);
             const committed = try server.lifecycle.currentRoutePathAddress(&retry_scid);
             try testing.expect(tagged.dst.local.eql(committed.local));
@@ -1705,4 +1714,108 @@ test "serviceDueDeadline surfaces idle retirement after the deadline" {
     const result = try pair.server.serviceDueDeadline(deadline + 1);
     try testing.expect(result == .idle_retired);
     try testing.expect(pair.server.conn.connectionState() == .closed);
+}
+
+test "due application recovery emits only the application-space probe" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testPsk(&bootstrap, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var pair = try TestPair.init(alloc, &psk);
+    defer pair.deinit(alloc);
+
+    // An unacknowledged application PING arms the application PTO;
+    // the client never answers it.
+    const t = pair.now_nanos + 1;
+    try pair.server.conn.sendPing();
+    const ping = (try pair.server.pollOutboundPath(t)) orelse return error.NoPingEmission;
+    defer alloc.free(ping.dg);
+    try testing.expect(ping.emitted_ping);
+
+    // Past the PTO the serviced space is application, and the returned
+    // probe is a SHORT-header datagram: no pending long-header
+    // Initial/Handshake output can stand in for the due space's probe.
+    const result = try pair.server.serviceDueDeadline(t + 60 * std.time.ns_per_s);
+    if (result != .datagram) return error.ExpectedApplicationProbe;
+    const probe = result.datagram;
+    defer alloc.free(probe.dg);
+    try testing.expect(probe.dg[0] & 0x80 == 0);
+    const committed = try pair.server.lifecycle.currentRoutePathAddress(&retry_scid);
+    try testing.expect(probe.dst.local.eql(committed.local));
+    try testing.expect(probe.dst.remote.eql(committed.remote));
+}
+
+test "tagRouted frees the datagram when the committed route is missing" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testPsk(&bootstrap, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var ex = try FirstExchange.open(alloc, &psk);
+    defer ex.deinit(alloc);
+
+    // Adopted WITHOUT a route (the round-3 route-first idiom). An
+    // emission in hand with no `path_override` must resolve the
+    // committed route through this endpoint's own CID; the failure
+    // path is tagRouted — the ONE allocation-cleanup site every
+    // egress entry (`pollOutboundPath`, `serviceDueDeadline`) shares.
+    const server = try adoptCandidate(alloc, &ex.boundary, .{
+        .psk = &psk,
+        .retry_scid = retry_scid,
+        .original_dcid = original_dcid,
+        .client_scid = client_scid,
+        .token = ex.token,
+        .now_nanos = ex.now_nanos,
+    });
+    const dg = try alloc.alloc(u8, 64);
+    // The in-hand datagram is freed on the route failure — the testing
+    // allocator fails the test on any leak.
+    try testing.expectError(error.NoRegisteredPath, server.tagRouted(.{ .dg = dg }));
+}
+
+test "key-discard earliest keeps a simultaneously due recovery probe silent" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testPsk(&bootstrap, &psk);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var pair = try TestPair.init(alloc, &psk);
+    defer pair.deinit(alloc);
+
+    // A key update retains the previous generation with a discard
+    // deadline — the EARLIEST deadline on the now-idle connection.
+    const t_update = pair.now_nanos + 1;
+    pair.server.conn.last_packet_activity_nanos = t_update;
+    try pair.server.conn.initiateOneRttKeyUpdate();
+    const discard_deadline = pair.server.nextDeadlineNanos() orelse return error.NoDiscardDeadline;
+
+    // An application PING emitted just before that deadline arms a
+    // LATER recovery timer — both become due by the service time.
+    const t_ping = discard_deadline - 10;
+    try pair.server.conn.sendPing();
+    const ping = (try pair.server.pollOutboundPath(t_ping)) orelse return error.NoPingEmission;
+    defer alloc.free(ping.dg);
+    try testing.expect(ping.emitted_ping);
+    try testing.expectEqual(discard_deadline, pair.server.nextDeadlineNanos().?);
+
+    // Delayed wakeup: `processPendingWork` services BOTH the expired
+    // key discard and the due PTO, but the CAPTURED earliest kind is
+    // key-discard — the frozen contract returns no output.
+    const t_service = t_ping + 60 * std.time.ns_per_s;
+    try testing.expect(pair.server.nextDeadlineNanos().? <= t_service);
+    const silenced = try pair.server.serviceDueDeadline(t_service);
+    try testing.expect(silenced == .no_output);
+
+    // The queued recovery probe is untouched and remains available to
+    // normal polling.
+    const probe = (try pair.server.pollOutbound(t_service)) orelse return error.NoProbeAvailable;
+    defer alloc.free(probe);
+    try testing.expect(probe[0] & 0x80 == 0);
 }
