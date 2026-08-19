@@ -2123,3 +2123,176 @@ test "zmq1 relay: client reset of the input stream ends input without an error" 
     try testing.expect(sess.input_done);
     try testing.expect(!sess.closedOrEnding());
 }
+
+// ─── Client driver tests: the socket-owning Q5/Q6 client ───────────
+
+fn driverRound(loop: *quic_test.Loop, driver: *quic_client.Client, now: i64) !?quic_client.ControlEvent {
+    const ev = try driver.pump(now);
+    _ = try loop.gw.runOnce(0);
+    return ev;
+}
+
+test "client driver: IPv4 connect, full round trip, peer close visible" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, loop.gw_addr, lib_posix.nowNs());
+    defer driver.deinit();
+
+    // Handshake + HELLO_ACK through the driver's own pump.
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..80) |i| {
+        ack = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        if (ack != null) break;
+    }
+    try testing.expect(ack != null);
+    try testing.expect(ack.? == .hello_ack);
+    try testing.expect(driver.handshakeConfirmed());
+
+    // RESIZE → .Init; input → .Input; daemon output → bounded queue.
+    try driver.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    const init_frame = (try dr.next(loop.daemon_fd)) orelse return error.NoInit;
+    try testing.expectEqual(ipc.Tag.Init, init_frame.tag);
+
+    try driver.sendInput("driver-input");
+    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    {
+        const f = (try dr.next(loop.daemon_fd)) orelse return error.NoDriverInput;
+        try testing.expectEqualStrings("driver-input", f.payload);
+    }
+
+    try ipc.send(loop.daemon_fd, .Output, "driver-output");
+    var got: []const u8 = "";
+    for (0..8) |i| {
+        _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        var obuf: [64]u8 = undefined;
+        if (try driver.pollOutput(&obuf)) |n| {
+            got = obuf[0..n];
+            break;
+        }
+    }
+    try testing.expectEqualStrings("driver-output", got);
+
+    // Daemon EOF: the SESSION_END terminal is surfaced by pump across
+    // the settle-close race, and the APPLICATION close (code 9) is
+    // visible distinctly from a transport close.
+    lib_posix.close(loop.daemon_fd);
+    loop.daemon_fd = -1;
+    var end_seen = false;
+    for (0..16) |i| {
+        if (try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)))) |e| {
+            if (e == .session_end) end_seen = true;
+        }
+        if (end_seen) break;
+    }
+    try testing.expect(end_seen);
+    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    const pc = driver.peerClose();
+    try testing.expect(pc != null);
+    try testing.expect(pc.?.kind == .application);
+    try testing.expectEqual(quic_wire.ErrCode.session_ended.code(), pc.?.code);
+}
+
+test "client driver: native IPv6 socket" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, true);
+    defer loop.deinit();
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, loop.gw_addr, lib_posix.nowNs());
+    defer driver.deinit();
+    try testing.expect(driver.sock.bound_port != 0);
+
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..64) |i| {
+        ack = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        if (ack != null) break;
+    }
+    try testing.expect(ack != null);
+    try testing.expect(ack.? == .hello_ack);
+}
+
+test "client driver: handshake timeout enforced in pump, not just the deadline" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    // No gateway at all: the HELLO goes nowhere.
+    var gw_sock = try udp.UdpSocket.bind(60400, 60500);
+    defer gw_sock.close();
+    const gw_addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, gw_sock.bound_port);
+
+    const anchor: i64 = 1_000_000;
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, gw_addr, anchor);
+    defer driver.deinit();
+
+    // Before expiry: no event.
+    try testing.expect((try driver.pump(anchor + 100)) == null);
+    // At expiry: the failure event is produced — the loop can never
+    // busy-spin on a passed deadline.
+    const ev = try driver.pump(anchor + quic_client.handshake_deadline_ns + 1);
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .err => |e| try testing.expectEqual(quic_wire.ErrCode.session_ended.code(), e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(driver.session.ended());
+}
+
+test "client driver: per-pump inbound bound" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var gw_sock = try udp.UdpSocket.bind(60400, 60500);
+    defer gw_sock.close();
+    const gw_addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, gw_sock.bound_port);
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, gw_addr, 1_000_000);
+    defer driver.deinit();
+
+    // Junk-flood the client's socket beyond the per-pump bound: one
+    // pump processes at most 64 inbound datagrams.
+    var flooder = try udp.UdpSocket.bind(60600, 60700);
+    defer flooder.close();
+    var junk: [64]u8 = undefined;
+    @memset(&junk, 0);
+    junk[0] = 0x40;
+    const junk_addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, driver.sock.bound_port);
+    for (0..80) |_| try flooder.sendTo(&junk, junk_addr);
+
+    _ = try driver.pump(1_000_100);
+    // At least 80 − 64 datagrams remain unconsumed.
+    var left: usize = 0;
+    var probe: [64]u8 = undefined;
+    while (true) {
+        _ = driver.sock.recvFrom(&probe) catch break;
+        left += 1;
+    }
+    try testing.expect(left >= 16);
+}

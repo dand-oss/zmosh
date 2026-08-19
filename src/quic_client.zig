@@ -476,6 +476,321 @@ pub const ClientSession = struct {
 pub const client_stash_cap = 4096;
 
 // ---------------------------------------------------------------------------
+// The socket-owning client driver (Q5 attach client, Q6 command client)
+// ---------------------------------------------------------------------------
+
+const lib_posix = @import("posix.zig");
+const udp = @import("udp.zig");
+const quic_gateway = @import("quic_gateway.zig");
+
+/// Application versus transport peer close, distinctly surfaced.
+pub const PeerCloseInfo = struct {
+    kind: enum { application, transport },
+    code: u64,
+    reason: []const u8,
+};
+
+/// The client control/event pump bounds, mirroring the gateway's turn.
+pub const pump_max_inbound = 64;
+pub const pump_max_outbound = 64;
+/// The bounded terminal/output accumulation: receiving STOPS while it
+/// is full; `pollOutput` drains it.
+pub const client_output_cap = 64 * 1024;
+/// Parked handshake datagrams bound; beyond it a drop is recovered by
+/// QUIC retransmission.
+pub const parked_max = 16;
+pub const handshake_deadline_ns: i64 = 10 * std.time.ns_per_s;
+
+pub const Client = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    sock: udp.UdpSocket,
+    transport: *quic_transport.Transport,
+    session: ClientSession,
+    /// The stable remote the connection was opened to (v1: fixed).
+    remote: lib_posix.Address,
+    remote_udp: quicz.endpoint.UdpAddress,
+    local_udp: quicz.endpoint.UdpAddress,
+    challenge: [8]u8,
+    handshake_deadline_ns: i64,
+
+    /// Bounded output accumulation (linear buffer with compaction).
+    out_buf: [client_output_cap]u8 = undefined,
+    out_len: usize = 0,
+    out_head: usize = 0,
+
+    /// Handshake-space datagrams that raced key installation: parked
+    /// (bounded; QUIC retransmission recovers an overflow drop) and
+    /// replayed once the keys exist — the same recovery the fixtures
+    /// perform.
+    parked: std.ArrayList([]u8) = .empty,
+    /// Whether parked[i] is a short-form (1-RTT) datagram gated on
+    /// handshake CONFIRMATION (long-form entries gate on keys).
+    parked_short: [parked_max]bool = [_]bool{false} ** parked_max,
+    /// Malformed inbound datagrams discarded at the driver boundary.
+    junk_received: usize = 0,
+    /// An allocation failure observed inside feed (surfaced by pump).
+    oom: bool = false,
+
+    const quicz = @import("quicz");
+
+    /// One client turn. Returns and CONSUMES the one-event slot; the
+    /// event's reason stays valid in the session's fixed storage until
+    /// the next pump.
+    pub fn connect(alloc: std.mem.Allocator, io: std.Io, psk: *const [32]u8, remote: lib_posix.Address, now: i64) !Client {
+        const family: u32 = switch (remote.any.family) {
+            lib_posix.AF.INET => lib_posix.AF.INET,
+            lib_posix.AF.INET6 => lib_posix.AF.INET6,
+            else => return error.UnsupportedAddressFamily,
+        };
+        var sock = try udp.UdpSocket.bindEphemeral(family);
+        errdefer sock.close();
+        var scid: [4]u8 = undefined;
+        var odcid: [8]u8 = undefined;
+        var challenge: [8]u8 = undefined;
+        io.random(&scid);
+        io.random(&odcid);
+        io.random(&challenge);
+        const transport = try quic_transport.Transport.createClient(alloc, .{
+            .psk = psk,
+            .scid = scid,
+            .original_dcid = odcid,
+        });
+        errdefer transport.destroy();
+        const remote_udp = quic_gateway.sockaddrToUdpAddress(remote) orelse return error.UnsupportedAddressFamily;
+        var bound: lib_posix.Address = std.mem.zeroes(lib_posix.Address);
+        var bound_len: lib_posix.socklen_t = @sizeOf(lib_posix.Address);
+        try lib_posix.getsockname(sock.getFd(), &bound.any, &bound_len);
+        const local_udp = quic_gateway.sockaddrToUdpAddress(bound) orelse return error.UnsupportedAddressFamily;
+        try transport.registerRoute(local_udp, remote_udp);
+        const session = try ClientSession.init(alloc, transport);
+        var c = Client{
+            .alloc = alloc,
+            .io = io,
+            .sock = sock,
+            .transport = transport,
+            .session = session,
+            .remote = remote,
+            .remote_udp = remote_udp,
+            .local_udp = local_udp,
+            .challenge = challenge,
+            .handshake_deadline_ns = now + handshake_deadline_ns,
+        };
+        try c.parked.ensureTotalCapacity(alloc, parked_max);
+        return c;
+    }
+
+    pub fn deinit(self: *Client) void {
+        for (self.parked.items) |dg| self.alloc.free(dg);
+        self.parked.deinit(self.alloc);
+        self.session.deinit();
+        self.transport.destroy();
+        self.sock.close();
+    }
+
+    pub fn handshakeConfirmed(self: *const Client) bool {
+        return self.transport.handshakeConfirmed();
+    }
+
+    /// The composed deadline: the 10 s handshake anchor until the
+    /// handshake confirms, then the transport's own deadlines. Always
+    /// in the future so a poll timeout of zero never busy-loops.
+    pub fn nextDeadline(self: *const Client, now: i64) ?i64 {
+        const transport_deadline = self.transport.nextDeadlineNanos();
+        var d: i64 = undefined;
+        if (!self.transport.handshakeConfirmed()) {
+            d = self.handshake_deadline_ns;
+            if (transport_deadline) |td| d = @min(td, d);
+        } else if (transport_deadline) |td| {
+            d = td;
+        } else {
+            return null;
+        }
+        return @max(d, now + 1);
+    }
+
+    /// The peer's close, distinctly application versus transport.
+    pub fn peerClose(self: *const Client) ?PeerCloseInfo {
+        const pc = (self.transport.connection().peerClose() orelse return null);
+        return switch (pc) {
+            .application => |a| .{ .kind = .application, .code = a.error_code, .reason = a.reason_phrase },
+            .connection => |c| .{ .kind = .transport, .code = c.error_code, .reason = c.reason_phrase },
+        };
+    }
+
+    /// Drains accumulated output into `dst` (bounded queue; receiving
+    /// stops while it is full).
+    pub fn pollOutput(self: *Client, dst: []u8) !?usize {
+        const available = self.out_len - self.out_head;
+        if (available == 0) {
+            self.compactOutput();
+            return null;
+        }
+        const n = @min(available, dst.len);
+        @memcpy(dst[0..n], self.out_buf[self.out_head .. self.out_head + n]);
+        self.out_head += n;
+        self.compactOutput();
+        return n;
+    }
+
+    fn compactOutput(self: *Client) void {
+        if (self.out_head == 0) return;
+        const keep = self.out_len - self.out_head;
+        std.mem.copyForwards(u8, self.out_buf[0..keep], self.out_buf[self.out_head..self.out_len]);
+        self.out_len = keep;
+        self.out_head = 0;
+    }
+
+    fn outputFull(self: *const Client) bool {
+        return self.out_len - self.out_head >= self.out_buf.len;
+    }
+
+    fn drainOutput(self: *Client) !void {
+        var scratch: [4096]u8 = undefined;
+        while (!self.outputFull()) {
+            const space = self.out_buf.len - self.out_len;
+            if (space == 0) return;
+            const dst = scratch[0..@min(scratch.len, space)];
+            const n = (try self.session.pollOutput(dst, null)) orelse return;
+            @memcpy(self.out_buf[self.out_len .. self.out_len + n], dst[0..n]);
+            self.out_len += n;
+        }
+    }
+
+    /// One bounded turn. Enforces the 10 s handshake timeout (a bare
+    /// nextDeadline would busy-loop after expiry), retries parked
+    /// atomic writes, sends ≤ 64 outbound datagrams (including PTO
+    /// output), drains existing state, then receives ≤ 64 inbound
+    /// datagrams — draining control/output after EACH, and stopping
+    /// when the event slot is occupied or the output queue is full.
+    pub fn pump(self: *Client, now: i64) !?ControlEvent {
+        if (!self.transport.handshakeConfirmed() and now >= self.handshake_deadline_ns) {
+            return self.failLocal(.session_ended, "handshake timeout");
+        }
+        if (!self.transport.handshakeConfirmed()) {
+            try self.transport.driveCrypto(.initial, now);
+            try self.transport.driveCrypto(.handshake, now);
+        }
+        try self.session.retryPendingSends();
+
+        var outbound: usize = 0;
+        while (outbound < pump_max_outbound) : (outbound += 1) {
+            const dg = (try self.transport.pollOutbound(now)) orelse break;
+            defer self.alloc.free(dg);
+            self.sock.sendTo(dg, self.remote) catch |e| switch (e) {
+                error.WouldBlock => break,
+                else => return e,
+            };
+        }
+        if (outbound < pump_max_outbound) {
+            switch (try self.transport.serviceDueDeadline(now)) {
+                .datagram => |tagged| {
+                    defer self.alloc.free(tagged.dg);
+                    self.sock.sendTo(tagged.dg, quic_gateway.udpAddressToSockaddr(tagged.dst.remote)) catch {};
+                },
+                else => {},
+            }
+        }
+
+        // Drain existing state BEFORE receiving.
+        var ev: ?ControlEvent = null;
+        if (try self.session.pollControl()) |e| ev = e;
+        try self.drainOutput();
+
+        var inbound: usize = 0;
+        var buf: [quic_transport.max_udp_payload]u8 = undefined;
+        while (inbound < pump_max_inbound and ev == null and !self.outputFull()) : (inbound += 1) {
+            const r = self.sock.recvFrom(&buf) catch break;
+            const arrival = quicz.endpoint.UdpTuple{ .local = self.local_udp, .remote = self.remote_udp };
+            // Park Handshake-space datagrams that race key
+            // installation; replay them once the keys exist.
+            const info = quicz.protection.peekProtectedLongPacketInfo(buf[0..r.len]) catch {
+                self.feed(arrival, now, buf[0..r.len]);
+                if (try self.session.pollControl()) |e| ev = e;
+                try self.drainOutput();
+                continue;
+            };
+            const is_short = (buf[0] & 0x80) == 0;
+            const gate_on_keys = info.packet_type == .handshake and !self.transport.conn.hasHandshakeProtectionKeys();
+            // A short-form (1-RTT) datagram that races handshake
+            // CONFIRMATION would be silently discarded by the keyless
+            // path — park it too; replay order preserves arrival.
+            const gate_on_confirm = is_short and !self.transport.handshakeConfirmed();
+            if (gate_on_keys or gate_on_confirm) {
+                if (self.parked.items.len < parked_max) {
+                    const dg = self.alloc.dupe(u8, buf[0..r.len]) catch return error.OutOfMemory;
+                    self.parked.appendAssumeCapacity(dg);
+                    self.parked_short[self.parked.items.len - 1] = gate_on_confirm;
+                }
+                continue;
+            }
+            self.feed(arrival, now, buf[0..r.len]);
+            if (try self.session.pollControl()) |e| ev = e;
+            try self.drainOutput();
+        }
+        // Replay parked datagrams whose gate has opened (handshake
+        // keys for long-form entries, confirmation for short-form).
+        var gate_i: usize = 0;
+        while (gate_i < self.parked.items.len) : (gate_i += 1) {
+            const ready = if (self.parked_short[gate_i])
+                self.transport.handshakeConfirmed()
+            else
+                self.transport.conn.hasHandshakeProtectionKeys();
+            if (!ready) continue;
+            const dg = self.parked.items[gate_i];
+            const arrival = quicz.endpoint.UdpTuple{ .local = self.local_udp, .remote = self.remote_udp };
+            _ = try self.transport.handleDatagram(arrival, now, dg, &self.challenge);
+            self.feed(arrival, now, dg);
+            if (try self.session.pollControl()) |e| ev = e;
+            try self.drainOutput();
+            self.alloc.free(dg);
+            _ = self.parked.orderedRemove(gate_i);
+            // Compact the short flags with the list.
+            var s_i = gate_i;
+            while (s_i < self.parked.items.len) : (s_i += 1) {
+                self.parked_short[s_i] = self.parked_short[s_i + 1];
+            }
+            if (ev != null) break;
+        }
+        return ev;
+    }
+
+    /// Feeds one datagram; malformed network junk is discarded and
+    /// counted (the adapter's own discard-and-count discipline for the
+    /// paths its route layer covers), only allocation failure aborts.
+    fn feed(self: *Client, arrival: quicz.endpoint.UdpTuple, now: i64, data: []const u8) void {
+        _ = self.transport.handleDatagram(arrival, now, data, &self.challenge) catch |e| switch (e) {
+            error.OutOfMemory => {
+                self.oom = true;
+                return;
+            },
+            else => self.junk_received += 1,
+        };
+    }
+
+    /// A local failure surfaced exactly like a wire one.
+    pub fn failLocal(self: *Client, code: quic_wire.ErrCode, reason: []const u8) !?ControlEvent {
+        return self.session.failControl(code, reason);
+    }
+
+    pub fn sendInput(self: *Client, bytes: []const u8) !void {
+        return self.session.sendInput(bytes);
+    }
+
+    pub fn sendResize(self: *Client, rows: u16, cols: u16, xpixel: u16, ypixel: u16) !void {
+        return self.session.sendResize(rows, cols, xpixel, ypixel);
+    }
+
+    pub fn sendDetach(self: *Client) !void {
+        return self.session.sendDetach();
+    }
+
+    pub fn sendSnapshotRequest(self: *Client) !void {
+        return self.session.sendSnapshotRequest();
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

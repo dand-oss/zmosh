@@ -68,6 +68,41 @@ pub const UdpSocket = struct {
         return null;
     }
 
+    /// Binds an EPHEMERAL port (port 0) in the given family — an IPv4
+    /// socket for an IPv4 remote, IPv6 for IPv6, so a mapped-address
+    /// route can never mismatch — and reads back the assigned port.
+    /// (`bind(0, 1)` would record port zero.)
+    pub fn bindEphemeral(family: u32) !UdpSocket {
+        const fd = try lib_posix.socket(
+            family,
+            lib_posix.SOCK.DGRAM | lib_posix.SOCK.NONBLOCK | lib_posix.SOCK.CLOEXEC,
+            0,
+        );
+        errdefer lib_posix.close(fd);
+        if (family == lib_posix.AF.INET6) {
+            const v6only: i32 = 1;
+            try lib_posix.setsockopt(fd, lib_posix.IPPROTO.IPV6, lib_posix.IPV6_V6ONLY, std.mem.asBytes(&v6only));
+        }
+        const addr = if (family == lib_posix.AF.INET6)
+            lib_posix.Address.initIp6(.{0} ** 16, 0, 0, 0)
+        else
+            lib_posix.Address.initIp4(.{0} ** 4, 0);
+        try lib_posix.bind(fd, &addr.any, addr.getOsSockLen());
+        var bound: lib_posix.Address = std.mem.zeroes(lib_posix.Address);
+        var bound_len: lib_posix.socklen_t = @sizeOf(lib_posix.Address);
+        try lib_posix.getsockname(fd, &bound.any, &bound_len);
+        const port: u16 = switch (bound.any.family) {
+            lib_posix.AF.INET => std.mem.bigToNative(u16, bound.in.port),
+            lib_posix.AF.INET6 => std.mem.bigToNative(u16, bound.in6.port),
+            else => return error.UnsupportedAddressFamily,
+        };
+        log.info("bound udp ephemeral port={d} family={s}", .{
+            port,
+            if (family == lib_posix.AF.INET6) "inet6" else "inet",
+        });
+        return .{ .fd = fd, .bound_port = port };
+    }
+
     pub fn getFd(self: *const UdpSocket) i32 {
         return self.fd;
     }
