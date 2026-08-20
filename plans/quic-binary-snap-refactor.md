@@ -1777,6 +1777,67 @@ Bats 58/0/4, unchanged C header/library ABI, unchanged q2-2/quicz refs and
 backup, clean worktree except the preserved worktree directory. Q5 remains
 locked.
 
+### Q4 Stage 4.1 frozen correction contract (2026-08-20, before any 4.1 code)
+
+Appended after the stage-4 review of `1a7013e`; history is preserved,
+nothing rewritten. Stage 5 remains locked. The audited checkpoint's
+history, scope, and gates stand (1a7013e on origin, 276/276 both
+modes, adapter SLOC 467); this correction closes two P1 runtime bugs
+and two P2 accuracy gaps, landed as three commits in this order:
+
+1. this frozen amendment;
+2. runtime fixes plus RED-first deterministic proofs;
+3. normative documentation and factual evidence, after gates.
+
+Runtime changes:
+
+- In `.snapshot_streaming`, Output is: before the validated End, an
+  immediate terminal snapshot interleave; after the validated End,
+  legal post-cut output, capacity-gated, even while the stream-7 FIN
+  remains pending (`offerDaemonOutput` branches on
+  `snapshot_end_validated`; `canConsumeDaemonFrame`'s Output arm
+  mirrors it).
+- Zero-length, oversized, and negotiated-limit-exceeding SnapshotChunk
+  frames are immediately consumable in `canConsumeDaemonFrame`, so
+  client-withheld stream-7 credit can never delay `failSnapshot`.
+- `daemonReadEligible` applies `canConsumeDaemonFrame` as soon as an
+  IPC header (8 bytes) is buffered, using the declared payload length:
+  an unacceptable frame's payload is never read into the buffer.
+  `pumpDaemonFrames` stays whole-frame-only.
+- `snapshot_limit` defaults from `quic_wire.snapshot_limit_v1`; the
+  duplicated 128 MiB constant is removed.
+- The ACTIVE-phase SNAPSHOT_REQUEST nonterminal diagnostic becomes
+  "replacement snapshots are Q5" (coupled response-size assertions
+  updated).
+
+Deterministic proofs (each run RED against `1a7013e` first, evidence
+kept outside the repository):
+
+- Post-End/pre-FIN race: one 8 KiB chunk, withheld stream-7 reads;
+  before any client read, assert End validated, FIN not sent, the
+  Output consumed from IPC and counted (daemon_output_frames), and the
+  session nonterminal; then drain and verify snapshot bytes, FIN, and
+  Output losslessly.
+- Parked-unit malformed chunks on separate fresh sessions (zero-length,
+  33 KiB, negotiated-limit overflow): each fails closed and resets
+  stream 7 with no client reads and no restored credit.
+- Header-aware gating on an active session with occupied output
+  storage: only an Output header buffered; reads stop before its
+  payload; lossless recovery after output credit returns.
+- The fresh snapshot-header split loop extends through the 23+1
+  boundary; the populated-transaction test is renamed to identify
+  post-FIN/pre-INSTALLED output; awaiting-HELLO discard is covered on
+  a freshly initialized session without mutating its phase.
+
+Documentation (commit 3): the authoritative wire document and the
+serve.zig module description gain stream 7 and its 24-byte epoch-1
+header, first RESIZE → .InitSnapshot, installation ordering and
+SNAPSHOT_INSTALLED acceptance, post-End output legality, adapter
+version 2 with the frozen ABI digest, and the explicit
+replacement-snapshots-deferred-to-Q5 deferral. Completion evidence is
+appended without modifying earlier records. Full Bats remains the
+final Q4 gate.
+
 ## Phase Q5: reliable output epochs and remote attach
 
 Input uses one client unidirectional reliable stream. Raw terminal input is
