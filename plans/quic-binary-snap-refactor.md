@@ -1873,6 +1873,94 @@ bounded reader correctly fails closed on the garbage follow-on
 header). Q5 scope, the q2-2 quicz pin, and quic_transport.zig are
 untouched; Stage 5 remains locked pending review.
 
+### Q4 Stage 4.1.1 frozen correction contract (2026-08-20, before any 4.1.1 code)
+
+Appended after the external audit of the three Stage 4.1 commits
+(7d3af88 → 132a841 → a5b467b); history is preserved, nothing
+rewritten. Stage 5 remains locked. The audit returned three blockers;
+reproduction against a5b467b confirms two and refutes one:
+
+1. CONFIRMED — header-aware reading is incomplete. `SocketBuffer.read`
+   reads up to 4096 B per call regardless of gate state
+   (src/ipc.zig:226-227); `daemonReadEligible` gates only WHETHER to
+   read, never HOW MUCH. When a header and its payload are coalesced
+   in the socket at read time, one `read()` admits the payload of a
+   frame the gate would reject. The Stage 4.1 contract's wording
+   ("an unacceptable frame's payload is never read into the buffer")
+   and the src/serve.zig:283-286 comment hold only when header and
+   payload arrive in separate reads. The Stage 4.1 proof cannot
+   expose this: it writes the header alone (src/serve.zig:2571-2572)
+   and the payload only after credit returns (src/serve.zig:2611).
+2. CONFIRMED — the wire document contradicts itself and omits the
+   promised digest. docs/quic-wire.md:6-7 bumps the adapter to 2;
+   docs/quic-wire.md:179 says `adapter_version` is 1. The code truth
+   is 2 (src/quic_wire.zig:24, pinned by the test at
+   src/quic_wire.zig:1165). The Stage 4.1 documentation scope
+   promised "adapter version 2 with the frozen ABI digest"; only the
+   formula is recorded, never the literal 32-byte value.
+3. REFUTED — the SLOC gate is not false. The audit claims the gate's
+   exact command reports 682 at both 1a7013e and the tip.
+   Reproduction in both working copies (identical files at a5b467b):
+   the frozen counting command prints 467 at 1a7013e, ebbbca0,
+   c8b3d03, and a5b467b — the gate passes and the 467 evidence
+   stands. 682 reproduces only as the nonblank pre-testing line
+   count with comment-only lines included, i.e. the frozen command
+   with its comment-strip predicate dropped (`NF{n++}` alone), which
+   the gate's prose ("excluding … comment-only lines") explicitly
+   rejects. No gate change and no SLOC work follow; future SLOC
+   audits must quote the frozen command verbatim.
+
+Correction work, landed as three commits in this order:
+
+1. this frozen amendment;
+2. the C1 runtime fix plus a RED-first deterministic proof;
+3. the C2 documentation corrections and factual 4.1.1 evidence,
+   after gates.
+
+C1 — exact header-sized reads:
+
+- `ipc.SocketBuffer` gains a read accepting an explicit byte cap
+  (same buffer compaction, same `max_frame_len` walk); the existing
+  `read(fd)` and every daemon/client call site stay untouched — the
+  gateway alone switches to the capped read.
+- `relayDaemon` computes the cap per read: with fewer than 8
+  buffered bytes toward the current header, exactly the header
+  remainder; with a complete acceptable header buffered,
+  min(declared remaining payload, 4096). `daemonReadEligible`
+  semantics are unchanged — it still gates whether to read at all.
+- RED-first proof against a5b467b: the Stage 4.1 header-gate
+  scenario, but the header and its 1 KiB payload are written in ONE
+  write while output storage is stuffed. Before the fix this fails
+  for exactly the audited cause (the buffer holds payload bytes).
+  After: one gateway turn leaves exactly the 8 header bytes
+  buffered, the gate closed, the session nonterminal; once output
+  credit returns, the full 1 KiB relays with the byte-pattern
+  proof. The existing separate-writes proof passes unchanged, and an
+  ipc.zig unit test covers the capped coalesced read directly.
+- The src/serve.zig:283-286 comment and every doc claim of the
+  overstrong form are re-worded to the true mechanism: reads are
+  capped to the header remainder until the header is inspectable.
+
+C2 — ABI document corrections:
+
+- docs/quic-wire.md:179 is amended to state `adapter_version` is 2,
+  matching src/quic_wire.zig:24 and its test pin.
+- The literal 32-byte `snapshot_abi_id` of the current pins is
+  recorded in hex alongside its exact inputs (ghostty commit, Ghostty
+  package hash string, adapter_version) and a reproduction path, and
+  a unit test asserts the comptime id equals the doc-recorded bytes —
+  a pin advance fails that test until the doc is amended, making the
+  frozen digest enforceable rather than advisory.
+
+Gates for commit 2: RED first against a5b467b for the coalesced
+proof; then Debug and ReleaseSafe full suites with the new proofs,
+`zig build check`, `zig build release` then Debug rebuild,
+`zig fmt --check`, `git diff --check`; the frozen SLOC command is
+re-run and recorded verbatim in the 4.1.1 evidence. Full Bats remains
+the final Q4 gate. No quicz change, no Q5 scope change, and no
+quic_transport.zig change of any kind; the landed Stage 4.1 proofs
+are not reopened.
+
 ## Phase Q5: reliable output epochs and remote attach
 
 Input uses one client unidirectional reliable stream. Raw terminal input is
