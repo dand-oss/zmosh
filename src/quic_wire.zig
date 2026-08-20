@@ -519,6 +519,100 @@ pub const OutputHeaderParser = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Snapshot stream header (Q4): preface(role=snapshot) + epoch u64 BE +
+// flags byte + 7 zero reserved bytes
+// ---------------------------------------------------------------------------
+
+pub const snapshot_header_len = preface_len + 8 + 1 + 7;
+/// The only defined snapshot-header flag bit: PRESENT (0x01). Zero
+/// means an empty snapshot (PRESENT=0) with no body and an immediate
+/// FIN after the header.
+pub const snapshot_flag_present: u8 = 0x01;
+/// Q4 permits only the initial epoch 1 on both the output stream (3)
+/// and the snapshot stream (7); replacement epochs remain Q5.
+pub const snapshot_epoch_v1: u64 = 1;
+
+pub fn writeSnapshotHeader(out: *[snapshot_header_len]u8, epoch: u64, present: bool) void {
+    writePreface(out[0..preface_len], .snapshot);
+    std.mem.writeInt(u64, out[preface_len .. preface_len + 8], epoch, .big);
+    out[preface_len + 8] = if (present) snapshot_flag_present else 0;
+    @memset(out[preface_len + 9 ..], 0);
+}
+
+pub const SnapshotHeader = struct { epoch: u64, present: bool };
+
+pub const SnapshotHeaderError = error{
+    BadMagic,
+    UnknownRole,
+    NonzeroFlags,
+    NonzeroReserved,
+    /// The preface is valid but does not declare the snapshot role.
+    WrongRole,
+    /// Bits other than PRESENT are set in the flags byte.
+    BadFlags,
+    /// Q4 permits epoch 1 only.
+    BadEpoch,
+};
+
+pub fn parseSnapshotHeader(bytes: *const [snapshot_header_len]u8) SnapshotHeaderError!SnapshotHeader {
+    const role = try parsePreface(bytes[0..preface_len]);
+    if (role != .snapshot) return error.WrongRole;
+    const flags = bytes[preface_len + 8];
+    if (flags & ~snapshot_flag_present != 0) return error.BadFlags;
+    for (bytes[preface_len + 9 ..]) |b| {
+        if (b != 0) return error.NonzeroReserved;
+    }
+    const epoch = std.mem.readInt(u64, bytes[preface_len..][0..8], .big);
+    if (epoch != snapshot_epoch_v1) return error.BadEpoch;
+    return .{ .epoch = epoch, .present = (flags & snapshot_flag_present) != 0 };
+}
+
+/// Incremental snapshot-header parser (QUIC delivers arbitrary chunks;
+/// the parser resumes mid-field and consumes only a prefix of each
+/// chunk).
+pub const SnapshotHeaderParser = struct {
+    buf: [snapshot_header_len]u8 = undefined,
+    filled: usize = 0,
+    done: bool = false,
+
+    pub const Result = union(enum) {
+        done: SnapshotHeader,
+        need: usize,
+        invalid: SnapshotHeaderError,
+    };
+
+    /// Feeds up to `snapshot_header_len - filled` bytes from `chunk`;
+    /// returns the number of bytes consumed.
+    pub fn feed(self: *SnapshotHeaderParser, chunk: []const u8) struct { consumed: usize, result: Result } {
+        if (self.done) return .{ .consumed = 0, .result = .{ .need = 0 } };
+        const want = snapshot_header_len - self.filled;
+        const take = @min(want, chunk.len);
+        @memcpy(self.buf[self.filled .. self.filled + take], chunk[0..take]);
+        self.filled += take;
+        if (self.filled < snapshot_header_len) {
+            return .{ .consumed = take, .result = .{ .need = snapshot_header_len - self.filled } };
+        }
+        const h = parseSnapshotHeader(&self.buf) catch |e| {
+            return .{ .consumed = take, .result = .{ .invalid = e } };
+        };
+        self.done = true;
+        return .{ .consumed = take, .result = .{ .done = h } };
+    }
+
+    /// True when bytes of an INCOMPLETE header have arrived — a FIN now
+    /// is a truncation.
+    pub fn expecting(self: *const SnapshotHeaderParser) bool {
+        return !self.done and self.filled > 0;
+    }
+
+    /// Bytes still missing before the header can validate. Callers read
+    /// EXACTLY this many so surplus consumption is impossible.
+    pub fn remaining(self: *const SnapshotHeaderParser) usize {
+        return if (self.done) 0 else snapshot_header_len - self.filled;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // snapshot_abi_id
 // ---------------------------------------------------------------------------
 
@@ -921,6 +1015,92 @@ test "output header golden and split parse" {
         .invalid => |e| try testing.expectEqual(error.UnknownRole, e),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "snapshot header golden, split parse, and field validation" {
+    var buf: [snapshot_header_len]u8 = undefined;
+    writeSnapshotHeader(&buf, snapshot_epoch_v1, true);
+    // preface(role=snapshot) + epoch 1 BE + PRESENT + 7 zero bytes.
+    try testing.expectEqualSlices(u8, &.{
+        'Z',  'M', 'Q', '1', 3, 0, 0, 0,
+        0,    0,   0,   0,   0, 0, 0, 1,
+        0x01, 0,   0,   0,   0, 0, 0, 0,
+    }, &buf);
+    const h = try parseSnapshotHeader(&buf);
+    try testing.expectEqual(snapshot_epoch_v1, h.epoch);
+    try testing.expect(h.present);
+
+    // PRESENT=0 is the empty snapshot.
+    writeSnapshotHeader(&buf, snapshot_epoch_v1, false);
+    try testing.expectEqual(@as(u8, 0), buf[16]);
+    try testing.expect(!(try parseSnapshotHeader(&buf)).present);
+
+    // Every split boundary resumes mid-field: 1 byte at a time, AND
+    // every fresh two-part split (prefix [0..i], then the rest).
+    writeSnapshotHeader(&buf, snapshot_epoch_v1, true);
+    var i: usize = 0;
+    while (i < snapshot_header_len - 1) : (i += 1) {
+        var p2: SnapshotHeaderParser = .{};
+        const ra = p2.feed(buf[0..i]);
+        switch (ra.result) {
+            .need => |n| try testing.expectEqual(snapshot_header_len - i, n),
+            else => return error.TestUnexpectedResult,
+        }
+        const rb = p2.feed(buf[i..]);
+        switch (rb.result) {
+            .done => |hh| {
+                try testing.expectEqual(snapshot_epoch_v1, hh.epoch);
+                try testing.expect(hh.present);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    var p: SnapshotHeaderParser = .{};
+    i = 0;
+    while (i < snapshot_header_len - 1) : (i += 1) {
+        const r = p.feed(buf[i .. i + 1]);
+        switch (r.result) {
+            .need => |n| try testing.expectEqual(snapshot_header_len - (i + 1), n),
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqual(@as(usize, 1), r.consumed);
+    }
+    const done = p.feed(buf[i..]);
+    switch (done.result) {
+        .done => |hh| {
+            try testing.expectEqual(snapshot_epoch_v1, hh.epoch);
+            try testing.expect(hh.present);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 0), p.remaining());
+
+    // Invalid role, epoch, flags, and reserved bytes each reject with
+    // their own error, through the incremental parser as well.
+    const cases = [_]struct { mutate: usize, val: u8, err: SnapshotHeaderError }{
+        .{ .mutate = 4, .val = 4, .err = error.WrongRole }, // output role
+        .{ .mutate = 15, .val = 2, .err = error.BadEpoch }, // epoch 2
+        .{ .mutate = 16, .val = 0x02, .err = error.BadFlags }, // unset bit
+        .{ .mutate = 17, .val = 1, .err = error.NonzeroReserved },
+        .{ .mutate = 23, .val = 0xFF, .err = error.NonzeroReserved },
+    };
+    for (cases) |c| {
+        writeSnapshotHeader(&buf, snapshot_epoch_v1, true);
+        buf[c.mutate] = c.val;
+        try testing.expectError(c.err, parseSnapshotHeader(&buf));
+        var pp: SnapshotHeaderParser = .{};
+        const r = pp.feed(&buf);
+        switch (r.result) {
+            .invalid => |e| try testing.expectEqual(c.err, e),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // A bad magic keeps the preface's own error; the parser reports it
+    // after consuming the whole 24 bytes.
+    writeSnapshotHeader(&buf, snapshot_epoch_v1, true);
+    buf[0] = 'X';
+    try testing.expectError(error.BadMagic, parseSnapshotHeader(&buf));
 }
 
 test "snapshot abi id: golden construction and comptime equality" {
