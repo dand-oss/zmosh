@@ -392,19 +392,31 @@ test "snapshot IPC payload codecs golden and bounds" {
     try std.testing.expectEqual(snapshot_error_limit_exceeded, parsed.code);
     try std.testing.expectEqualStrings("too big", parsed.diag);
 
-    // Exactly 256 fits, 257 does not.
+    // Exactly 256 fits in both directions, 257 does not.
     try std.testing.expectEqual(@as(usize, 260), try writeSnapshotErrorPayload(&buf, 1, "a" ** 256));
     try std.testing.expectError(error.DiagTooLong, writeSnapshotErrorPayload(&buf, 1, "a" ** 257));
+    const n256 = try writeSnapshotErrorPayload(&buf, 1, "b" ** 256);
+    const parsed_max = try parseSnapshotErrorPayload(buf[0..n256]);
+    try std.testing.expectEqual(@as(usize, 256), parsed_max.diag.len);
     var tiny: [7]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, writeSnapshotErrorPayload(&tiny, 1, "toolong"));
 
-    // Non-printable diag bytes are rejected on parse; short payloads too.
+    // Non-printable diag bytes are rejected on write AND on parse, at
+    // both control-character edges (0x01 and 0x7F).
+    try std.testing.expectError(error.NonPrintableDiag, writeSnapshotErrorPayload(&buf, 1, "a\x01b"));
+    try std.testing.expectError(error.NonPrintableDiag, writeSnapshotErrorPayload(&buf, 1, "a\x7Fb"));
     var raw: [6]u8 = undefined;
     std.mem.writeInt(u32, raw[0..4], 2, .big);
     raw[4] = 0x01;
     raw[5] = 0x7F;
     try std.testing.expectError(error.NonPrintableDiag, parseSnapshotErrorPayload(&raw));
     try std.testing.expectError(error.TooShort, parseSnapshotErrorPayload(raw[0..2]));
+
+    // A parse-side 257-byte printable diag is rejected at the bound.
+    var long_raw: [4 + 257]u8 = undefined;
+    std.mem.writeInt(u32, long_raw[0..4], 1, .big);
+    @memset(long_raw[4..], 'c');
+    try std.testing.expectError(error.DiagTooLong, parseSnapshotErrorPayload(&long_raw));
 
     // Known-code predicate covers exactly the five frozen codes.
     var code: u32 = 0;
@@ -464,13 +476,17 @@ pub fn parseSnapshotEndPayload(bytes: *const [8]u8) u64 {
 
 /// SnapshotError payload: code u32 big-endian plus a printable
 /// diagnostic (<= 256 bytes). Mirrors the ZMQ1 ERROR payload shape but
-/// lives here so the daemon never imports the QUIC wire module.
+/// lives here so the daemon never imports the QUIC wire module. Both
+/// directions enforce printability and the 256-byte bound.
 pub fn writeSnapshotErrorPayload(
     out: []u8,
     code: u32,
     diag: []const u8,
-) error{ DiagTooLong, BufferTooSmall }!usize {
+) error{ DiagTooLong, NonPrintableDiag, BufferTooSmall }!usize {
     if (diag.len > snapshot_error_diag_max) return error.DiagTooLong;
+    for (diag) |c| {
+        if (c < 0x20 or c > 0x7E) return error.NonPrintableDiag;
+    }
     if (out.len < 4 + diag.len) return error.BufferTooSmall;
     std.mem.writeInt(u32, out[0..4], code, .big);
     @memcpy(out[4 .. 4 + diag.len], diag);
@@ -479,11 +495,12 @@ pub fn writeSnapshotErrorPayload(
 
 pub const SnapshotErrorWire = struct { code: u32, diag: []const u8 };
 
-pub const SnapshotErrorPayloadError = error{ TooShort, NonPrintableDiag };
+pub const SnapshotErrorPayloadError = error{ TooShort, DiagTooLong, NonPrintableDiag };
 
 pub fn parseSnapshotErrorPayload(bytes: []const u8) SnapshotErrorPayloadError!SnapshotErrorWire {
     if (bytes.len < 4) return error.TooShort;
     const diag = bytes[4..];
+    if (diag.len > snapshot_error_diag_max) return error.DiagTooLong;
     for (diag) |c| {
         if (c < 0x20 or c > 0x7E) return error.NonPrintableDiag;
     }

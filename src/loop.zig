@@ -464,7 +464,17 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
-                        .InitSnapshot => try daemon.handleInitSnapshot(gpa, client, pty_fd, &term, &vt_stream, msg.payload),
+                        // Snapshot-local failures never unwind the
+                        // daemon loop. Only the (unreportable) error-
+                        // capacity reservation closes a client, and it
+                        // closes ONLY the requester — same shape as
+                        // .Detach's close path.
+                        .InitSnapshot => {
+                            if (daemon.handleInitSnapshot(gpa, client, pty_fd, &term, &vt_stream, msg.payload)) {
+                                _ = daemon.closeClient(gpa, client, i, false);
+                                break :clients_loop;
+                            }
+                        },
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
                         .Detach => {
@@ -1131,6 +1141,13 @@ pub const Daemon = struct {
     /// client's IPC queue — after the resize and before the event loop
     /// reads the shell's next (SIGWINCH-triggered) output, so the cut is
     /// unambiguously post-resize.
+    ///
+    /// Snapshot-local failures NEVER unwind the daemon loop: every one
+    /// is reported through the transactional SnapshotError rollback.
+    /// The single exception is the initial error-capacity reservation,
+    /// which cannot report itself — the return value `true` tells the
+    /// dispatch to close ONLY this requester; the daemon and every
+    /// other client keep serving.
     pub fn handleInitSnapshot(
         self: *Daemon,
         gpa: std.mem.Allocator,
@@ -1139,43 +1156,64 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         vt_stream: *ghostty_vt.TerminalStream,
         payload: []const u8,
-    ) !void {
+    ) bool {
         // Reserve room for the maximum SnapshotError BEFORE starting:
         // after this, the rollback error append can never allocate.
-        try client.write_buf.ensureTotalCapacity(
+        client.write_buf.ensureTotalCapacity(
             gpa,
             client.write_buf.items.len +
                 @sizeOf(ipc.Header) + 4 + ipc.snapshot_error_diag_max,
-        );
+        ) catch |e| {
+            std.log.warn(
+                "snapshot reservation failed, closing requester err={s}",
+                .{@errorName(e)},
+            );
+            return true;
+        };
         const mark = client.write_buf.items.len;
 
         if (payload.len != @sizeOf(ipc.Resize)) {
-            return self.rollbackSnapshot(client, mark, ipc.snapshot_error_invalid_request, "bad InitSnapshot payload");
+            self.rollbackSnapshot(client, mark, ipc.snapshot_error_invalid_request, "bad InitSnapshot payload");
+            return false;
+        }
+        // Dimensions are validated before leadership or any ioctl: a
+        // zero row or column can never size a terminal.
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        if (resize.rows == 0 or resize.cols == 0) {
+            self.rollbackSnapshot(client, mark, ipc.snapshot_error_invalid_request, "invalid InitSnapshot dimensions");
+            return false;
         }
 
         // The size travels in this payload, so leadership is established
-        // directly (no .Resize ask-back), then the resize applies.
+        // directly (no .Resize ask-back), then the resize applies. A
+        // resize failure is snapshot-local: code 5 through the normal
+        // rollback, never an unwind.
         if (self.leader_client_fd != client.socket_fd) {
             std.log.info("setting snapshot leader client_fd={d}", .{client.socket_fd});
             self.leader_client_fd = client.socket_fd;
         }
-        try self.applyLeaderResize(gpa, pty_fd, term, payload);
+        self.applyLeaderResize(gpa, pty_fd, term, payload) catch |e| {
+            self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+            return false;
+        };
         self.has_had_client = true;
         self.has_terminal_client = true;
 
         // Empty session: open and close the transaction with no encoder
         // invocation (PRESENT=0).
         if (!self.has_pty_output) {
-            ipc.appendMessage(gpa, &client.write_buf, .SnapshotBegin, &.{0}) catch |e| {
-                return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
-            };
             var endp: [8]u8 = undefined;
             ipc.writeSnapshotEndPayload(&endp, 0);
+            ipc.appendMessage(gpa, &client.write_buf, .SnapshotBegin, &.{0}) catch |e| {
+                self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+                return false;
+            };
             ipc.appendMessage(gpa, &client.write_buf, .SnapshotEnd, &endp) catch |e| {
-                return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+                self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+                return false;
             };
             client.has_pending_output = true;
-            return;
+            return false;
         }
 
         // Continuation: ground needs no bytes and skips the buffer;
@@ -1184,62 +1222,88 @@ pub const Daemon = struct {
         var cont_writer: std.Io.Writer.Allocating = .init(gpa);
         defer cont_writer.deinit();
         if (!vt_stream.ground()) {
-            vt_stream.writeContinuation(&cont_writer.writer) catch |e| switch (e) {
-                error.ContinuationUnavailable => return self.rollbackSnapshot(
-                    client,
-                    mark,
-                    ipc.snapshot_error_continuation_unavailable,
-                    "continuation unavailable",
-                ),
-                // The Allocating writer's only drain failure is growth
-                // failure, surfaced as WriteFailed.
-                error.WriteFailed => return self.rollbackSnapshot(
-                    client,
-                    mark,
-                    ipc.snapshot_error_out_of_memory,
-                    "out of memory",
-                ),
-                // Tracking is always enabled for the daemon stream.
-                error.ContinuationDisabled => return self.rollbackSnapshot(
-                    client,
-                    mark,
-                    ipc.snapshot_error_encode_failed,
-                    "continuation tracking disabled",
-                ),
+            vt_stream.writeContinuation(&cont_writer.writer) catch |e| {
+                switch (e) {
+                    error.ContinuationUnavailable => self.rollbackSnapshot(
+                        client,
+                        mark,
+                        ipc.snapshot_error_continuation_unavailable,
+                        "continuation unavailable",
+                    ),
+                    // The Allocating writer's only drain failure is growth
+                    // failure, surfaced as WriteFailed.
+                    error.WriteFailed => self.rollbackSnapshot(
+                        client,
+                        mark,
+                        ipc.snapshot_error_out_of_memory,
+                        "out of memory",
+                    ),
+                    // Tracking is always enabled for the daemon stream.
+                    error.ContinuationDisabled => self.rollbackSnapshot(
+                        client,
+                        mark,
+                        ipc.snapshot_error_encode_failed,
+                        "continuation tracking disabled",
+                    ),
+                }
+                return false;
             };
             const bytes = cont_writer.written();
             if (bytes.len > Daemon.snapshot_continuation_max) {
-                return self.rollbackSnapshot(
+                self.rollbackSnapshot(
                     client,
                     mark,
                     ipc.snapshot_error_limit_exceeded,
                     "continuation exceeds the 64 MiB bound",
                 );
+                return false;
             }
             cont = .{ .bytes = bytes };
         }
 
-        // Open the transaction, then stream the encoder output.
+        self.exportSnapshotTransaction(gpa, client, term, cont, Daemon.snapshot_total_max);
+        return false;
+    }
+
+    /// Streams one complete encoded snapshot into the client's queue as
+    /// a SnapshotBegin / SnapshotChunk... / SnapshotEnd transaction.
+    /// Every failure rolls the queue back to its length on entry and
+    /// appends exactly one SnapshotError. `max_total` is the caller's
+    /// bound (the daemon's frozen 128 MiB; tests inject smaller bounds
+    /// to exercise the limit path genuinely).
+    fn exportSnapshotTransaction(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        cont: ghostty_vt.snapshot.Continuation,
+        max_total: usize,
+    ) void {
+        const mark = client.write_buf.items.len;
         ipc.appendMessage(gpa, &client.write_buf, .SnapshotBegin, &.{1}) catch |e| {
-            return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+            self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+            return;
         };
         var cw: SnapshotChunkWriter = undefined;
-        cw.init(gpa, &client.write_buf, Daemon.snapshot_total_max);
+        cw.init(gpa, &client.write_buf, max_total);
         ghostty_vt.snapshot.encode(gpa, &cw.writer, term, .{
             .continuation = cont,
         }) catch |e| {
-            return self.rollbackSnapshot(client, mark, snapshotFailureCode(e, cw.cause), snapshotFailureDiag(e, cw.cause));
+            self.rollbackSnapshot(client, mark, Daemon.snapshotFailureCode(e, cw.cause), Daemon.snapshotFailureDiag(e, cw.cause));
+            return;
         };
         // Explicit final partial-chunk flush (skipped on failure — the
         // rollback already discarded the partial transaction).
         cw.writer.flush() catch |e| {
             const cause = cw.cause orelse SnapshotChunkWriter.Cause.write;
-            return self.rollbackSnapshot(client, mark, snapshotFailureCode(e, cause), snapshotFailureDiag(e, cause));
+            self.rollbackSnapshot(client, mark, Daemon.snapshotFailureCode(e, cause), Daemon.snapshotFailureDiag(e, cause));
+            return;
         };
         var endp: [8]u8 = undefined;
         ipc.writeSnapshotEndPayload(&endp, cw.total);
         ipc.appendMessage(gpa, &client.write_buf, .SnapshotEnd, &endp) catch |e| {
-            return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+            self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+            return;
         };
         client.has_pending_output = true;
     }
@@ -1874,7 +1938,7 @@ test "handleInitSnapshot empty session queues Begin(0) and End(0)" {
     defer vts.deinit();
 
     const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
-    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+    try std.testing.expectEqual(false, daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload));
 
     try std.testing.expect(daemon.leader_client_fd == client.socket_fd);
     try std.testing.expect(daemon.has_terminal_client);
@@ -1913,8 +1977,10 @@ test "handleInitSnapshot populated transaction streams a decodable snapshot" {
     vts.nextSlice("\x1b]0;session title\x07");
     vts.nextSlice("\x1b[31");
 
-    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
-    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+    // Requested dimensions differ from the terminal's construction
+    // (80x24): the capture must reflect the post-resize geometry.
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100, .xpixel = 0, .ypixel = 0 });
+    try std.testing.expectEqual(false, daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload));
 
     const frames = try collectFrames(alloc, client.write_buf.items);
     defer alloc.free(frames);
@@ -1944,6 +2010,11 @@ test "handleInitSnapshot populated transaction streams a decodable snapshot" {
     defer decoded.deinit(alloc);
     var restored = decoded.toOwned();
     defer restored.deinit(alloc);
+
+    // The snapshot carries the POST-RESIZE dimensions (30x100), not the
+    // terminal's 80x24 construction.
+    try std.testing.expectEqual(@as(@TypeOf(restored.rows), 30), restored.rows);
+    try std.testing.expectEqual(@as(@TypeOf(restored.cols), 100), restored.cols);
 
     const want = util.serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
     defer alloc.free(want);
@@ -2067,7 +2138,7 @@ test "handleInitSnapshot continuation unavailable rolls back to code 2" {
     vts.nextSlice("\x1b[312");
 
     const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
-    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+    try std.testing.expectEqual(false, daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload));
 
     const frames = try collectFrames(alloc, client.write_buf.items);
     defer alloc.free(frames);
@@ -2095,7 +2166,7 @@ test "handleInitSnapshot preserves pre-existing queue content through rollback" 
     vts.nextSlice("\x1b[312");
 
     const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
-    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+    try std.testing.expectEqual(false, daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload));
 
     const frames = try collectFrames(alloc, client.write_buf.items);
     defer alloc.free(frames);
@@ -2128,14 +2199,18 @@ test "handleInitSnapshot rolls back every allocation failure to one error" {
         vts.nextSlice("some output\r\nwith content\r\n");
 
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-        const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
-        daemon.handleInitSnapshot(failing.allocator(), &client, -1, &term, &vts, payload) catch |e| {
-            // A failure before the transaction (reservation or resize)
-            // propagates and leaves the queue untouched.
-            try std.testing.expectEqual(error.OutOfMemory, e);
+        // Dimensions differ from the terminal's so the resize itself
+        // allocates (reflow), not just the encoder.
+        const payload = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100, .xpixel = 0, .ypixel = 0 });
+        // Nothing unwinds the daemon loop: the only failure mode is the
+        // close-requester signal (the unreportable reservation), and it
+        // leaves the queue untouched for the dispatch's close path.
+        const close = daemon.handleInitSnapshot(failing.allocator(), &client, -1, &term, &vts, payload);
+        if (close) {
+            try std.testing.expectEqual(@as(usize, 0), fail_index);
             try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
             continue;
-        };
+        }
 
         const frames = try collectFrames(alloc, client.write_buf.items);
         defer alloc.free(frames);
@@ -2187,4 +2262,212 @@ test "handleInit first attach sets leader without replay or snapshot frames" {
     try std.testing.expectEqual(@as(usize, 1), frames.len);
     try std.testing.expectEqual(ipc.Tag.Resize, frames[0].tag);
     try std.testing.expectEqual(@as(usize, 0), frames[0].payload.len);
+}
+
+test "snapshot reservation failure closes only the requester; daemon and peers survive" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    defer daemon.clients.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = Daemon.snapshot_continuation_max,
+    });
+    defer vts.deinit();
+    vts.nextSlice("shared session content\r\n");
+
+    // Two connected clients, as daemonLoop's accept path creates them.
+    // A carries a REAL fd: the dispatch's close path runs Client.deinit,
+    // and closing -1 panics in this Zig version.
+    const a = try alloc.create(Client);
+    a.* = snapshotTestClient(alloc);
+    a.socket_fd = lib_posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch
+        return error.TestUnexpectedError;
+    a.read_buf = try ipc.SocketBuffer.init(alloc); // deinit runs via closeClient
+    const b = try alloc.create(Client);
+    b.* = snapshotTestClient(alloc);
+    defer alloc.destroy(b);
+    defer b.write_buf.deinit(alloc);
+    try daemon.clients.append(alloc, a);
+    try daemon.clients.append(alloc, b);
+
+    // The dispatch site's exact handling of the close signal: the
+    // reservation is the first allocation, so fail_index 0 reaches it.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100, .xpixel = 0, .ypixel = 0 });
+    const close = daemon.handleInitSnapshot(failing.allocator(), a, -1, &term, &vts, payload);
+    try std.testing.expect(close);
+    try std.testing.expectEqual(@as(usize, 0), a.write_buf.items.len);
+    _ = daemon.closeClient(alloc, a, 0, false);
+
+    // The daemon lives, the peer is intact, and the peer can still run
+    // its own successful snapshot transaction on the same terminal.
+    try std.testing.expect(daemon.running);
+    try std.testing.expectEqual(@as(usize, 1), daemon.clients.items.len);
+    try std.testing.expect(daemon.clients.items[0] == b);
+    try std.testing.expect(daemon.leader_client_fd == null or daemon.leader_client_fd != a.socket_fd);
+    try std.testing.expectEqual(false, daemon.handleInitSnapshot(alloc, b, -1, &term, &vts, payload));
+    const frames = try collectFrames(alloc, b.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expect(frames.len >= 2);
+    try std.testing.expectEqual(ipc.Tag.SnapshotBegin, frames[0].tag);
+    try std.testing.expectEqual(ipc.Tag.SnapshotEnd, frames[frames.len - 1].tag);
+
+    daemon.clients.clearRetainingCapacity();
+}
+
+test "genuine transaction limit failure preserves the prefix and leaves no residue" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+
+    try ipc.appendMessage(alloc, &client.write_buf, .Output, "prefix frame");
+    // A 16-byte bound makes the FIRST chunk append exceed the limit
+    // mid-transaction — a genuine encode that started and was bounded.
+    daemon.exportSnapshotTransaction(alloc, &client, &term, .ground, 16);
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(ipc.Tag.Output, frames[0].tag);
+    try std.testing.expectEqualStrings("prefix frame", frames[0].payload);
+    try std.testing.expectEqual(ipc.Tag.SnapshotError, frames[1].tag);
+    const ew = try ipc.parseSnapshotErrorPayload(frames[1].payload);
+    try std.testing.expectEqual(ipc.snapshot_error_limit_exceeded, ew.code);
+}
+
+test "genuine generic encode failure preserves the prefix and leaves no residue" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+
+    try ipc.appendMessage(alloc, &client.write_buf, .Output, "prefix frame");
+    // "ab" leaves the parser in ground: Ghostty's own continuation
+    // validation rejects it inside encode, BEFORE the envelope — a
+    // genuine non-allocation encode failure (code 3).
+    daemon.exportSnapshotTransaction(alloc, &client, &term, .{ .bytes = "ab" }, Daemon.snapshot_total_max);
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(ipc.Tag.Output, frames[0].tag);
+    try std.testing.expectEqual(ipc.Tag.SnapshotError, frames[1].tag);
+    const ew = try ipc.parseSnapshotErrorPayload(frames[1].payload);
+    try std.testing.expectEqual(ipc.snapshot_error_encode_failed, ew.code);
+}
+
+test "handleInitSnapshot rejects zero dimensions before leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = Daemon.snapshot_continuation_max,
+    });
+    defer vts.deinit();
+
+    for ([_][2]u16{ .{ 0, 80 }, .{ 24, 0 }, .{ 0, 0 } }) |dims| {
+        client.write_buf.clearRetainingCapacity();
+        const payload = std.mem.asBytes(&ipc.Resize{ .rows = dims[0], .cols = dims[1], .xpixel = 0, .ypixel = 0 });
+        try std.testing.expectEqual(false, daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload));
+        const frames = try collectFrames(alloc, client.write_buf.items);
+        defer alloc.free(frames);
+        try std.testing.expectEqual(@as(usize, 1), frames.len);
+        try std.testing.expectEqual(ipc.Tag.SnapshotError, frames[0].tag);
+        const ew = try ipc.parseSnapshotErrorPayload(frames[0].payload);
+        try std.testing.expectEqual(ipc.snapshot_error_invalid_request, ew.code);
+    }
+    // Leadership was never taken and the terminal kept its geometry.
+    try std.testing.expect(daemon.leader_client_fd == null);
+    try std.testing.expect(!daemon.has_terminal_client);
+    try std.testing.expectEqual(@as(@TypeOf(term.cols), 80), term.cols);
+    try std.testing.expectEqual(@as(@TypeOf(term.rows), 24), term.rows);
+}
+
+test "handleInitSnapshot resize failure rolls back to code 5 without unwinding" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = Daemon.snapshot_continuation_max,
+    });
+    defer vts.deinit();
+    // Enough scrollback that the 24x80 -> 30x100 reflow must allocate.
+    var n: usize = 0;
+    while (n < 60) : (n += 1) {
+        vts.nextSlice("resize failure probe line\r\n");
+    }
+
+    // fail_index 1: the reservation succeeds, the next allocation — the
+    // resize reflow to a new geometry — fails.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100, .xpixel = 0, .ypixel = 0 });
+    try std.testing.expectEqual(false, daemon.handleInitSnapshot(failing.allocator(), &client, -1, &term, &vts, payload));
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    try std.testing.expectEqual(ipc.Tag.SnapshotError, frames[0].tag);
+    const ew = try ipc.parseSnapshotErrorPayload(frames[0].payload);
+    try std.testing.expectEqual(ipc.snapshot_error_out_of_memory, ew.code);
+    // Note: whether the first post-reservation allocation lands in the
+    // resize reflow or the encoder is Ghostty-internal; both orders
+    // produce the same containment (code 5, no unwind, no close signal,
+    // queue restored to its pre-transaction length).
+}
+
+test "handleInit reattach emits legacy replay before the resize ask-back" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    daemon.has_had_client = true; // reattach: the replay path is live
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = term.vtStream();
+    defer vts.deinit();
+    vts.nextSlice("legacy session content\r\nwith two lines\r\n");
+
+    // The replay must serialize the PRE-resize state: capture it first.
+    const want = util.serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(want);
+
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100, .xpixel = 0, .ypixel = 0 });
+    try daemon.handleInit(alloc, &client, -1, &term, payload);
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    // Exactly the historical shape: replay Output first, then the
+    // leader ask-back Resize — and nothing else.
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(ipc.Tag.Output, frames[0].tag);
+    try std.testing.expectEqualSlices(u8, want, frames[0].payload);
+    try std.testing.expectEqual(ipc.Tag.Resize, frames[1].tag);
+    try std.testing.expectEqual(@as(usize, 0), frames[1].payload.len);
+    // The resize itself applied after the replay.
+    try std.testing.expectEqual(@as(@TypeOf(term.cols), 100), term.cols);
+    try std.testing.expectEqual(@as(@TypeOf(term.rows), 30), term.rows);
 }
