@@ -232,7 +232,15 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         .max_scrollback_lines = daemon.cfg.max_scrollback_lines,
     });
     defer term.deinit(gpa);
-    var vt_stream = term.vtStream();
+    // One persistent continuation-tracking stream, created here — before
+    // the loop can feed the first PTY byte — so a snapshot cut can export
+    // the minimal unfinished VT/UTF-8 input (bounded by the tracker cap)
+    // instead of reconstructing it from serialized output.
+    var vt_stream = ghostty_vt.TerminalStream.init(.{
+        .allocator = gpa,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = Daemon.snapshot_continuation_max,
+    });
     defer vt_stream.deinit();
 
     // Carries the tail of the previous PTY read so the task-exit marker
@@ -456,6 +464,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                        .InitSnapshot => try daemon.handleInitSnapshot(gpa, client, pty_fd, &term, &vt_stream, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
                         .Detach => {
@@ -482,6 +491,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .SessionEnd => std.log.warn(
                             "ignoring SessionEnd tag from client",
                             .{},
+                        ),
+                        // Q4 daemon-to-client snapshot tags: same rule.
+                        .SnapshotBegin, .SnapshotChunk, .SnapshotEnd, .SnapshotError => std.log.warn(
+                            "ignoring snapshot tag from client tag={d}",
+                            .{@intFromEnum(msg.header.tag)},
                         ),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -541,6 +555,113 @@ pub const Client = struct {
         lib_posix.close(self.socket_fd);
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+    }
+};
+
+/// The Q4 snapshot chunking writer: stages Ghostty encoder output in a
+/// fixed 32 KiB buffer and frames each full staging area as one
+/// `.SnapshotChunk` IPC message appended to the requesting client's
+/// write queue. `total` counts Ghostty bytes only — never IPC framing —
+/// and the 128 MiB ceiling is enforced BEFORE every queue growth.
+///
+/// The std.Io.Writer interface reports every failure as WriteFailed, so
+/// the underlying cause (limit exceeded vs allocation failure) rides in
+/// `cause` for the exporter's frozen-code mapping.
+const SnapshotChunkWriter = struct {
+    const chunk_len = ipc.snapshot_chunk_max;
+    const EmitError = error{ LimitExceeded, OutOfMemory };
+
+    alloc: std.mem.Allocator,
+    /// The requesting client's IPC write queue.
+    queue: *std.ArrayList(u8),
+    staging: [chunk_len]u8 = undefined,
+    writer: std.Io.Writer = undefined,
+    /// Ghostty bytes handed to this writer so far.
+    total: u64 = 0,
+    max_total: usize,
+    /// Set when drain/flush failed; distinguishes codes 4 and 5.
+    cause: ?Cause = null,
+
+    const Cause = enum { limit, out_of_memory, write };
+
+    fn init(self: *SnapshotChunkWriter, alloc: std.mem.Allocator, queue: *std.ArrayList(u8), max_total: usize) void {
+        self.* = .{ .alloc = alloc, .queue = queue, .max_total = max_total };
+        self.writer = .{
+            .buffer = self.staging[0..],
+            .vtable = &.{ .drain = drain, .flush = flush },
+        };
+    }
+
+    /// Appends one framed chunk. Payload bounds: 1..=32 KiB.
+    fn emit(self: *SnapshotChunkWriter, bytes: []const u8) EmitError!void {
+        std.debug.assert(bytes.len >= ipc.snapshot_chunk_min and bytes.len <= ipc.snapshot_chunk_max);
+        if (self.total + bytes.len > self.max_total) return error.LimitExceeded;
+        try ipc.appendMessage(self.alloc, self.queue, .SnapshotChunk, bytes);
+        self.total += bytes.len;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *SnapshotChunkWriter = @alignCast(@fieldParentPtr("writer", w));
+        return self.drainInner(w, data, splat) catch |e| {
+            self.cause = switch (e) {
+                error.LimitExceeded => .limit,
+                error.OutOfMemory => .out_of_memory,
+            };
+            return error.WriteFailed;
+        };
+    }
+
+    fn drainInner(
+        self: *SnapshotChunkWriter,
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) EmitError!usize {
+        // Staged bytes go out first as one chunk.
+        if (w.end > 0) {
+            try self.emit(w.buffer[0..w.end]);
+            w.end = 0;
+        }
+        // Then the incoming slices, chunk-aligned; the tail stays staged.
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| written += try self.writeBytes(bytes);
+        var rep: usize = 0;
+        while (rep < splat) : (rep += 1) {
+            written += try self.writeBytes(data[data.len - 1]);
+        }
+        return written;
+    }
+
+    fn writeBytes(self: *SnapshotChunkWriter, bytes: []const u8) EmitError!usize {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const end = self.writer.end;
+            const take = @min(bytes.len - off, chunk_len - end);
+            @memcpy(self.staging[end..][0..take], bytes[off..][0..take]);
+            self.writer.end += take;
+            off += take;
+            if (self.writer.end == chunk_len) {
+                try self.emit(self.staging[0..chunk_len]);
+                self.writer.end = 0;
+            }
+        }
+        return bytes.len;
+    }
+
+    /// Flushes the final PARTIAL chunk (guarded so an explicit flush
+    /// after a failure is a no-op).
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *SnapshotChunkWriter = @alignCast(@fieldParentPtr("writer", w));
+        if (w.end > 0) {
+            self.emit(w.buffer[0..w.end]) catch |e| {
+                self.cause = switch (e) {
+                    error.LimitExceeded => .limit,
+                    error.OutOfMemory => .out_of_memory,
+                };
+                return error.WriteFailed;
+            };
+            w.end = 0;
+        }
     }
 };
 
@@ -820,6 +941,12 @@ pub const Daemon = struct {
 
     const PTY_WRITE_BUF_MAX = 256 * 1024;
 
+    /// Q4 snapshot bounds: the persistent stream's retained unfinished
+    /// VT/UTF-8 input and the complete-snapshot ceiling enforced before
+    /// every queue growth.
+    pub const snapshot_continuation_max: usize = 64 * 1024 * 1024;
+    pub const snapshot_total_max: usize = 128 * 1024 * 1024;
+
     /// Queue bytes for the PTY's stdin. Flushed by daemonLoop on POLLOUT.
     /// Drops the payload if the buffer is over cap -- same failure mode as
     /// the old direct-write ptyWrite (drop on EAGAIN), just at a 64x higher
@@ -956,33 +1083,225 @@ pub const Daemon = struct {
 
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
-            const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-            // Disable prompt_redraw before resize. The daemon's internal terminal
-            // would otherwise clear prompt lines expecting the shell to redraw them,
-            // but the shell's redraw goes to the PTY (forwarded to clients), not to
-            // this daemon terminal. The clearing corrupts the daemon's snapshot state.
-            const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-            term.flags.shell_redraws_prompt = .false;
-            defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            const opts = ghostty_vt.Terminal.Resize{
-                .cols = resize.cols,
-                .rows = resize.rows,
-            };
-            try term.resize(gpa, opts);
+            try self.applyLeaderResize(gpa, pty_fd, term, payload);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
             self.has_terminal_client = true;
-
-            std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
         }
+    }
+
+    /// Leader-only PTY + Ghostty resize shared by `.Init` and
+    /// `.InitSnapshot` (Q4 factored the mechanics; both callers keep
+    /// their own replay/leadership ordering).
+    fn applyLeaderResize(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        _ = self;
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = resize.rows,
+            .ws_col = resize.cols,
+            .ws_xpixel = resize.xpixel,
+            .ws_ypixel = resize.ypixel,
+        };
+        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        // Disable prompt_redraw before resize. The daemon's internal terminal
+        // would otherwise clear prompt lines expecting the shell to redraw them,
+        // but the shell's redraw goes to the PTY (forwarded to clients), not to
+        // this daemon terminal. The clearing corrupts the daemon's snapshot state.
+        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
+        term.flags.shell_redraws_prompt = .false;
+        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+        const opts = ghostty_vt.Terminal.Resize{
+            .cols = resize.cols,
+            .rows = resize.rows,
+        };
+        try term.resize(gpa, opts);
+        std.log.debug("leader resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
+
+    /// Q4 attach-with-snapshot: establish leadership, apply the payload
+    /// size to the PTY and the Ghostty terminal, then synchronously
+    /// capture one transactional binary snapshot into the requesting
+    /// client's IPC queue — after the resize and before the event loop
+    /// reads the shell's next (SIGWINCH-triggered) output, so the cut is
+    /// unambiguously post-resize.
+    pub fn handleInitSnapshot(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        vt_stream: *ghostty_vt.TerminalStream,
+        payload: []const u8,
+    ) !void {
+        // Reserve room for the maximum SnapshotError BEFORE starting:
+        // after this, the rollback error append can never allocate.
+        try client.write_buf.ensureTotalCapacity(
+            gpa,
+            client.write_buf.items.len +
+                @sizeOf(ipc.Header) + 4 + ipc.snapshot_error_diag_max,
+        );
+        const mark = client.write_buf.items.len;
+
+        if (payload.len != @sizeOf(ipc.Resize)) {
+            return self.rollbackSnapshot(client, mark, ipc.snapshot_error_invalid_request, "bad InitSnapshot payload");
+        }
+
+        // The size travels in this payload, so leadership is established
+        // directly (no .Resize ask-back), then the resize applies.
+        if (self.leader_client_fd != client.socket_fd) {
+            std.log.info("setting snapshot leader client_fd={d}", .{client.socket_fd});
+            self.leader_client_fd = client.socket_fd;
+        }
+        try self.applyLeaderResize(gpa, pty_fd, term, payload);
+        self.has_had_client = true;
+        self.has_terminal_client = true;
+
+        // Empty session: open and close the transaction with no encoder
+        // invocation (PRESENT=0).
+        if (!self.has_pty_output) {
+            ipc.appendMessage(gpa, &client.write_buf, .SnapshotBegin, &.{0}) catch |e| {
+                return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+            };
+            var endp: [8]u8 = undefined;
+            ipc.writeSnapshotEndPayload(&endp, 0);
+            ipc.appendMessage(gpa, &client.write_buf, .SnapshotEnd, &endp) catch |e| {
+                return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+            };
+            client.has_pending_output = true;
+            return;
+        }
+
+        // Continuation: ground needs no bytes and skips the buffer;
+        // otherwise export exactly once into a bounded buffer.
+        var cont: ghostty_vt.snapshot.Continuation = .ground;
+        var cont_writer: std.Io.Writer.Allocating = .init(gpa);
+        defer cont_writer.deinit();
+        if (!vt_stream.ground()) {
+            vt_stream.writeContinuation(&cont_writer.writer) catch |e| switch (e) {
+                error.ContinuationUnavailable => return self.rollbackSnapshot(
+                    client,
+                    mark,
+                    ipc.snapshot_error_continuation_unavailable,
+                    "continuation unavailable",
+                ),
+                // The Allocating writer's only drain failure is growth
+                // failure, surfaced as WriteFailed.
+                error.WriteFailed => return self.rollbackSnapshot(
+                    client,
+                    mark,
+                    ipc.snapshot_error_out_of_memory,
+                    "out of memory",
+                ),
+                // Tracking is always enabled for the daemon stream.
+                error.ContinuationDisabled => return self.rollbackSnapshot(
+                    client,
+                    mark,
+                    ipc.snapshot_error_encode_failed,
+                    "continuation tracking disabled",
+                ),
+            };
+            const bytes = cont_writer.written();
+            if (bytes.len > Daemon.snapshot_continuation_max) {
+                return self.rollbackSnapshot(
+                    client,
+                    mark,
+                    ipc.snapshot_error_limit_exceeded,
+                    "continuation exceeds the 64 MiB bound",
+                );
+            }
+            cont = .{ .bytes = bytes };
+        }
+
+        // Open the transaction, then stream the encoder output.
+        ipc.appendMessage(gpa, &client.write_buf, .SnapshotBegin, &.{1}) catch |e| {
+            return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+        };
+        var cw: SnapshotChunkWriter = undefined;
+        cw.init(gpa, &client.write_buf, Daemon.snapshot_total_max);
+        ghostty_vt.snapshot.encode(gpa, &cw.writer, term, .{
+            .continuation = cont,
+        }) catch |e| {
+            return self.rollbackSnapshot(client, mark, snapshotFailureCode(e, cw.cause), snapshotFailureDiag(e, cw.cause));
+        };
+        // Explicit final partial-chunk flush (skipped on failure — the
+        // rollback already discarded the partial transaction).
+        cw.writer.flush() catch |e| {
+            const cause = cw.cause orelse SnapshotChunkWriter.Cause.write;
+            return self.rollbackSnapshot(client, mark, snapshotFailureCode(e, cause), snapshotFailureDiag(e, cause));
+        };
+        var endp: [8]u8 = undefined;
+        ipc.writeSnapshotEndPayload(&endp, cw.total);
+        ipc.appendMessage(gpa, &client.write_buf, .SnapshotEnd, &endp) catch |e| {
+            return self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
+        };
+        client.has_pending_output = true;
+    }
+
+    /// Transactional rollback: restore the queue to the length recorded
+    /// immediately before SnapshotBegin and append exactly one
+    /// SnapshotError. The error capacity was reserved up front, so this
+    /// never allocates.
+    fn rollbackSnapshot(
+        self: *Daemon,
+        client: *Client,
+        mark: usize,
+        code: u32,
+        diag: []const u8,
+    ) void {
+        _ = self;
+        client.write_buf.items.len = mark;
+        var ebuf: [4 + ipc.snapshot_error_diag_max]u8 = undefined;
+        // Constant, bounded inputs: the payload encode cannot fail.
+        const n = ipc.writeSnapshotErrorPayload(&ebuf, code, diag) catch unreachable;
+        // Allocation-free by construction: capacity >= mark + this frame
+        // was reserved before the transaction started.
+        ipc.appendMessage(client.alloc, &client.write_buf, .SnapshotError, ebuf[0..n]) catch |e| {
+            // Capacity was reserved; any failure here is an invariant.
+            std.log.err(
+                "snapshot rollback could not append SnapshotError err={s}",
+                .{@errorName(e)},
+            );
+            return;
+        };
+        client.has_pending_output = true;
+    }
+
+    /// Maps an encode-path failure to the frozen local code, preserving
+    /// the chunk writer's cause (limit vs OOM) over the generic
+    /// WriteFailed the Writer interface reports. The chunk writer always
+    /// records its cause BEFORE returning WriteFailed, so a WriteFailed
+    /// arriving without one can only originate in Ghostty's internal
+    /// record scratch — an Allocating writer, whose only drain failure
+    /// is allocation growth — and maps to out-of-memory as well.
+    fn snapshotFailureCode(err: anyerror, cause: ?SnapshotChunkWriter.Cause) u32 {
+        return switch (cause orelse .write) {
+            .limit => ipc.snapshot_error_limit_exceeded,
+            .out_of_memory => ipc.snapshot_error_out_of_memory,
+            .write => switch (err) {
+                error.OutOfMemory, error.WriteFailed => ipc.snapshot_error_out_of_memory,
+                error.ContinuationUnavailable => ipc.snapshot_error_continuation_unavailable,
+                else => ipc.snapshot_error_encode_failed,
+            },
+        };
+    }
+
+    fn snapshotFailureDiag(err: anyerror, cause: ?SnapshotChunkWriter.Cause) []const u8 {
+        return switch (cause orelse .write) {
+            .limit => "snapshot exceeds the 128 MiB limit",
+            .out_of_memory => "out of memory",
+            .write => switch (err) {
+                error.OutOfMemory, error.WriteFailed => "out of memory",
+                error.ContinuationUnavailable => "continuation unavailable",
+                else => "snapshot encode failed",
+            },
+        };
     }
 
     pub fn handleResize(
@@ -1493,4 +1812,379 @@ test "queuePtyInputChecked leaves the queue untouched on failure" {
     @memset(big, 'z');
     try std.testing.expectError(error.OutOfMemory, daemon.queuePtyInputChecked(failing.allocator(), big));
     try std.testing.expectEqualStrings("abc", daemon.pty_write_buf.items);
+}
+
+// ---------------------------------------------------------------------------
+// Q4 snapshot export (Phase Q4)
+// ---------------------------------------------------------------------------
+
+const TestFrame = struct { tag: ipc.Tag, payload: []const u8 };
+
+/// Walks complete IPC frames out of a client write queue; payloads point
+/// into `buf` and stay valid while it does.
+fn collectFrames(alloc: std.mem.Allocator, buf: []const u8) ![]TestFrame {
+    var list: std.ArrayList(TestFrame) = .empty;
+    errdefer list.deinit(alloc);
+    var head: usize = 0;
+    while (ipc.expectedLength(buf[head..])) |total| {
+        if (buf.len - head < total) break;
+        const hdr = std.mem.bytesToValue(ipc.Header, buf[head..][0..@sizeOf(ipc.Header)]);
+        try list.append(alloc, .{
+            .tag = hdr.tag,
+            .payload = buf[head..][@sizeOf(ipc.Header)..total],
+        });
+        head += total;
+    }
+    return list.toOwnedSlice(alloc);
+}
+
+fn snapshotTestDaemon() Daemon {
+    return .{
+        .cfg = undefined,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+}
+
+fn snapshotTestClient(alloc: std.mem.Allocator) Client {
+    return .{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+}
+
+test "handleInitSnapshot empty session queues Begin(0) and End(0)" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = Daemon.snapshot_continuation_max,
+    });
+    defer vts.deinit();
+
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
+    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+
+    try std.testing.expect(daemon.leader_client_fd == client.socket_fd);
+    try std.testing.expect(daemon.has_terminal_client);
+    try std.testing.expect(client.has_pending_output);
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(ipc.Tag.SnapshotBegin, frames[0].tag);
+    try std.testing.expectEqualSlices(u8, &.{0}, frames[0].payload);
+    try std.testing.expectEqual(ipc.Tag.SnapshotEnd, frames[1].tag);
+    try std.testing.expectEqual(@as(u64, 0), ipc.parseSnapshotEndPayload(frames[1].payload[0..8]));
+}
+
+test "handleInitSnapshot populated transaction streams a decodable snapshot" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = Daemon.snapshot_continuation_max,
+    });
+    defer vts.deinit();
+
+    // Populated screen, a title, scrollback, and an unfinished CSI so the
+    // continuation path (non-ground export) is exercised too.
+    var n: usize = 0;
+    while (n < 60) : (n += 1) {
+        vts.nextSlice("line of output text\r\n");
+    }
+    vts.nextSlice("\x1b]0;session title\x07");
+    vts.nextSlice("\x1b[31");
+
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
+    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expect(frames.len >= 3);
+    try std.testing.expectEqual(ipc.Tag.SnapshotBegin, frames[0].tag);
+    try std.testing.expectEqualSlices(u8, &.{1}, frames[0].payload);
+    try std.testing.expectEqual(ipc.Tag.SnapshotEnd, frames[frames.len - 1].tag);
+
+    var spool: std.ArrayList(u8) = .empty;
+    defer spool.deinit(alloc);
+    for (frames[1 .. frames.len - 1]) |f| {
+        try std.testing.expectEqual(ipc.Tag.SnapshotChunk, f.tag);
+        try std.testing.expect(f.payload.len >= ipc.snapshot_chunk_min);
+        try std.testing.expect(f.payload.len <= ipc.snapshot_chunk_max);
+        try spool.appendSlice(alloc, f.payload);
+    }
+    const declared = ipc.parseSnapshotEndPayload(frames[frames.len - 1].payload[0..8]);
+    try std.testing.expectEqual(spool.items.len, declared);
+
+    // The concatenated chunks decode EXACTLY: one snapshot through FINISH
+    // with zero trailing bytes, and the restored terminal serializes to
+    // the same VT as the captured source.
+    var reader: std.Io.Reader = .fixed(spool.items);
+    var decoded = try ghostty_vt.snapshot.decodeExact(alloc, std.testing.io, &reader, .{
+        .max_continuation_bytes = Daemon.snapshot_continuation_max,
+    });
+    defer decoded.deinit(alloc);
+    var restored = decoded.toOwned();
+    defer restored.deinit(alloc);
+
+    const want = util.serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(want);
+    const got = util.serializeTerminalState(alloc, &restored) orelse return error.TestUnexpectedNull;
+    defer alloc.free(got);
+    try std.testing.expectEqualSlices(u8, want, got);
+}
+
+test "SnapshotChunkWriter exact 32 KiB boundaries and final partial flush" {
+    const alloc = std.testing.allocator;
+    var queue: std.ArrayList(u8) = .empty;
+    defer queue.deinit(alloc);
+
+    // Exactly chunk_len through one oversized write: one full chunk, and
+    // the explicit flush has no partial tail to emit.
+    {
+        var cw: SnapshotChunkWriter = undefined;
+        cw.init(alloc, &queue, 1 << 30);
+        var data: [SnapshotChunkWriter.chunk_len]u8 = undefined;
+        @memset(&data, 'a');
+        try cw.writer.writeAll(&data);
+        try cw.writer.flush();
+        try std.testing.expectEqual(@as(u64, SnapshotChunkWriter.chunk_len), cw.total);
+        const frames = try collectFrames(alloc, queue.items);
+        defer alloc.free(frames);
+        try std.testing.expectEqual(@as(usize, 1), frames.len);
+        try std.testing.expectEqual(ipc.Tag.SnapshotChunk, frames[0].tag);
+        try std.testing.expectEqual(SnapshotChunkWriter.chunk_len, frames[0].payload.len);
+    }
+
+    // chunk_len + 1: the full chunk, then the one-byte final partial.
+    {
+        queue.clearRetainingCapacity();
+        var cw: SnapshotChunkWriter = undefined;
+        cw.init(alloc, &queue, 1 << 30);
+        var data: [SnapshotChunkWriter.chunk_len + 1]u8 = undefined;
+        @memset(&data, 'b');
+        try cw.writer.writeAll(&data);
+        try cw.writer.flush();
+        try std.testing.expectEqual(@as(u64, SnapshotChunkWriter.chunk_len + 1), cw.total);
+        const frames = try collectFrames(alloc, queue.items);
+        defer alloc.free(frames);
+        try std.testing.expectEqual(@as(usize, 2), frames.len);
+        try std.testing.expectEqual(SnapshotChunkWriter.chunk_len, frames[0].payload.len);
+        try std.testing.expectEqual(@as(usize, 1), frames[1].payload.len);
+    }
+
+    // Small writes accumulate in the staging area until a boundary: no
+    // chunk frames appear until the flush emits the residue.
+    {
+        queue.clearRetainingCapacity();
+        var cw: SnapshotChunkWriter = undefined;
+        cw.init(alloc, &queue, 1 << 30);
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            try cw.writer.writeAll(&([_]u8{'c'} ** 300));
+        }
+        try std.testing.expectEqual(@as(usize, 0), queue.items.len);
+        try cw.writer.flush();
+        const frames = try collectFrames(alloc, queue.items);
+        defer alloc.free(frames);
+        var summed: usize = 0;
+        for (frames) |f| {
+            try std.testing.expectEqual(ipc.Tag.SnapshotChunk, f.tag);
+            summed += f.payload.len;
+        }
+        try std.testing.expectEqual(@as(usize, 100 * 300), summed);
+        try std.testing.expectEqual(@as(u64, 100 * 300), cw.total);
+    }
+}
+
+test "SnapshotChunkWriter enforces the total before every growth" {
+    const alloc = std.testing.allocator;
+    var queue: std.ArrayList(u8) = .empty;
+    defer queue.deinit(alloc);
+    var cw: SnapshotChunkWriter = undefined;
+    cw.init(alloc, &queue, 8);
+
+    // Ten bytes stage silently (no growth yet), then the explicit flush
+    // refuses to grow past the cap: nothing is queued, the cause rides.
+    try cw.writer.writeAll("0123456789");
+    try std.testing.expectEqual(@as(usize, 0), queue.items.len);
+    try std.testing.expectError(error.WriteFailed, cw.writer.flush());
+    try std.testing.expectEqual(@as(?SnapshotChunkWriter.Cause, .limit), cw.cause);
+    try std.testing.expectEqual(@as(u64, 0), cw.total);
+    try std.testing.expectEqual(@as(usize, 0), queue.items.len);
+}
+
+test "snapshot failure mapping preserves the writer cause" {
+    const t = std.testing;
+    // Cause wins over the generic WriteFailed the interface reports.
+    try t.expectEqual(ipc.snapshot_error_limit_exceeded, Daemon.snapshotFailureCode(error.WriteFailed, .limit));
+    try t.expectEqual(ipc.snapshot_error_out_of_memory, Daemon.snapshotFailureCode(error.WriteFailed, .out_of_memory));
+    // Without a cause: OOM and continuation keep their codes. A bare
+    // WriteFailed can only be Ghostty's internal scratch allocation
+    // failing (the chunk writer always records its cause first); other
+    // errors are genuine encode failures.
+    try t.expectEqual(ipc.snapshot_error_out_of_memory, Daemon.snapshotFailureCode(error.OutOfMemory, null));
+    try t.expectEqual(ipc.snapshot_error_out_of_memory, Daemon.snapshotFailureCode(error.WriteFailed, null));
+    try t.expectEqual(ipc.snapshot_error_continuation_unavailable, Daemon.snapshotFailureCode(error.ContinuationUnavailable, null));
+    try t.expectEqual(ipc.snapshot_error_encode_failed, Daemon.snapshotFailureCode(error.Overflow, null));
+    try t.expectEqual(ipc.snapshot_error_encode_failed, Daemon.snapshotFailureCode(error.PayloadTooLarge, null));
+}
+
+test "handleInitSnapshot continuation unavailable rolls back to code 2" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    // Tiny cap: a 5-byte unfinished CSI breaks the tracker, so the cut
+    // reports ContinuationUnavailable instead of exporting.
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = 4,
+    });
+    defer vts.deinit();
+    vts.nextSlice("\x1b[312");
+
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
+    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    try std.testing.expectEqual(ipc.Tag.SnapshotError, frames[0].tag);
+    const ew = try ipc.parseSnapshotErrorPayload(frames[0].payload);
+    try std.testing.expectEqual(ipc.snapshot_error_continuation_unavailable, ew.code);
+}
+
+test "handleInitSnapshot preserves pre-existing queue content through rollback" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    daemon.has_pty_output = true;
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    try ipc.appendMessage(alloc, &client.write_buf, .Output, "pre-cut bytes");
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = 4,
+    });
+    defer vts.deinit();
+    vts.nextSlice("\x1b[312");
+
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
+    try daemon.handleInitSnapshot(alloc, &client, -1, &term, &vts, payload);
+
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(ipc.Tag.Output, frames[0].tag);
+    try std.testing.expectEqualStrings("pre-cut bytes", frames[0].payload);
+    try std.testing.expectEqual(ipc.Tag.SnapshotError, frames[1].tag);
+    try std.testing.expectEqual(
+        ipc.snapshot_error_continuation_unavailable,
+        (try ipc.parseSnapshotErrorPayload(frames[1].payload)).code,
+    );
+}
+
+test "handleInitSnapshot rolls back every allocation failure to one error" {
+    const alloc = std.testing.allocator;
+    var fail_index: usize = 0;
+    while (fail_index <= 24) : (fail_index += 1) {
+        var daemon = snapshotTestDaemon();
+        daemon.has_pty_output = true;
+        var client = snapshotTestClient(alloc);
+        defer client.write_buf.deinit(alloc);
+        var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+        defer term.deinit(alloc);
+        var vts = ghostty_vt.TerminalStream.init(.{
+            .allocator = alloc,
+            .handler = term.vtHandler(),
+            .continuation_max_bytes = Daemon.snapshot_continuation_max,
+        });
+        defer vts.deinit();
+        vts.nextSlice("some output\r\nwith content\r\n");
+
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
+        daemon.handleInitSnapshot(failing.allocator(), &client, -1, &term, &vts, payload) catch |e| {
+            // A failure before the transaction (reservation or resize)
+            // propagates and leaves the queue untouched.
+            try std.testing.expectEqual(error.OutOfMemory, e);
+            try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+            continue;
+        };
+
+        const frames = try collectFrames(alloc, client.write_buf.items);
+        defer alloc.free(frames);
+        var saw_error: ?ipc.Tag = null;
+        for (frames) |f| {
+            if (f.tag == .SnapshotError) {
+                try std.testing.expect(saw_error == null); // exactly one
+                saw_error = f.tag;
+                const ew = try ipc.parseSnapshotErrorPayload(f.payload);
+                // Every injected failure on this path is an allocation
+                // failure: it must map to code 5, never generic 3.
+                try std.testing.expectEqual(ipc.snapshot_error_out_of_memory, ew.code);
+            } else {
+                // No transaction frame may coexist with the error.
+                try std.testing.expect(saw_error == null);
+            }
+        }
+        // Either exactly one SnapshotError, or a complete transaction.
+        if (saw_error != null) {
+            try std.testing.expectEqual(@as(usize, 1), frames.len);
+        } else {
+            try std.testing.expectEqual(ipc.Tag.SnapshotBegin, frames[0].tag);
+            try std.testing.expectEqual(ipc.Tag.SnapshotEnd, frames[frames.len - 1].tag);
+        }
+    }
+}
+
+test "handleInit first attach sets leader without replay or snapshot frames" {
+    const alloc = std.testing.allocator;
+    var daemon = snapshotTestDaemon();
+    var client = snapshotTestClient(alloc);
+    defer client.write_buf.deinit(alloc);
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var vts = term.vtStream();
+    defer vts.deinit();
+
+    // First attach (has_had_client false): no legacy replay is emitted.
+    // setLeader still asks the client for its size (the empty .Resize
+    // ask-back) — pre-existing .Init behavior, unchanged by Q4.
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 80, .xpixel = 0, .ypixel = 0 });
+    try daemon.handleInit(alloc, &client, -1, &term, payload);
+
+    try std.testing.expect(daemon.leader_client_fd == client.socket_fd);
+    try std.testing.expect(daemon.has_terminal_client);
+    try std.testing.expect(daemon.has_had_client);
+    const frames = try collectFrames(alloc, client.write_buf.items);
+    defer alloc.free(frames);
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    try std.testing.expectEqual(ipc.Tag.Resize, frames[0].tag);
+    try std.testing.expectEqual(@as(usize, 0), frames[0].payload.len);
 }
