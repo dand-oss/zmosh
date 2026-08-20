@@ -1507,6 +1507,276 @@ The public C ABI remains unchanged. `zmosh_output_fn` still receives VT bytes;
 binary snapshot exposure would require a future additive API and is out of
 scope.
 
+### Q4 frozen implementation contract (2026-08-20, before any Q4 code)
+
+Q4 is implemented against `31e373c` on `replant-zmx0.7`. This record freezes
+the execution contract before any code; wording below is the approved contract
+verbatim (heading depth adjusted to fit this document; no wording changes).
+
+#### Summary
+
+Implement Q4 against 31e373c on replant-zmx0.7.
+
+Q4 will replace the QUIC client's initial VT replay with a transactional
+Ghostty binary snapshot:
+
+- daemon captures post-resize state and continuation;
+- gateway streams it on server uni stream 7 as epoch 1;
+- client spools through QUIC FIN, restores READY, applies post-cut output
+  between history pages, validates FINISH, then emits one VT replay;
+
+- local .Init behavior and the public C ABI remain unchanged.
+
+Explicit SNAPSHOT_REQUEST replacement remains nonterminal unimplemented until
+Q5, which owns matching output-epoch replacement. Performance uses a
+measure-then-approve checkpoint before Q4 closes.
+
+#### Implementation
+
+##### 1. Preflight, tracking, and Ghostty pin
+
+- Reverify clean 31e373c, matching origin/replant-zmx0.7; preserve
+  .claude/worktrees/.
+- Close both signed-off Q3 beads (zmosh-8sd.3, zmosh-8sd.9) with the audit
+  evidence, mark zmosh-8sd.4 in progress, and append a frozen Q4 contract
+  before code.
+
+- Advance Ghostty to:
+    - SHA 6361b2eac73e8243a7042f517ea95ab87165f105
+    - hash ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD
+
+- Pass vt-features=+snapshot to executable, test, and every release dependency
+  instance. Bump quic_wire.adapter_version from 1 to 2. Freeze the resulting
+  ABI ID as:
+  7698150409ab3681797355e5ba819898a422283b3f3ce8eee7cb15f6fb18d9ad.
+
+- Run full pin-only gates before source adaptation. Any unexpected
+  compatibility change stops the round.
+
+##### 2. Frozen IPC and wire interfaces
+
+Add IPC tags without changing 0–19:
+
+| Tag | Value | Exact payload |
+|---|---|---|
+| InitSnapshot | 20 | exactly one existing 8-byte ipc.Resize |
+| SnapshotBegin | 21 | one byte, 0 or 1 (present) |
+| SnapshotChunk | 22 | 1–32 KiB opaque Ghostty bytes |
+| SnapshotEnd | 23 | u64 BE count of Ghostty bytes only |
+| SnapshotError | 24 | u32 BE code plus printable diagnostic ≤256 bytes |
+
+Freeze local error codes: invalid request=1, continuation unavailable=2,
+encode failed=3, limit exceeded=4, out of memory=5. Unknown codes or malformed
+payloads fail the gateway session closed.
+
+Add the 24-byte snapshot header:
+
+- common preface with role snapshot;
+- epoch u64 BE;
+- flags byte with PRESENT=0x01 only;
+- seven zero reserved bytes.
+
+Q4 permits only initial epoch 1: output stream id 3 and snapshot stream id 7
+both carry epoch 1. Duplicate/future snapshot streams are rejected;
+already-installed stale epochs are drained and discarded. Explicit replacement
+epochs remain Q5.
+
+##### 3. Daemon snapshot export
+
+- Replace the daemon's fresh term.vtStream() with one persistent
+  TerminalStream.init created before the first PTY byte, using the existing
+  terminal handler and a 64 MiB continuation cap.
+
+- Factor only leadership/resize mechanics shared by .Init and .InitSnapshot.
+  Preserve normal .Init exactly: legacy replay remains pre-resize for local
+  clients.
+
+- .InitSnapshot establishes leadership, applies PTY and Ghostty resize, then
+  captures synchronously before the next PTY read.
+
+- For an empty session, enqueue SnapshotBegin(0) and SnapshotEnd(0) with no
+  encoder invocation.
+
+- Otherwise export continuation exactly once and pass it unchanged to
+  ghostty_vt.snapshot.encode.
+
+- Stream encoder output through one fixed 32 KiB chunking writer directly into
+  the requesting client's IPC queue. Enforce the 128 MiB total before every
+  growth.
+
+- Reserve room for the maximum SnapshotError before starting. Record the queue
+  length immediately before SnapshotBegin; on any encoder, continuation,
+  allocation, or limit failure, restore that exact length and append exactly
+  one error without another allocation.
+
+- The single-threaded synchronous handler inherently permits only one active
+  encoder invocation. Completed queued transactions may drain normally; no
+  thread, second full-snapshot buffer, or copied Ghostty record definition is
+  introduced.
+
+- Snapshot failure affects only the requesting gateway. The daemon and other
+  local clients remain alive.
+
+##### 4. Gateway snapshot relay
+
+Extend QuicSession with explicit phases:
+
+awaiting_resize → awaiting_snapshot_begin → snapshot_streaming →
+awaiting_snapshot_installed → active.
+
+- First client RESIZE queues .InitSnapshot, not .Init.
+- Client input may flow only after .InitSnapshot is already ahead of it in the
+  ordered Unix write buffer.
+
+- Additional RESIZEs during installation coalesce to one latest value and
+  reach the daemon only after installation.
+
+- Discard daemon .Output before SnapshotBegin; it predates the authoritative
+  cut.
+- Between Begin and End, accept only legal chunks and End. Interleaved Output,
+  duplicate markers, bad lengths, count mismatch, or more than 128 MiB are
+  terminal internal errors.
+
+- After End, relay subsequent .Output as post-cut epoch-1 output.
+- Open snapshot stream 7 on Begin, send the header and chunks under normal
+  QUIC flow control, and FIN only after the validated End count and all
+  pending bytes are accepted.
+
+- Keep one bounded pending snapshot buffer of header plus one 32 KiB chunk.
+  Snapshot transmission is serviced before output so a blocked output stream
+  cannot starve snapshot or control progress.
+
+- Teach the daemon relay to process already-buffered IPC frames even without a
+  new POLL.IN, and stop after accepting one blocked snapshot/output unit. This
+  prevents both overflow and buffered-frame stalls.
+
+- Accept empty SNAPSHOT_INSTALLED only after snapshot FIN was sent; then enter
+  active and flush the latest coalesced resize.
+
+- A daemon SnapshotError becomes a terminal ZMQ1 internal_error. Reset an
+  unfinished snapshot stream before the existing bounded terminal settlement.
+
+- Leave quic_transport.zig untouched at 467 SLOC.
+
+##### 5. Client installer and FSM
+
+Create one internal, heap-owned snapshot installer so its reader, Decoder,
+Terminal, and TerminalStream have stable addresses even if Client moves.
+
+Client protocol changes:
+
+- First accepted RESIZE enters installing_snapshot, not active.
+- During installation, later RESIZEs replace one coalesced value; input,
+  DETACH, and explicit snapshot requests remain unavailable.
+
+- Snapshot headers and bodies are read incrementally with a 64 KiB per-pump
+  budget.
+- Spool with precise growth and reject byte 128 MiB+1 before allocation.
+- PRESENT=0 requires no body and immediate FIN.
+- Never invoke Ghostty decoding before QUIC FIN.
+- For a present snapshot:
+    1. initialize a fixed reader over the completed spool;
+    2. call Decoder.ready() exactly once;
+    3. move the terminal to its stable final field;
+    4. create its persistent stream and replay decoded continuation exactly
+       once;
+    5. unlock output reads and apply post-cut bytes to that terminal;
+    6. beginning on the following pump, call Decoder.next() at most once per
+       pump;
+    7. on completion, require FINISH and zero trailing reader bytes.
+
+- Reuse the completed spool allocation as a bounded 128 MiB VT replay buffer.
+  Serialize the restored terminal once, then destroy decoder/terminal state
+  and direct-forward future output.
+
+- Client.pollOutput() keeps its signature and returns the initial replay
+  first, then live bytes. Bytes applied during history restoration are
+  represented only by that replay and are never forwarded separately.
+
+- Send SNAPSHOT_INSTALLED only after FINISH/no-trailing validation and replay
+  preparation. A blocked frame remains owned and retries atomically; once
+  accepted, transition active and send the latest coalesced resize.
+
+- Extend terminal-event deferral so SESSION_END cannot surface while a valid
+  initial snapshot remains unfinished. Decoder/protocol failures replace it
+  with their own terminal error.
+
+- Keep Client.pump, Client.pollOutput, and all public C declarations
+  unchanged.
+
+#### Tests and checkpoints
+
+Land green FF commits in this order:
+
+1. Frozen Q4 plan and Beads transition.
+2. Ghostty pin, feature option, adapter-version bump, and ABI golden.
+3. IPC codecs, persistent continuation tracking, transactional daemon
+   exporter.
+4. Snapshot wire parser, gateway phases, bounded relay and stream FIN
+   handling.
+5. Heap-stable client installer, FSM integration, replay ordering, and
+   coalesced resize.
+6. Cross-layer fixtures and performance harness.
+
+Required deterministic coverage:
+
+- Golden tag values, payload lengths, header bytes, reserved bits, PRESENT
+  flag, ABI ID, and epoch 1.
+
+- Empty and populated transactions; exact 32 KiB boundaries; pre-existing
+  queue preservation; every injected allocation/encode/limit failure rolling
+  back to one error.
+
+- Post-resize cut ordering and unfinished ESC/CSI/OSC/DCS/APC/UTF-8
+  continuation.
+- Pre-cut Output discarded, transaction interleaving rejected, End count
+  validated, post-cut Output preserved.
+
+- Snapshot/control progress while output credit is exhausted; snapshot-chunk
+  backpressure and buffered-IPC resumption.
+
+- Every network split boundary, absent-body rejection, truncation, trailing
+  bytes, malformed Ghostty records, excessive continuation, and 128 MiB+1
+  rejection.
+
+- READY once, stable move, continuation once, no decoder call before FIN, one
+  history page per pump, and final equality with an uninterrupted terminal.
+
+- Output arriving between history pages, one VT replay followed by direct
+  live output, and latest-only resize after installation.
+
+- Constructor/allocation failure leak checks and unchanged local .Init
+  behavior.
+- Existing Q3 tests retained and adapted to perform the initial snapshot
+  rather than bypassing it.
+
+- SNAPSHOT_REQUEST remains a nonterminal Q5 deferral and continued service is
+  re-proven.
+
+##### Performance approval gate
+
+Add a dedicated ReleaseSafe benchmark using a frozen 120×40 terminal with
+25,000 deterministic styled scrollback lines, title/OSC7, alternate-screen
+state, and unfinished continuation.
+
+After one warm-up, record five runs:
+
+- encoded byte count;
+- encode, READY, total decode, and per-page p50/p95/max times;
+- overall peak RSS from /usr/bin/time -v;
+- host, Zig version, optimization mode, and Ghostty pin.
+
+Store logs outside the repository and append factual evidence to the
+plan/bead. Stop for review without closing Q4. The reviewed numbers then
+become explicit enforced bounds in a final record commit; rerun the benchmark
+and all gates before closing zmosh-8sd.4.
+
+Final gates: Debug and ReleaseSafe tests from the 247 baseline, zig build
+check, release then Debug builds, formatter and diff checks, adapter SLOC 467,
+Bats 58/0/4, unchanged C header/library ABI, unchanged q2-2/quicz refs and
+backup, clean worktree except the preserved worktree directory. Q5 remains
+locked.
+
 ## Phase Q5: reliable output epochs and remote attach
 
 Input uses one client unidirectional reliable stream. Raw terminal input is
