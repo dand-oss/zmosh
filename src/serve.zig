@@ -3,15 +3,26 @@
 //! One poll() loop bridges the daemon's Unix socket to the client's
 //! QUIC connection. QUIC is this branch's active transport; the custom
 //! UDP transport files stay untouched until the reviewed removal
-//! checkpoint. The Q3 relay carries application data both ways: daemon
-//! `.Output` flows to the epoch-1 output stream, input stream bytes and
-//! control frames map to daemon IPC (first RESIZE → `.Init`, later
-//! RESIZE → `.Resize`, DETACH → `.Detach`), daemon `.Resize` is
-//! answered locally with the last client size, and daemon EOF sends
-//! SESSION_END then settles both streams before closing (code 9). All
-//! daemon I/O is bounded: the reader caps one frame (header + 64 KiB,
-//! oversized declarations rejected before accumulation) and the writer
-//! is a 64 KiB buffer flushed on a dynamic POLL.OUT arm.
+//! checkpoint. The Q4 relay carries application data both ways: the
+//! first client RESIZE maps to daemon `.InitSnapshot`, whose
+//! transactional Begin/Chunk/End/Error reply streams to the client on
+//! server uni stream 7 (24-byte epoch-1 snapshot header with the
+//! PRESENT flag, then Ghostty bytes, then the FIN — see
+//! docs/quic-wire.md); installation-phase RESIZEs coalesce to one
+//! latest value forwarded after SNAPSHOT_INSTALLED; daemon `.Output`
+//! before SnapshotBegin is discarded as pre-cut, after the validated
+//! End it flows to the epoch-1 output stream, and between the two it
+//! is a terminal interleave; later RESIZEs forward as `.Resize`,
+//! DETACH → `.Detach`; daemon `.Resize` is answered locally with the
+//! last client size, and daemon EOF sends SESSION_END then settles
+//! both streams before closing (code 9). All daemon I/O is bounded
+//! and header-aware: the reader caps one frame (header + 64 KiB,
+//! oversized declarations rejected before accumulation) and never
+//! reads the payload of a frame the session cannot accept — while
+//! discard-only and terminal-error frames stay always-consumable so
+//! withheld snapshot credit can neither starve SnapshotBegin nor
+//! delay fail-closed handling; the writer is a 64 KiB buffer flushed
+//! on a dynamic POLL.OUT arm.
 //!
 //! Bootstrap ordering is contract: EVERY fallible initialization
 //! completes before the success line prints; pre-success failures emit

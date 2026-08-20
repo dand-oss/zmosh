@@ -1,8 +1,11 @@
 # zmosh QUIC wire protocol (ZMQ1)
 
-Status: authoritative ZMQ1 v1, amended (Q3, 2026-08-19). The FINAL
-flag and the DETACH/terminal-FIN rules below postdate the original v1
-freeze; with no released v1 consumer the version number is unchanged.
+Status: authoritative ZMQ1 v1, amended (Q3 2026-08-19; Q4 2026-08-20).
+The FINAL flag and the DETACH/terminal-FIN rules postdate the original
+v1 freeze; Q4 amends the attach path to the transactional binary
+snapshot (stream 7, `.InitSnapshot`, SNAPSHOT_INSTALLED) and bumps the
+adapter version to 2 with a new frozen `snapshot_abi_id`. With no
+released v1 consumer the wire version number is unchanged.
 This document is the authoritative
 wire specification for the zmosh application protocol carried over QUIC.
 Implementation: `src/quic_wire.zig` (framing), `src/quic_session.zig`
@@ -31,7 +34,7 @@ Rejections: unknown role → `unknown_role`; nonzero flags or reserved →
 | control | bidirectional | client bidi id 0 | client, first |
 | input | client → server | client uni id 2 | client, after HELLO_ACK |
 | output | server → client | server uni id 3 | server, at HELLO_ACK |
-| snapshot | server → client | server uni id ≥ 7 | Q4 |
+| snapshot | server → client | server uni id 7 | server, at SnapshotBegin (Q4, epoch 1) |
 | command | bidirectional | client bidi id ≥ 4 | Q6 |
 
 Attach uses one control stream, one input stream, and one current
@@ -43,7 +46,22 @@ limits (4 bidirectional, 8 unidirectional).
 
 The output stream begins with the common preface (role=output) followed
 by an epoch u64 big-endian (16 header bytes total), then raw PTY bytes.
-Epochs start at 1; Q3 always uses 1. Epoch replacement is Q5.
+Epochs start at 1; Q4 always uses 1. Epoch replacement is Q5.
+
+The snapshot stream (7) begins with its own 24-byte header, then the
+Ghostty binary snapshot bytes, then the FIN:
+
+| Offset | Field | Value |
+|---|---|---|
+| 0..7 | preface | role=snapshot |
+| 8..15 | epoch | u64 big-endian; 1 (Q4 permits only epoch 1) |
+| 16 | flags | PRESENT=0x01 only; zero means an empty snapshot |
+| 17..23 | reserved | seven zero bytes |
+
+PRESENT=0 means no body: the FIN follows the header immediately.
+Invalid role, flags, reserved bytes, or a non-1 epoch are rejected by
+the client parser. The header is incremental-resume (arbitrary QUIC
+chunking). Explicit replacement epochs remain Q5.
 
 ## Ordering across streams
 
@@ -61,9 +79,34 @@ QUIC does not order bytes across streams, only within one:
   before the HELLO_ACK packet; the client MUST NOT process stream-3
   bytes before HELLO_ACK validates.
 - The client's first control frame after HELLO_ACK MUST be RESIZE. The
-  gateway maps that first RESIZE to the daemon `.Init` (session
-  initialization with the client's size); subsequent RESIZEs forward as
-  daemon `.Resize`.
+  gateway maps that first RESIZE to the daemon `.InitSnapshot` (Q4:
+  session initialization with the client's size plus one transactional
+  binary snapshot; before Q4 it mapped to the legacy `.Init` VT
+  replay). During installation further RESIZEs never reach the daemon:
+  they coalesce to one latest value, forwarded as daemon `.Resize`
+  only after SNAPSHOT_INSTALLED activates the session. Input on
+  stream 2 is accepted once `.InitSnapshot` is ahead of it in the
+  ordered daemon-bound buffer.
+- The daemon transaction is strict: SnapshotBegin opens stream 7 and
+  stages the snapshot header (below); between Begin and End ONLY
+  SnapshotChunk/SnapshotEnd/SnapshotError are legal (any interleaved
+  daemon frame — Output, Resize, Switch, unknown — is a terminal
+  `internal_error`); PRESENT=0 admits no chunks and requires End(0);
+  PRESENT=1 requires at least one byte; the End count must equal the
+  chunk bytes exactly; the accumulated total must stay within the
+  HELLO-negotiated snapshot limit. Every violation — and any daemon
+  SnapshotError (known code, unknown code, or malformed) — resets an
+  unfinished stream 7 before the bounded terminal settlement. Daemon
+  Output before Begin predates the authoritative cut: discarded and
+  counted. Output AFTER a validated End is legal post-cut output,
+  relayed on the epoch-1 output stream even while the stream-7 FIN is
+  still pending.
+- The gateway FINs stream 7 only after the validated End count AND
+  full acceptance of every pending snapshot byte; the client's empty
+  SNAPSHOT_INSTALLED is accepted only in that post-FIN state
+  (premature, nonempty, or post-activation INSTALLED is a
+  `protocol_violation`, as are DETACH and SNAPSHOT_REQUEST during
+  installation).
 
 ## Control frames (on the control stream)
 
@@ -84,8 +127,8 @@ bit, or FINAL on another frame type, is `protocol_violation`.
 | 2 | HELLO_ACK | 48 bytes, same shape |
 | 3 | RESIZE | rows, cols, xpixel, ypixel — four u16 big-endian |
 | 4 | DETACH | empty |
-| 5 | SNAPSHOT_REQUEST | empty (served from Q4; nonterminal ERROR before) |
-| 6 | SNAPSHOT_INSTALLED | empty (Q4; from a client before that: `protocol_violation`) |
+| 5 | SNAPSHOT_REQUEST | empty (ACTIVE: nonterminal ERROR, replacement snapshots are Q5; during installation: `protocol_violation`) |
+| 6 | SNAPSHOT_INSTALLED | empty (accepted only in the post-stream-7-FIN state; premature/nonempty/duplicate: `protocol_violation`) |
 | 7 | SESSION_END | empty |
 | 8 | ERROR | code u32 big-endian + printable reason ≤ 256 bytes |
 
@@ -174,8 +217,11 @@ ERROR+FIN sequence above; when no control stream was ever observed
 close with the correct code and a bounded reason — no stream write is
 attempted, since no send side exists.
 
-SNAPSHOT_REQUEST before Q4 is answered by a NONTERMINAL
-ERROR(unimplemented): no FIN, the session continues serving.
+SNAPSHOT_REQUEST in the ACTIVE phase is answered by a NONTERMINAL
+ERROR(unimplemented) — replacement snapshots are deferred to Q5 — no
+FIN, the session continues serving. During snapshot installation the
+same frame is a `protocol_violation` (unavailable until the initial
+snapshot completes).
 
 ### DETACH sequencing (normative)
 
@@ -239,14 +285,25 @@ custom windows:
 ## Daemon-side mapping (gateway only)
 
 The gateway bridges ZMQ1 to the existing daemon Unix-socket IPC: input
-bytes → `.Input` frames; the first RESIZE → `.Init`; later RESIZEs →
-`.Resize`; DETACH → `.Detach`. Daemon → client: `.Output` relays to the
-output stream; a daemon `.Resize` is answered with `.Resize` carrying
-the last client size (the local attach client's behavior — never a
-second `.Init`, which would re-trigger terminal replay); `.Switch`
-terminates the session with `unimplemented` until Q5; any other tag is
-counted and ignored. Daemon EOF produces SESSION_END and closes with
-`session_ended`. Daemon frames are bounded (header + 64 KiB); an
-oversized declared frame is rejected before payload accumulation —
-a large legacy VT replay therefore fails closed until Q4 introduces
-chunked snapshots.
+bytes → `.Input` frames; the first RESIZE → `.InitSnapshot` (Q4);
+installation-phase RESIZEs coalesce (forwarded as one `.Resize` after
+SNAPSHOT_INSTALLED); later RESIZEs → `.Resize`; DETACH → `.Detach`.
+Daemon → client: the SnapshotBegin/Chunk/End/Error transaction relays
+to stream 7 as epoch 1 (one bounded header-plus-32-KiB pending unit at
+a time, serviced before output; FIN only after the validated End count
+and full pending acceptance); pre-Begin `.Output` is discarded and
+counted; Output between Begin and a validated End is a terminal
+interleave; Output after the validated End relays as post-cut epoch-1
+output even before the FIN; a daemon `.Resize` is answered with
+`.Resize` carrying the last client size (never a second
+initialization, which would re-trigger terminal replay); `.Switch`
+terminates the session with `unimplemented` until Q5; any other tag
+during an active transaction is a terminal interleave, and outside one
+is counted and ignored. Daemon EOF produces SESSION_END and closes
+with `session_ended`. Daemon frames are bounded (header + 64 KiB); an
+oversized declared frame is rejected before payload accumulation. The
+daemon read gate is header-aware: once an IPC header is buffered, a
+frame the session cannot accept (its bounded relay storage is
+occupied) has its payload withheld — but discard-only and
+terminal-error frames are always consumable, so withheld snapshot
+credit can never delay fail-closed handling or starve SnapshotBegin.

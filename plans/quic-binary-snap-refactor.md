@@ -1838,6 +1838,41 @@ replacement-snapshots-deferred-to-Q5 deferral. Completion evidence is
 appended without modifying earlier records. Full Bats remains the
 final Q4 gate.
 
+### Q4 Stage 4.1 completion evidence (2026-08-20, appended after gates)
+
+Landed as three commits on replant-zmx0.7, in the frozen order:
+
+1. `7d3af88` — the frozen correction contract above, appended before
+   any correction code.
+2. `132a841` — runtime fixes plus the RED-first deterministic proofs.
+   Each proof was run against `1a7013e` first and failed for exactly
+   the audited cause (RED log retained outside the repository):
+   post-End/pre-FIN output terminated as an interleave; malformed
+   chunks behind a parked legal unit never reached failSnapshot; the
+   read gate kept reading an unacceptable frame's payload. After the
+   fixes: Debug 279/279, ReleaseSafe 279/279 (264 at stage-3.1 plus
+   the stage-4 twelve and three new 4.1 proofs), `zig build check`,
+   `zig build release` then Debug rebuild, `zig fmt --check`,
+   `git diff --check` all clean, frozen awk SLOC 467 on
+   quic_transport.zig. Diff: quic_session.zig, quic_wire.zig (test
+   only), serve.zig.
+3. Documentation and this evidence: docs/quic-wire.md amended
+   (stream 7 and its 24-byte epoch-1 header, `.InitSnapshot` first
+   attach, installation ordering and SNAPSHOT_INSTALLED acceptance,
+   post-End output legality, adapter version 2, replacement-snapshots
+   Q5 deferral) and the serve.zig module description rewritten for the
+   header-aware bounded relay; both test modes and format/diff rerun
+   green after the edits.
+
+Notes recorded during the proofs: the eagerly-sent HELLO's ACK must be
+captured (a discarded sessionRound return swallows the one-shot
+event); the r8.6 credit-clamp pattern requires re-clamping at the
+current offset because quicz auto-refills stream credit across rounds;
+writing arbitrary mid-frame bytes as a probe is invalid input (the
+bounded reader correctly fails closed on the garbage follow-on
+header). Q5 scope, the q2-2 quicz pin, and quic_transport.zig are
+untouched; Stage 5 remains locked pending review.
+
 ## Phase Q5: reliable output epochs and remote attach
 
 Input uses one client unidirectional reliable stream. Raw terminal input is
