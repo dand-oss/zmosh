@@ -62,7 +62,7 @@ pub const ControlTx = union(enum) {
     closed,
 };
 
-pub const PendingKind = enum { hello, first_resize, ordinary };
+pub const PendingKind = enum { hello, first_resize, detach, ordinary };
 
 /// The client's input-send side. `preface_pending` holds the staged
 /// preface; the body bytes remain caller-owned.
@@ -127,9 +127,15 @@ pub const ProtocolState = union(enum) {
         control_rx: ControlRx,
         input_tx: InputTx = .unopened,
         output_rx: OutputRx,
-        /// A DETACH was accepted (sent or parked): the server's bare
-        /// control FIN completes the session cleanly.
-        detach_sent: bool = false,
+    },
+    /// A DETACH was accepted (sent whole or parked whole — ownership
+    /// transferred). No further application writes; the server's bare
+    /// control FIN completes the session cleanly once the parked
+    /// frame (if any) has actually flushed.
+    detaching: struct {
+        control_tx: ControlTx,
+        control_rx: ControlRx,
+        output_rx: OutputRx,
     },
     /// A terminal marker was received after authorization: no new
     /// sends; control FIN validation and output draining continue.
@@ -153,6 +159,7 @@ pub const StateTag = enum {
     awaiting_ack,
     awaiting_first_resize,
     active,
+    detaching,
     draining,
     failed,
     closed,
@@ -230,7 +237,7 @@ pub const ClientSession = struct {
 
     pub fn ended(self: *const ClientSession) bool {
         return switch (self.state) {
-            .draining, .failed, .closed => true,
+            .detaching, .draining, .failed, .closed => true,
             else => false,
         };
     }
@@ -249,6 +256,7 @@ pub const ClientSession = struct {
             .awaiting_ack => .awaiting_ack,
             .awaiting_first_resize => .awaiting_first_resize,
             .active => .active,
+            .detaching => .detaching,
             .draining => .draining,
             .failed => .failed,
             .closed => .closed,
@@ -325,6 +333,21 @@ pub const ClientSession = struct {
         } };
     }
 
+    /// A DETACH frame was accepted with ownership transferred (sent
+    /// whole or parked whole): active → detaching, retaining the
+    /// control-send side so a parked DETACH survives to its retry.
+    fn beginDetach(self: *ClientSession) void {
+        const a = switch (self.state) {
+            .active => |a| a,
+            else => return,
+        };
+        self.state = .{ .detaching = .{
+            .control_tx = a.control_tx,
+            .control_rx = a.control_rx,
+            .output_rx = a.output_rx,
+        } };
+    }
+
     /// A terminal SESSION_END or FINAL ERROR after authorization: the
     /// live state enters draining, keeps its output evidence, and
     /// stops all new sends.
@@ -332,6 +355,7 @@ pub const ClientSession = struct {
         const output_rx = switch (self.state) {
             .awaiting_first_resize => |a| a.output_rx,
             .active => |a| a.output_rx,
+            .detaching => |d| d.output_rx,
             else => return,
         };
         self.state = .{ .draining = .{
@@ -376,6 +400,11 @@ pub const ClientSession = struct {
     /// still drains.
     fn recordPeerClose(self: *ClientSession, kind: CloseKind) void {
         switch (self.state) {
+            .detaching => {
+                // The control FIN the detach contract promised never
+                // arrived before the connection died.
+                self.failProtocol(.protocol_violation, "peer closed during detach");
+            },
             .draining => {
                 self.state.draining.peer = .closed;
                 if (self.state.draining.control_rx == .terminal_wait_fin) {
@@ -443,6 +472,7 @@ pub const ClientSession = struct {
             .awaiting_ack => |*a| &a.control_tx,
             .awaiting_first_resize => |*a| &a.control_tx,
             .active => |*a| &a.control_tx,
+            .detaching => |*d| &d.control_tx,
             else => null,
         };
     }
@@ -468,6 +498,7 @@ pub const ClientSession = struct {
         return switch (self.state) {
             .awaiting_first_resize => |*a| &a.output_rx,
             .active => |*a| &a.output_rx,
+            .detaching => |*d| &d.output_rx,
             .draining => |*d| &d.output_rx,
             else => null,
         };
@@ -557,7 +588,7 @@ pub const ClientSession = struct {
         if (self.takeEvent()) |e| return e;
 
         switch (self.state) {
-            .awaiting_ack, .awaiting_first_resize, .active, .draining => {},
+            .awaiting_ack, .awaiting_first_resize, .active, .detaching, .draining => {},
             .failed, .closed => return null,
         }
 
@@ -654,11 +685,15 @@ pub const ClientSession = struct {
             .frames => {
                 if (self.control_preface.expecting() or self.control.expectingFrame()) {
                     self.failProtocol(.protocol_violation, "truncated control stream");
-                } else if (self.state == .active and self.state.active.detach_sent) {
+                } else if (self.state == .detaching and self.state.detaching.control_tx == .idle) {
                     // The clean-detach arm: the server FINs without a
                     // final frame once our DETACH was flushed.
                     self.beginDrain(.{ .kind = .detach_fin, .code = 0 });
                     if (self.controlRx()) |c2| c2.* = .finished;
+                } else if (self.state == .detaching) {
+                    // A locally parked DETACH has not reached quicz:
+                    // a FIN cannot legitimately precede its bytes.
+                    self.failProtocol(.protocol_violation, "control FIN before DETACH flush");
                 } else {
                     self.failProtocol(.protocol_violation, "control FIN without terminal frame");
                 }
@@ -705,7 +740,7 @@ pub const ClientSession = struct {
                 }
                 switch (self.state) {
                     .awaiting_ack => return self.failBeforeAuthorization(quic_wire.ErrCode.session_ended.code(), "session ended"),
-                    .awaiting_first_resize, .active => {
+                    .awaiting_first_resize, .active, .detaching => {
                         self.beginDrain(.{ .kind = .session_end, .code = 0 });
                         self.pending_event = .session_end;
                     },
@@ -729,7 +764,7 @@ pub const ClientSession = struct {
                 if (h.isFinal()) {
                     switch (self.state) {
                         .awaiting_ack => return self.failBeforeAuthorization(parsed.code, parsed.reason),
-                        .awaiting_first_resize, .active => {
+                        .awaiting_first_resize, .active, .detaching => {
                             self.beginDrain(.{ .kind = .err, .code = parsed.code });
                         },
                         else => return self.failProtocol(.protocol_violation, "frame after terminal marker"),
@@ -772,12 +807,20 @@ pub const ClientSession = struct {
             .active => {},
             else => return error.NotActive,
         }
+        // A staged input preface owns stream 2's ordering: the DETACH
+        // waits for its flush (no reset, no silent abandonment, no
+        // reordering semantics).
+        if (self.inputTx()) |t| {
+            if (t.* == .preface_pending) return error.WouldBlock;
+        }
         var frame: [quic_wire.control_header_len]u8 = undefined;
         quic_wire.writeControlHeader(&frame, .detach, 0, 0);
-        try self.sendFrameAtomic(.ordinary, frame[0..]);
-        // Accepted (sent whole or parked whole): the bare FIN that
-        // follows now completes the session cleanly.
-        if (self.state == .active) self.state.active.detach_sent = true;
+        try self.sendFrameAtomic(.detach, frame[0..]);
+        // Accepted with ownership transferred (sent whole or parked
+        // whole): no further application writes; the bare FIN that
+        // follows — once any parked copy flushed — completes the
+        // session cleanly.
+        self.beginDetach();
     }
 
     pub fn sendSnapshotRequest(self: *ClientSession) !void {
@@ -1021,9 +1064,12 @@ pub const Client = struct {
 
     /// The one owned pending-egress datagram retained across a
     /// WouldBlock send, retried before any new QUIC output is polled.
+    /// The COMPLETE TaggedDatagram path binding is retained: bytes,
+    /// the whole destination tuple (local and remote), and ping
+    /// metadata.
     pending_egress: ?struct {
         dg: []u8,
-        dst: quicz.endpoint.UdpAddress,
+        dst: quicz.endpoint.UdpTuple,
         emitted_ping: bool,
     } = null,
 
@@ -1047,12 +1093,13 @@ pub const Client = struct {
     /// Latched after the first permanent socket failure: no further
     /// socket I/O is attempted.
     io_failed: bool = false,
-    /// A terminal event produced by a mid-turn local failure, delivered
-    /// by this pump's epilogue or the next pump call.
-    returned_event: ?ControlEvent = null,
     /// TEST-ONLY deterministic send-helper fixture: when nonzero, that
     /// many egress sends behave as WouldBlock before any real sendTo.
     egress_block_n: usize = 0,
+    /// TEST-ONLY permanent-failure fixture: when nonzero, that many
+    /// egress sends fail permanently through the SAME catch/latch
+    /// branch a real kernel error takes.
+    egress_fail_n: usize = 0,
 
     pub fn connect(alloc: std.mem.Allocator, io: std.Io, psk: *const [32]u8, remote: lib_posix.Address, now: i64) !Client {
         const family: u32 = switch (remote.any.family) {
@@ -1193,20 +1240,30 @@ pub const Client = struct {
     const Egress = enum { sent, parked };
 
     /// The one kernel-send path. Returns true when sent, false on
-    /// WouldBlock (the caller retains the datagram). `egress_block_n`
-    /// is the deterministic send-helper fixture: when nonzero, that
-    /// many sends behave as WouldBlock before any real sendTo —
-    /// loopback UDP never otherwise blocks.
-    fn sockSend(self: *Client, dg: []u8, dst: quicz.endpoint.UdpAddress) error{SocketFailed}!bool {
+    /// WouldBlock (the caller retains the datagram); a permanent
+    /// failure LATCHES and returns error.SocketFailed without ever
+    /// freeing the datagram — ownership stays with the caller. The
+    /// two test fixtures route through the same branches: `egress_fail_n`
+    /// takes the permanent-error path, `egress_block_n` the WouldBlock
+    /// path (loopback UDP never otherwise blocks).
+    fn sockSend(self: *Client, dg: []u8, dst: quicz.endpoint.UdpTuple) error{SocketFailed}!bool {
+        if (self.egress_fail_n > 0) {
+            self.egress_fail_n -= 1;
+            self.latchSocketFailure("socket send failed");
+            return error.SocketFailed;
+        }
         if (self.egress_block_n > 0) {
             self.egress_block_n -= 1;
             return false;
         }
-        if (self.sock.sendTo(dg, udp.udpAddressToSockaddr(dst))) {
+        if (self.sock.sendTo(dg, udp.udpAddressToSockaddr(dst.remote))) {
             return true;
         } else |e| switch (e) {
             error.WouldBlock => return false,
-            else => return self.failSocket(dg, "socket send failed"),
+            else => {
+                self.latchSocketFailure("socket send failed");
+                return error.SocketFailed;
+            },
         }
     }
 
@@ -1216,11 +1273,17 @@ pub const Client = struct {
     /// path binding, and ping metadata in the pending-egress slot; a
     /// permanent failure latches the no-more-I/O state.
     fn sendOrPark(self: *Client, tagged: quic_transport.Transport.TaggedDatagram) !Egress {
-        if (try self.sockSend(tagged.dg, tagged.dst.remote)) {
+        const sent = self.sockSend(tagged.dg, tagged.dst) catch |e| {
+            // Ownership never transferred: free OUR datagram; the
+            // latch freed the pending one exactly once, if any.
+            if (e == error.SocketFailed) self.alloc.free(tagged.dg);
+            return e;
+        };
+        if (sent) {
             self.alloc.free(tagged.dg);
             return .sent;
         }
-        self.pending_egress = .{ .dg = tagged.dg, .dst = tagged.dst.remote, .emitted_ping = tagged.emitted_ping };
+        self.pending_egress = .{ .dg = tagged.dg, .dst = tagged.dst, .emitted_ping = tagged.emitted_ping };
         return .parked;
     }
 
@@ -1234,6 +1297,9 @@ pub const Client = struct {
             return true;
         }
         return false;
+        // A permanent failure propagates error.SocketFailed AFTER the
+        // latch freed the pending datagram exactly once — nothing is
+        // freed here.
     }
 
     /// One bounded egress turn: pending retry first, then freshly
@@ -1321,11 +1387,20 @@ pub const Client = struct {
             try self.feed(arrival, now, buf);
             return true;
         }
-        const info = quicz.protection.peekProtectedLongPacketInfo(buf) catch {
-            // Retry validation and junk counting happen inside the
-            // adapter's route layer.
-            try self.feed(arrival, now, buf);
-            return true;
+        const info = quicz.protection.peekProtectedLongPacketInfo(buf) catch |e| switch (e) {
+            // Retry (and version negotiation) are not protected-long
+            // packets: the adapter's route layer performs the
+            // validation — passed ONCE, never parked.
+            error.UnsupportedPacketType => {
+                try self.feed(arrival, now, buf);
+                return true;
+            },
+            // Genuinely malformed long headers never reach the
+            // adapter: counted and discarded at the driver boundary.
+            else => {
+                self.junk_received += 1;
+                return true;
+            },
         };
         if (info.packet_type == .handshake and !self.transport.conn.hasHandshakeProtectionKeys()) {
             self.parkDatagram(buf.len, arrival, .handshake_keys, buf);
@@ -1426,17 +1501,29 @@ pub const Client = struct {
     /// The first permanent socket failure: one internal_error terminal
     /// event, best-effort session shutdown, pending egress freed, and
     /// socket I/O disabled for good.
-    fn failSocket(self: *Client, dg: []u8, context: []const u8) error{SocketFailed} {
-        self.alloc.free(dg);
+    /// The ONE permanent-failure latch — idempotent: a second call
+    /// neither replaces the first event nor frees anything again. It
+    /// still routes the failure through ClientSession.failLocal so the
+    /// session's shutdown and state stay consistent, then parks the
+    /// terminal metadata in `.event_ready` for deliverTerminal().
+    fn latchSocketFailure(self: *Client, context: []const u8) void {
+        if (self.io_failed) return;
         self.io_failed = true;
         if (self.pending_egress) |p| {
             self.alloc.free(p.dg);
             self.pending_egress = null;
         }
-        const ev = self.session.failLocal(.internal_error, context);
-        self.dstate = .terminal_delivered;
-        self.returned_event = ev;
-        return error.SocketFailed;
+        if (self.session.failLocal(.internal_error, context)) |ev| {
+            switch (ev) {
+                .err => |er| {
+                    const rlen = @min(er.reason.len, self.deferred_reason.len);
+                    @memcpy(self.deferred_reason[0..rlen], er.reason[0..rlen]);
+                    self.deferred_reason_len = rlen;
+                },
+                else => {},
+            }
+        }
+        self.dstate = .{ .event_ready = .{ .kind = .err, .code = quic_wire.ErrCode.internal_error.code() } };
     }
 
     /// One bounded turn. Retries the pending egress datagram first,
@@ -1449,12 +1536,16 @@ pub const Client = struct {
     /// the peer closed after draining everything readable); a failure
     /// event surfaces immediately. `event_ready` → `terminal_delivered`
     /// happens atomically with the return.
+    /// THE terminal delivery point: the atomic `event_ready →
+    /// terminal_delivered` transition, made exactly with the return.
+    fn deliverTerminal(self: *Client, meta: TerminalMeta) ?ControlEvent {
+        self.dstate = .terminal_delivered;
+        return self.deferredEvent(meta);
+    }
+
     pub fn pump(self: *Client, now: i64) !?ControlEvent {
         switch (self.dstate) {
-            .event_ready => |meta| {
-                self.dstate = .terminal_delivered;
-                return self.deferredEvent(meta);
-            },
+            .event_ready => |meta| return self.deliverTerminal(meta),
             // Terminal delivered, peer still settling: keep ACK/PTO
             // egress and socket receives alive so the peer's close
             // becomes observable, then stop for good.
@@ -1465,18 +1556,20 @@ pub const Client = struct {
             .closed => return null,
             .handshaking, .running, .draining => {},
         }
-        if (self.returned_event) |e| {
-            self.returned_event = null;
-            return e;
-        }
 
         if (self.dstate == .handshaking) {
             if (now >= self.dstate.handshaking.deadline_ns) {
                 // Fires once: the state leaves .handshaking with the
                 // event, and nextDeadline() returns null from here on.
-                const ev = self.session.failLocal(.session_ended, "handshake timeout");
-                self.dstate = .terminal_delivered;
-                return ev;
+                if (self.session.failLocal(.session_ended, "handshake timeout")) |ev| {
+                    if (ev == .err) {
+                        const rlen = @min(ev.err.reason.len, self.deferred_reason.len);
+                        @memcpy(self.deferred_reason[0..rlen], ev.err.reason[0..rlen]);
+                        self.deferred_reason_len = rlen;
+                    }
+                }
+                self.dstate = .{ .event_ready = .{ .kind = .err, .code = quic_wire.ErrCode.session_ended.code() } };
+                return self.deliverTerminal(self.dstate.event_ready);
             }
             try self.transport.driveCrypto(.initial, now);
             try self.transport.driveCrypto(.handshake, now);
@@ -1484,10 +1577,7 @@ pub const Client = struct {
         }
         try self.session.retryPendingSends();
         try self.pumpEgress(now);
-        if (self.returned_event) |e| {
-            self.returned_event = null;
-            return e;
-        }
+        if (self.dstate == .event_ready) return self.deliverTerminal(self.dstate.event_ready);
 
         // Drain output BEFORE control, before receiving.
         var ev: ?ControlEvent = null;
@@ -1515,8 +1605,8 @@ pub const Client = struct {
             const r = self.sock.recvFrom(&buf) catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => {
-                    self.failSocketNoDatagram("socket receive failed") catch {};
-                    return self.takeReturnedEvent();
+                    self.latchSocketFailure("socket receive failed");
+                    return self.deliverTerminal(self.dstate.event_ready);
                 },
             };
             _ = try self.classifyAndFeed(r.addr, now, buf[0..r.len]);
@@ -1544,13 +1634,16 @@ pub const Client = struct {
             const failed = self.session.stateTag() == .failed;
             if (failed or (self.session.controlFinished() and self.session.outputSettled())) {
                 const meta = self.dstate.draining;
-                self.dstate = .terminal_delivered;
+                self.dstate = .{ .event_ready = meta };
                 if (failed) {
                     // A protocol failure REPLACED the deferred event:
                     // surface the session's own failure event.
-                    if (try self.session.pollControl()) |e| return e;
+                    if (try self.session.pollControl()) |e| {
+                        self.dstate = .terminal_delivered;
+                        return e;
+                    }
                 }
-                return self.deferredEvent(meta);
+                return self.deliverTerminal(self.dstate.event_ready);
             }
         }
         return ev;
@@ -1566,9 +1659,8 @@ pub const Client = struct {
             return;
         }
         try self.pumpEgress(now);
-        if (self.returned_event != null) {
+        if (self.io_failed) {
             self.dstate = .closed;
-            self.returned_event = null;
             return;
         }
         var inbound: usize = 0;
@@ -1577,7 +1669,7 @@ pub const Client = struct {
             const r = self.sock.recvFrom(&buf) catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => {
-                    self.failSocketNoDatagram("socket receive failed") catch {};
+                    self.latchSocketFailure("socket receive failed");
                     self.dstate = .closed;
                     return;
                 },
@@ -1596,28 +1688,6 @@ pub const Client = struct {
     fn sessionDrainComplete(self: *const Client) bool {
         if (self.dstate != .draining) return false;
         return self.session.controlFinished() and self.session.outputSettled();
-    }
-
-    fn takeReturnedEvent(self: *Client) ?ControlEvent {
-        const e = self.returned_event orelse return null;
-        self.returned_event = null;
-        return e;
-    }
-
-    fn failSocketNoDatagram(self: *Client, context: []const u8) error{SocketFailed} {
-        self.io_failed = true;
-        if (self.pending_egress) |p| {
-            self.alloc.free(p.dg);
-            self.pending_egress = null;
-        }
-        self.returned_event = self.session.failLocal(.internal_error, context);
-        self.dstate = .terminal_delivered;
-        return error.SocketFailed;
-    }
-
-    /// A local failure surfaced exactly like a wire one.
-    pub fn failLocal(self: *Client, code: quic_wire.ErrCode, reason: []const u8) !?ControlEvent {
-        return self.session.failLocal(code, reason);
     }
 
     pub fn sendInput(self: *Client, bytes: []const u8) !void {
@@ -1792,7 +1862,8 @@ test "driver egress: WouldBlock retains the complete tagged datagram and retries
     try std.testing.expectEqual(Client.Egress.parked, try driver.sendOrPark(tagged));
     try std.testing.expect(driver.pending_egress != null);
     try std.testing.expectEqualStrings("tagged-egress-datagram", driver.pending_egress.?.dg);
-    try std.testing.expectEqual(driver.remote_udp, driver.pending_egress.?.dst);
+    try std.testing.expectEqual(driver.remote_udp, driver.pending_egress.?.dst.remote);
+    try std.testing.expectEqual(driver.local_udp, driver.pending_egress.?.dst.local);
     try std.testing.expect(driver.pending_egress.?.emitted_ping);
 
     // With the fixture cleared, the retry sends it exactly once; the
