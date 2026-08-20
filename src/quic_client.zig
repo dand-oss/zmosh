@@ -489,6 +489,7 @@ pub const ClientSession = struct {
             .awaiting_ack => |*a| &a.control_rx,
             .awaiting_first_resize => |*a| &a.control_rx,
             .active => |*a| &a.control_rx,
+            .detaching => |*d| &d.control_rx,
             .draining => |*d| &d.control_rx,
             else => null,
         };
@@ -1783,11 +1784,34 @@ test "driver classify: empty junk, short-form parks on 1-RTT keys, handshake par
     try std.testing.expectEqual(quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, 4242), driver.parked[0].arrival.remote);
     try std.testing.expect(driver.parked[0].gate == .one_rtt_keys);
 
-    // A long-form datagram whose protected-long peek fails (Retry or
-    // malformed) passes ONCE to the adapter — never parked, never an
-    // error out of the driver boundary.
-    const junk_long = [_]u8{0xFF} ** 32;
-    try std.testing.expectEqual(true, try driver.classifyAndFeed(src, 0, &junk_long));
+    // A Retry-shaped peek failure (UnsupportedPacketType) passes ONCE
+    // to the adapter for route-layer validation — never parked, never
+    // an error out of the driver boundary.
+    const retry_shaped = [_]u8{0xFF} ** 32;
+    const j_before = driver.junk_received;
+    try std.testing.expectEqual(true, try driver.classifyAndFeed(src, 0, &retry_shaped));
+    try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+    try std.testing.expectEqual(j_before, driver.junk_received);
+
+    // A genuinely malformed long header (version-1 Initial type whose
+    // declared length exceeds the datagram → InvalidPayloadLength) is
+    // counted and discarded at the boundary — never fed.
+    var malformed: [64]u8 = undefined;
+    @memset(&malformed, 0);
+    malformed[0] = 0xC0; // long header, Initial type
+    malformed[1] = 0x00;
+    malformed[2] = 0x00;
+    malformed[3] = 0x00;
+    malformed[4] = 0x01; // version 1
+    malformed[5] = 0x00; // DCID len 0
+    malformed[6] = 0x00; // SCID len 0
+    malformed[7] = 0x40; // varint length prefix: 2-byte form
+    malformed[8] = 0xFF;
+    malformed[9] = 0xFF; // 65535 bytes declared in a 64-byte datagram
+    const recv_before = driver.transport.counters.datagrams_received;
+    try std.testing.expectEqual(true, try driver.classifyAndFeed(src, 0, &malformed));
+    try std.testing.expectEqual(j_before + 1, driver.junk_received);
+    try std.testing.expectEqual(recv_before, driver.transport.counters.datagrams_received);
     try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
 
     // A long-form datagram peeking as a v1 INITIAL parses and feeds
@@ -1871,4 +1895,297 @@ test "driver egress: WouldBlock retains the complete tagged datagram and retries
     try std.testing.expectEqual(true, try driver.retryPendingEgress());
     try std.testing.expect(driver.pending_egress == null);
     try std.testing.expectEqual(true, try driver.retryPendingEgress());
+}
+
+// ---------------------------------------------------------------------------
+// r8.5 proofs: in-file live gateway peer (private machinery stays private)
+// ---------------------------------------------------------------------------
+
+const quic_gateway = @import("quic_gateway.zig");
+
+/// A minimal live peer: one QuicGateway on a bound socket and manual
+/// turns — enough to produce REAL authenticated datagrams for the
+/// driver tests below.
+const LivePeer = struct {
+    gw_sock: udp.UdpSocket,
+    gw: quic_gateway.QuicGateway,
+    gw_addr: lib_posix.Address,
+
+    fn init(alloc: std.mem.Allocator, io: std.Io, psk: *const [32]u8) !LivePeer {
+        const gw_sock = try udp.UdpSocket.bindEphemeral(lib_posix.AF.INET);
+        var token_secret: [32]u8 = undefined;
+        quic_gateway.deriveTokenSecret(&token_secret, psk);
+        var bound: lib_posix.Address = std.mem.zeroes(lib_posix.Address);
+        var bound_len: lib_posix.socklen_t = @sizeOf(lib_posix.Address);
+        try lib_posix.getsockname(gw_sock.getFd(), &bound.any, &bound_len);
+        const local = udp.sockaddrToUdpAddress(bound) orelse return error.UnsupportedAddressFamily;
+        var gw = try quic_gateway.QuicGateway.init(alloc, io, psk, &token_secret, local, 0);
+        // The Loop fixture anchors the bootstrap emission at NOW after
+        // construction; a zero anchor reads as long expired and the
+        // gateway refuses the handshake.
+        gw.bootstrap_emitted_ns = lib_posix.nowNs();
+        // The gateway's CONCRETE route address is the loopback source
+        // its datagrams actually carry — the wildcard getsockname form
+        // would read as a path change for every inbound packet.
+        const gw_addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, gw_sock.bound_port);
+        return .{ .gw_sock = gw_sock, .gw = gw, .gw_addr = gw_addr };
+    }
+
+    fn deinit(self: *LivePeer) void {
+        self.gw.deinit();
+        self.gw_sock.close();
+    }
+
+    fn round(self: *LivePeer, now: i64) !void {
+        var budget = quic_gateway.TurnBudget{};
+        _ = try self.gw.receive(&self.gw_sock, now, &budget);
+        _ = try self.gw.serviceDue(&self.gw_sock, now, &budget);
+        try self.gw.drainEgress(&self.gw_sock, now, &budget);
+    }
+};
+
+/// An allocator wrapper with a runtime kill switch: allocations fail
+/// with OutOfMemory only while armed, so construction completes
+/// normally and the failure point is chosen by the test.
+const ToggleAllocator = struct {
+    child: std.mem.Allocator,
+    armed: bool = false,
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ToggleAllocator = @ptrCast(@alignCast(ctx));
+        if (self.armed) return null;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ToggleAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ToggleAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ToggleAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *ToggleAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "driver live: gate-skip replay — synthetic short parks ahead, Handshake never blocked" {
+    const alloc = std.testing.allocator;
+    var psk: [32]u8 = undefined;
+    try std.testing.io.randomSecure(&psk);
+    var peer = try LivePeer.init(alloc, std.testing.io, &psk);
+    defer peer.deinit();
+    const now_base = lib_posix.nowNs();
+    var driver = try Client.connect(alloc, std.testing.io, &psk, peer.gw_addr, now_base);
+    defer driver.deinit();
+
+    var now: i64 = now_base;
+    var synth_parked = false;
+    var handshake_parked: usize = 0;
+
+    // Round until the gateway's flight contains a Handshake-space
+    // datagram AND the synthetic short-form entry sits parked AHEAD of
+    // it (1-RTT keys absent — nothing has been processed yet).
+    var attempts: usize = 0;
+    while (attempts < 24) : (attempts += 1) {
+        _ = try driver.pump(now);
+        try peer.round(now);
+        now += 1;
+        // Capture everything the gateway just sent to the DRIVER,
+        // unprocessed: drain the driver's own receive queue.
+        var buf: [quic_transport.max_udp_payload]u8 = undefined;
+        var captured: [8][]u8 = undefined;
+        var captured_len: [8]usize = undefined;
+        var n: usize = 0;
+        while (n < captured.len) {
+            const r = driver.sock.recvFrom(&buf) catch break;
+            const dg = try alloc.dupe(u8, buf[0..r.len]);
+            captured[n] = dg;
+            captured_len[n] = r.len;
+            n += 1;
+        }
+        defer for (captured[0..n]) |dg| alloc.free(dg);
+
+        // The synthetic short-form junk parks FIRST (one-RTT gate).
+        if (!synth_parked) {
+            const synth = [_]u8{0x40} ++ ([_]u8{0} ** 31);
+            try std.testing.expectEqual(false, try driver.classifyAndFeed(peer.gw_addr, now, &synth));
+            try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+            try std.testing.expect(driver.parked[0].gate == .one_rtt_keys);
+            synth_parked = true;
+        }
+        // Then the captured datagrams in arrival order: Retry and
+        // Initial packets feed directly; Handshake-space ones park.
+        for (captured[0..n], captured_len[0..n]) |dg, len| {
+            if (!try driver.classifyAndFeed(peer.gw_addr, now, dg[0..len])) handshake_parked += 1;
+        }
+        if (handshake_parked >= 1) break;
+        // A Retry-only first flight: the loop head's next pump emits
+        // the post-Retry Initial (the driver's socket is drained, so
+        // that pump receives nothing) and the next capture sees the
+        // real flight.
+    }
+    try std.testing.expect(synth_parked);
+    try std.testing.expect(handshake_parked >= 1);
+
+    // The gate-skip: the Handshake entry must process NOW, despite
+    // the synthetic short sitting parked AHEAD of it. (The scan
+    // restarts once the Handshake feed opens one-RTT keys, so the
+    // synthetic may legitimately replay within the SAME pump.)
+    const junk_before = driver.junk_received;
+    _ = try driver.pump(now);
+    now += 1;
+    try std.testing.expect(driver.transport.conn.hasHandshakeProtectionKeys());
+
+    // Pump until both gates advance: every entry is fed exactly once —
+    // the synthetic short is junked EXACTLY once (a second feed would
+    // move the counter twice) and the queue empties.
+    attempts = 0;
+    while (attempts < 64 and driver.parked_len != 0) : (attempts += 1) {
+        _ = try driver.pump(now);
+        try peer.round(now);
+        now += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), driver.parked_len);
+    try std.testing.expectEqual(junk_before + 1, driver.junk_received);
+
+    // The handshake completes through normal rounds afterwards.
+    var confirmed = false;
+    attempts = 0;
+    while (attempts < 64 and !confirmed) : (attempts += 1) {
+        _ = try driver.pump(now);
+        try peer.round(now);
+        now += 1;
+        confirmed = driver.handshakeConfirmed();
+    }
+    try std.testing.expect(confirmed);
+}
+
+test "driver live: handshake-space parked entries are pruned after the space is discarded" {
+    const alloc = std.testing.allocator;
+    var psk: [32]u8 = undefined;
+    try std.testing.io.randomSecure(&psk);
+    var peer = try LivePeer.init(alloc, std.testing.io, &psk);
+    defer peer.deinit();
+    const base = lib_posix.nowNs();
+    var driver = try Client.connect(alloc, std.testing.io, &psk, peer.gw_addr, base);
+    defer driver.deinit();
+
+    var attempts: usize = 0;
+    while (attempts < 80 and !driver.handshakeConfirmed()) : (attempts += 1) {
+        _ = try driver.pump(base + @as(i64, @intCast(attempts)));
+        try peer.round(base + @as(i64, @intCast(attempts)));
+    }
+    try std.testing.expect(driver.handshakeConfirmed());
+    // Post-confirmation the client discards the Handshake space.
+    try std.testing.expect(driver.transport.connection().packetNumberSpaceDiscarded(.handshake));
+
+    // Obsolete handshake-gated entries are dropped, never fed.
+    const arrival = quicz.endpoint.UdpTuple{ .local = driver.local_udp, .remote = driver.remote_udp };
+    driver.parkDatagram(4, arrival, .handshake_keys, "junk");
+    driver.parkDatagram(4, arrival, .handshake_keys, "junk");
+    try std.testing.expectEqual(@as(usize, 2), driver.parked_len);
+    const junk_before = driver.junk_received;
+    const before = driver.transport.counters.datagrams_received;
+    var budget: usize = 0;
+    try driver.replayParked(base + 10_000, &budget);
+    try std.testing.expectEqual(@as(usize, 0), driver.parked_len);
+    try std.testing.expectEqual(junk_before, driver.junk_received);
+    try std.testing.expectEqual(before, driver.transport.counters.datagrams_received);
+}
+
+test "driver live: feed allocation failure propagates OutOfMemory through public pump" {
+    const alloc = std.testing.allocator;
+    var psk: [32]u8 = undefined;
+    try std.testing.io.randomSecure(&psk);
+    var peer = try LivePeer.init(alloc, std.testing.io, &psk);
+    defer peer.deinit();
+
+    // The driver's OWN allocations run through the toggle: normal
+    // until armed, then every allocation fails.
+    var toggle = ToggleAllocator{ .child = std.testing.allocator };
+    const base = lib_posix.nowNs();
+    var driver = try Client.connect(toggle.allocator(), std.testing.io, &psk, peer.gw_addr, base);
+    defer driver.deinit();
+
+    var attempts: usize = 0;
+    while (attempts < 80 and !driver.handshakeConfirmed()) : (attempts += 1) {
+        _ = try driver.pump(base + @as(i64, @intCast(attempts)));
+        try peer.round(base + @as(i64, @intCast(attempts)));
+    }
+    try std.testing.expect(driver.handshakeConfirmed());
+
+    // Quiet the driver: drain pending egress and inbound state.
+    attempts = 0;
+    while (attempts < 8) : (attempts += 1) {
+        _ = try driver.pump(base + 1_000 + @as(i64, @intCast(attempts)));
+        try peer.round(base + 1_000 + @as(i64, @intCast(attempts)));
+    }
+
+    // One KNOWN authenticated datagram: a keepalive PING emitted by
+    // the established gateway straight onto the driver's socket.
+    const t = peer.gw.establishedTransport() orelse return error.NotEstablished;
+    try t.connection().sendPing();
+    var budget = quic_gateway.TurnBudget{};
+    try peer.gw.drainEgress(&peer.gw_sock, base + 2_000, &budget);
+
+    const before = driver.transport.counters.datagrams_received;
+    toggle.armed = true;
+    defer toggle.armed = false;
+    try std.testing.expectError(error.OutOfMemory, driver.pump(base + 2_001));
+    // The counter moved by exactly one: the datagram was RECEIVED and
+    // the failure happened inside feed's protected-packet processing,
+    // not in some unrelated pump allocation.
+    try std.testing.expectEqual(before + 1, driver.transport.counters.datagrams_received);
+}
+
+test "driver egress: permanent send failure during retry latches ONE event with a single free" {
+    const alloc = std.testing.allocator;
+    var psk: [32]u8 = undefined;
+    try std.testing.io.randomSecure(&psk);
+    var hole: udp.UdpSocket = undefined;
+    var driver = try deadDriver(alloc, &psk, &hole);
+    defer hole.close();
+    defer driver.deinit();
+
+    // Park one tagged datagram through the WouldBlock fixture.
+    const body = try alloc.dupe(u8, "retry-ownership");
+    const tagged = quic_transport.Transport.TaggedDatagram{
+        .dg = body,
+        .dst = .{ .local = driver.local_udp, .remote = driver.remote_udp },
+        .emitted_ping = false,
+    };
+    driver.egress_block_n = 1;
+    try std.testing.expectEqual(Client.Egress.parked, try driver.sendOrPark(tagged));
+    try std.testing.expect(driver.pending_egress != null);
+
+    // The retry fails permanently through the same catch/latch branch
+    // a kernel error takes: exactly one internal_error event (the
+    // testing allocator fails the test on any double free), the slot
+    // is empty, and later pumps never repeat.
+    driver.egress_fail_n = 1;
+    const ev = try driver.pump(1_100);
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .err => |e| {
+            try std.testing.expectEqual(quic_wire.ErrCode.internal_error.code(), e.code);
+            try std.testing.expect(e.terminal);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(driver.pending_egress == null);
+    try std.testing.expect(driver.io_failed);
+    try std.testing.expect(driver.driverState() == .terminal_delivered);
+    try std.testing.expect((try driver.pump(1_200)) == null);
+    try std.testing.expect((try driver.pump(1_300)) == null);
 }

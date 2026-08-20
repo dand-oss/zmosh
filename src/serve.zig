@@ -4510,3 +4510,191 @@ test "client driver r8: exact-capacity output with FIN releases the terminal wit
     }
     try testing.expectEqual(@as(usize, 64 * 1024), got);
 }
+
+test "zmq1 r8.5: DETACH matrix — typed .detaching, writes rejected, preface rejection, clean completion" {
+    const alloc = testing.allocator;
+    {
+        var bootstrap: [32]u8 = undefined;
+        var psk: [32]u8 = undefined;
+        try testing.io.randomSecure(&bootstrap);
+        quic_transport.derivePsk(&psk, &bootstrap);
+        defer std.crypto.secureZero(u8, &bootstrap);
+        defer std.crypto.secureZero(u8, &psk);
+
+        var z = try zmq1Setup(alloc, &psk);
+        defer z.loop.deinit();
+        defer z.client.deinit();
+        var dr = try quic_test.DaemonReader.init(alloc);
+        defer dr.deinit();
+        const base: i64 = lib_posix.nowNs();
+        try zmq1ToActive(&z, &dr, base);
+
+        // A staged input preface REJECTS the DETACH: WouldBlock, no
+        // queue, no transition (option-1 semantics).
+        {
+            const conn = z.client.transport.connection();
+            var low2 = quicz.transport_parameters.TransportParameters{};
+            low2.initial_source_connection_id = conn.peerInitialSourceConnectionId();
+            low2.original_destination_connection_id = conn.originalDestinationConnectionId();
+            low2.retry_source_connection_id = conn.retrySourceConnectionId();
+            low2.initial_max_data = 1024 * 1024;
+            low2.initial_max_stream_data_bidi_remote = 64 * 1024;
+            low2.initial_max_stream_data_bidi_local = 64 * 1024;
+            low2.initial_max_stream_data_uni = 0;
+            low2.initial_max_streams_bidi = 100;
+            low2.initial_max_streams_uni = 100;
+            try conn.applyPeerTransportParameters(low2);
+            try testing.expectError(error.WouldBlock, z.client.sendInput("pending-preface"));
+            try testing.expectError(error.WouldBlock, z.client.sendDetach());
+            try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+            // Flush the preface (the session-level harness retries
+            // explicitly), restore, and the DETACH now proceeds.
+            var high = quicz.transport_parameters.TransportParameters{};
+            high.initial_source_connection_id = conn.peerInitialSourceConnectionId();
+            high.original_destination_connection_id = conn.originalDestinationConnectionId();
+            high.retry_source_connection_id = conn.retrySourceConnectionId();
+            high.initial_max_data = 1024 * 1024;
+            high.initial_max_stream_data_bidi_remote = 64 * 1024;
+            high.initial_max_stream_data_bidi_local = 64 * 1024;
+            high.initial_max_stream_data_uni = 64 * 1024;
+            high.initial_max_streams_bidi = 100;
+            high.initial_max_streams_uni = 100;
+            try conn.applyPeerTransportParameters(high);
+            for (0..4) |i| {
+                try z.client.retryPendingSends();
+                _ = try quic_test.sessionRound(&z.loop, &z.client, base + 50 + @as(i64, @intCast(i)));
+            }
+            while (try dr.next(z.loop.daemon_fd)) |_| {}
+        }
+
+        // The preface flushed: the DETACH now proceeds — sent whole,
+        // the typed .detaching state, every application write rejected.
+        try z.client.sendDetach();
+        try testing.expectEqual(quic_client.StateTag.detaching, z.client.stateTag());
+        try testing.expectError(error.NotActive, z.client.sendResize(1, 2, 0, 0));
+        try testing.expectError(error.NotActive, z.client.sendInput("x"));
+        try testing.expectError(error.NotActive, z.client.sendDetach());
+        try testing.expectError(error.NotActive, z.client.sendSnapshotRequest());
+
+        // The flushed DETACH completes cleanly: exactly one .Detach at
+        // the daemon (the retry never duplicated bytes), code-0 close.
+        for (0..12) |i| {
+            try z.client.retryPendingSends();
+            _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+        }
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoDetach;
+        try testing.expectEqual(ipc.Tag.Detach, f.tag);
+        var extra = false;
+        while (try dr.next(z.loop.daemon_fd)) |f2| {
+            if (f2.tag == ipc.Tag.Detach) extra = true;
+        }
+        try testing.expect(!extra);
+        const sess = try z.session();
+        try testing.expect(sess.closed);
+        try testing.expectEqual(quic_wire.ErrCode.none.code(), sess.end_code.code());
+    }
+}
+
+test "zmq1 r8.5: parked DETACH survives the transition; FIN before flush is a violation" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+
+    // Raw gateway rounds ONLY: attaching the gateway session would
+    // make the server-side protocol machinery answer the client's
+    // frames; this arm needs the transport alone.
+    const rawRound = struct {
+        fn run(l: *quic_test.Loop, now: i64) !void {
+            var budget = quic_gateway.TurnBudget{};
+            _ = try l.gw.quic.receive(&l.gw.udp_sock, now, &budget);
+            _ = try l.gw.quic.serviceDue(&l.gw.udp_sock, now, &budget);
+            try l.gw.quic.drainEgress(&l.gw.udp_sock, now, &budget);
+        }
+    }.run;
+
+    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    defer client.deinit();
+    const cconn = client.transport.connection();
+    _ = try cconn.openStream();
+    var pre: [quic_wire.preface_len]u8 = undefined;
+    quic_wire.writePreface(&pre, .control);
+    _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+
+    var ack = quic_wire.Hello.serverV1(quic_wire.mode_attach);
+    var ack_payload: [quic_wire.hello_payload_len]u8 = undefined;
+    ack.encode(&ack_payload);
+    var ack_hdr: [quic_wire.control_header_len]u8 = undefined;
+    quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len, 0);
+    var ack_pre: [quic_wire.preface_len]u8 = undefined;
+    quic_wire.writePreface(&ack_pre, .control);
+    const base: i64 = lib_posix.nowNs();
+    try loop.clientPump(base);
+    _ = try loop.gw.runOnce(0);
+    try craftServerControl(&loop, &.{ &ack_pre, &ack_hdr, &ack_payload });
+    var got_ack = false;
+    for (0..10) |i| {
+        try loop.clientPump(base + @as(i64, @intCast(i)));
+        try rawRound(&loop, base + @as(i64, @intCast(i)));
+        try loop.clientDrain(base + @as(i64, @intCast(i)));
+        if (try client.pollControl()) |e| {
+            if (e == .hello_ack) {
+                got_ack = true;
+                break;
+            }
+        }
+    }
+    try testing.expect(got_ack);
+    // The first RESIZE sends immediately (fresh credit) → active.
+    try client.sendResize(24, 80, 0, 0);
+    try testing.expectEqual(quic_client.StateTag.active, client.stateTag());
+
+    // The DETACH is accepted and enters .detaching; the live peer's
+    // stream credit auto-grows past any injectable transport
+    // parameter, so the FLOW-CONTROL-PARKED copy is staged
+    // deterministically — exactly the ControlTx state a
+    // FlowControlBlocked send leaves.
+    try client.sendDetach();
+    try testing.expectEqual(quic_client.StateTag.detaching, client.stateTag());
+    var dframe: [quic_wire.control_header_len]u8 = undefined;
+    quic_wire.writeControlHeader(&dframe, .detach, 0, 0);
+    client.state.detaching.control_tx = .{ .pending = .{
+        .kind = .detach,
+        .len = dframe.len,
+        .bytes = undefined,
+    } };
+    @memcpy(client.state.detaching.control_tx.pending.bytes[0..dframe.len], &dframe);
+    // Every application write still rejects.
+    try testing.expectError(error.NotActive, client.sendResize(1, 2, 0, 0));
+    try testing.expectError(error.NotActive, client.sendInput("x"));
+    try testing.expectError(error.NotActive, client.sendSnapshotRequest());
+
+    // A bare FIN while the DETACH is still parked (it has not reached
+    // quicz) is a protocol violation.
+    const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+    try t.connection().sendOnStream(quic_client.control_stream_id, &.{}, true);
+    var viol: ?quic_client.ControlEvent = null;
+    for (0..10) |i| {
+        try loop.clientPump(base + 100 + @as(i64, @intCast(i)));
+        try rawRound(&loop, base + 100 + @as(i64, @intCast(i)));
+        try loop.clientDrain(base + 100 + @as(i64, @intCast(i)));
+        const ev = try client.pollControl();
+        if (ev) |e| {
+            viol = e;
+            break;
+        }
+    }
+    try testing.expect(viol != null);
+    switch (viol.?) {
+        .err => |e| try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(quic_client.StateTag.failed, client.stateTag());
+}
