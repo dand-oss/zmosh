@@ -56,6 +56,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .@"emit-lib-vt" = true,
+        // Q4: the snapshot codec (ghostty_vt.snapshot encode/Decoder) is
+        // feature-gated; enable it explicitly so a default change upstream
+        // can never silently drop it.
+        .@"vt-features" = "+snapshot",
         // Not redundant: in lib-vt mode emit-xcframework defaults to "xcodebuild
         // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
         // configure time and breaks builds without full Xcode.
@@ -104,6 +108,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .@"emit-lib-vt" = true,
+            .@"vt-features" = "+snapshot",
             .@"emit-xcframework" = false,
             .@"emit-macos-app" = false,
         });
@@ -166,6 +171,7 @@ pub fn build(b: *std.Build) void {
                 .target = resolved,
                 .optimize = .ReleaseSafe,
                 .@"emit-lib-vt" = true,
+                .@"vt-features" = "+snapshot",
                 .@"emit-xcframework" = false,
                 .@"emit-macos-app" = false,
             })) |release_dep| {

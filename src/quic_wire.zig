@@ -19,7 +19,9 @@ pub const max_control_payload = 64 * 1024;
 pub const error_reason_max = 256;
 pub const output_header_len = 16; // preface + epoch u64 BE
 
-pub const adapter_version: u32 = 1;
+/// Bumped 1 → 2 for Q4 (Ghostty snapshot pin advance + snapshot stream);
+/// mixed-version peers fail the HELLO fingerprint check.
+pub const adapter_version: u32 = 2;
 
 pub const capability_binary_snapshot: u32 = 0x01;
 pub const capability_resettable_output: u32 = 0x02;
@@ -963,4 +965,21 @@ test "snapshot abi id: golden construction and comptime equality" {
     );
     try testing.expectEqualSlices(u8, &runtime, &snapshot_abi_id);
     try testing.expectEqual(@as(usize, 40), build_options.ghostty_commit.len);
+}
+
+test "snapshot abi id: frozen Q4 golden literal" {
+    // The frozen Q4 fingerprint of the pinned build inputs (Ghostty
+    // commit 6361b2eac73e8243a7042f517ea95ab87165f105, package hash
+    // ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD,
+    // adapter_version 2). Deliberately NOT derived through
+    // computeSnapshotAbiId: any input or construction drift must fail
+    // here against the frozen bytes.
+    const frozen_q4 = [_]u8{
+        0x76, 0x98, 0x15, 0x04, 0x09, 0xab, 0x36, 0x81,
+        0x79, 0x73, 0x55, 0xe5, 0xba, 0x81, 0x98, 0x98,
+        0xa4, 0x22, 0x28, 0x3b, 0x3f, 0x3c, 0xe8, 0xee,
+        0xe7, 0xcb, 0x15, 0xf6, 0xfb, 0x18, 0xd9, 0xad,
+    };
+    try testing.expectEqualSlices(u8, &frozen_q4, &snapshot_abi_id);
+    try testing.expectEqual(@as(u32, 2), adapter_version);
 }
