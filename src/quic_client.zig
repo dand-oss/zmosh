@@ -1375,11 +1375,13 @@ pub const Client = struct {
     /// discard-and-count. Returns false when the datagram was parked.
     /// The one kernel-receive path (the `recv_fail_n` fixture routes
     /// through the same permanent-error branch a real kernel error
-    /// takes).
+    /// takes). `recv_fail_n` is an Nth-call countdown: 1 fails the
+    /// next call, 2 permits one call then fails the next — the
+    /// counter counts sockReceive calls themselves.
     fn sockReceive(self: *Client, buf: []u8) !struct { len: usize, addr: lib_posix.Address } {
         if (self.recv_fail_n > 0) {
             self.recv_fail_n -= 1;
-            return error.SocketFailed;
+            if (self.recv_fail_n == 0) return error.SocketFailed;
         }
         const r = try self.sock.recvFrom(buf);
         return .{ .len = r.len, .addr = r.addr };
@@ -1521,7 +1523,8 @@ pub const Client = struct {
     /// THE stager: copies a terminal event's metadata and reason into
     /// the stable driver storage and assigns `.event_ready`. Accepts
     /// only terminal SESSION_END/ERROR and never returns the event —
-    /// deliverTerminal() is the sole event-return path.
+    /// deliverTerminal() is the sole terminal-event return path;
+    /// nonterminal events still return normally through the pump.
     fn stageTerminal(self: *Client, e: ControlEvent) void {
         switch (e) {
             .session_end => {
@@ -1550,12 +1553,14 @@ pub const Client = struct {
 
     /// The ONE permanent-failure latch — idempotent and single-owner:
     /// disables I/O and frees the pending egress exactly once. The
-    /// terminal it stages follows the frozen precedence: an existing
-    /// stored session/protocol failure wins; an already-deferred FINAL
-    /// ERROR wins over the socket; otherwise the socket failure itself
-    /// creates internal_error (a clean deferred SESSION_END can no
-    /// longer prove output completeness); a failed session with no
-    /// stored event is an invariant failure, also internal_error.
+    /// terminal it stages follows the frozen precedence: an owned
+    /// `.event_ready` terminal is never replaced; a stored
+    /// session/protocol failure wins; a driver-owned deferred FINAL
+    /// ERROR (whose staging consumed the session slot) is promoted
+    /// unchanged; a failed session with no representation is an
+    /// invariant failure; otherwise the socket failure itself creates
+    /// internal_error (a clean deferred SESSION_END can no longer
+    /// prove output completeness).
     fn latchSocketFailure(self: *Client, context: []const u8) void {
         if (self.io_failed) return;
         self.io_failed = true;
@@ -1566,22 +1571,36 @@ pub const Client = struct {
         // Post-delivery socket errors only disable I/O: no second,
         // undeliverable event is ever created.
         if (self.dstate == .terminal_delivered or self.dstate == .closed) return;
-        // 1. An existing session failure wins with its own code+reason.
+        // 1. An already-owned staged terminal is preserved as-is —
+        //    checked before anything is polled or replaced.
+        if (self.dstate == .event_ready) return;
+        // 2. A session failure still holding its event wins with its
+        //    own code+reason.
         if (self.session.stateTag() == .failed) {
             if (self.session.pollControl() catch null) |e| {
                 self.stageTerminal(e);
                 return;
             }
-            // 4. Failed session, no stored event: invariant failure.
+        }
+        // 3. The driver already owns the deferred FINAL ERROR —
+        //    deferTerminal consumed the slot when it copied the
+        //    failure, so the empty poll above is expected: promote
+        //    the deferred metadata unchanged.
+        if (self.dstate == .draining and self.dstate.draining.kind == .err) {
+            // Copy before the write: assigning `.{ .event_ready =
+            // self.dstate.draining }` directly would stamp the new tag
+            // into the result location before the payload read.
+            const meta = self.dstate.draining;
+            self.dstate = .{ .event_ready = meta };
+            return;
+        }
+        // 4. A failed session with neither representation: invariant
+        //    failure.
+        if (self.session.stateTag() == .failed) {
             self.stageInternalError("failed session missing terminal event");
             return;
         }
-        // 2. An already-deferred FINAL ERROR wins over the socket.
-        if (self.dstate == .draining and self.dstate.draining.kind == .err) {
-            self.dstate = .{ .event_ready = self.dstate.draining };
-            return;
-        }
-        // 3. Clean SESSION_END drain or no prior failure: the socket
+        // 5. Clean SESSION_END drain or no prior failure: the socket
         //    failure itself creates the terminal.
         self.stageInternalError(context);
     }

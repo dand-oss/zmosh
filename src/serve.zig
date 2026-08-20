@@ -4728,8 +4728,17 @@ test "zmq1 r8.6 fixture B: parked DETACH plus server FIN before flush is a proto
 
 test "client driver r8.6: terminal coherence — drain failure, post-failure socket, clean-drain socket" {
     const alloc = testing.allocator;
-    const Phase = enum { drain_failure, post_failure_socket, clean_drain_socket };
-    for ([_]Phase{ .drain_failure, .post_failure_socket, .clean_drain_socket }) |phase| {
+    // POLL.IN on the driver's socket, zero timeout — the fixture's
+    // readability oracle (never used to discard anything).
+    const sockReadable = struct {
+        fn check(driver: *quic_client.Client) bool {
+            var pfd = [_]lib_posix.pollfd{.{ .fd = driver.sock.fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+            const n = lib_posix.poll(&pfd, 0) catch return false;
+            return n == 1 and (pfd[0].revents & lib_posix.POLL.IN) != 0;
+        }
+    }.check;
+    const Phase = enum { drain_failure, combined_failure_socket, post_failure_socket, clean_drain_socket };
+    for ([_]Phase{ .drain_failure, .combined_failure_socket, .post_failure_socket, .clean_drain_socket }) |phase| {
         var bootstrap: [32]u8 = undefined;
         var psk: [32]u8 = undefined;
         try testing.io.randomSecure(&bootstrap);
@@ -4790,6 +4799,53 @@ test "client driver r8.6: terminal coherence — drain failure, post-failure soc
                     },
                     else => return error.TestUnexpectedResult,
                 }
+                try testing.expect((try driver.pump(lib_posix.nowNs())) == null);
+            },
+            .combined_failure_socket => {
+                // Same-pump combination: the protocol failure is
+                // deferred (deferTerminal consumed its event into
+                // .draining), then the NEXT receive fails inside the
+                // SAME pump. The deferred FINAL ERROR must be
+                // promoted unchanged — not replaced by the
+                // missing-event invariant.
+                //
+                // Quiesce stale traffic through normal pumps until
+                // the socket is provably empty (authenticated
+                // datagrams are never raw-discarded), and verify
+                // quiet BEFORE queuing the crafted frame.
+                var quiet = false;
+                for (0..16) |i| {
+                    _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+                    quiet = !sockReadable(&driver);
+                    if (quiet) break;
+                }
+                try testing.expect(quiet);
+                // One combined 16-byte illegal RESIZE, one stream
+                // write.
+                var bad: [quic_wire.control_header_len + 8]u8 = undefined;
+                quic_wire.writeControlHeader(bad[0..quic_wire.control_header_len], .resize, 8, 0);
+                quic_wire.writeResizePayload(bad[quic_wire.control_header_len..], 1, 2, 3, 4);
+                try t.connection().sendOnStream(quic_client.control_stream_id, &bad, false);
+                // Gateway egress only — the client is NOT pumped —
+                // until its socket is observably readable.
+                var readable = false;
+                for (0..16) |_| {
+                    _ = try loop.gw.runOnce(0);
+                    readable = sockReadable(&driver);
+                    if (readable) break;
+                }
+                try testing.expect(readable);
+                driver.recv_fail_n = 2;
+                const ev = try driver.pump(lib_posix.nowNs());
+                try testing.expect(ev != null);
+                switch (ev.?) {
+                    .err => |e| {
+                        try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.code);
+                        try testing.expectEqualStrings("frame after terminal marker", e.reason);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+                try testing.expect(driver.io_failed);
                 try testing.expect((try driver.pump(lib_posix.nowNs())) == null);
             },
             .post_failure_socket => {
