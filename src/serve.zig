@@ -269,8 +269,11 @@ pub const Gateway = struct {
         const s = if (self.session) |*sp| sp else return true;
         if (s.closedOrEnding()) return false;
         const bytes = self.unix_read_buf.buf.items[self.unix_read_buf.head..];
+        // Header-aware: once an IPC header (8 bytes) is buffered, the
+        // DECLARED frame's acceptability gates further reads — an
+        // unacceptable frame's payload never enters the buffer. Only
+        // an unreadable header (fewer than 8 bytes) still reads.
         const total = ipc.expectedLength(bytes) orelse return true;
-        if (bytes.len < total) return true;
         const hdr = std.mem.bytesToValue(ipc.Header, bytes[0..@sizeOf(ipc.Header)]);
         return s.canConsumeDaemonFrame(hdr.tag, total - @sizeOf(ipc.Header));
     }
@@ -1699,7 +1702,7 @@ fn daemonSendRaw(fd: i32, tag: ipc.Tag, payload: []const u8) !void {
     try ipc.send(fd, tag, payload);
 }
 
-test "zmq1 q4: populated stream-7 transaction with exact header, body, FIN, and post-End output" {
+test "zmq1 q4: populated stream-7 transaction with exact header, body, FIN, and post-FIN/pre-INSTALLED output" {
     const alloc = testing.allocator;
     var bootstrap: [32]u8 = undefined;
     var psk: [32]u8 = undefined;
@@ -1778,23 +1781,49 @@ test "zmq1 q4: pre-cut output is discarded in every pre-Begin phase" {
     var dr = try quic_test.DaemonReader.init(alloc);
     defer dr.deinit();
     const base: i64 = lib_posix.nowNs();
-    try zmq1HelloAck(&z, base);
+
+    // Output while STILL awaiting_hello (the freshly initialized
+    // session, phase untouched): discarded, counted, never relayed.
+    try testing.expect(sess.phase == .awaiting_hello);
+    try ipc.send(z.loop.daemon_fd, .Output, "no-hello-yet");
+    // The client session sends its HELLO eagerly, so the ACK may
+    // surface inside these very rounds — capture, never discard.
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..4) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + 10 + @as(i64, @intCast(i)))) |e| {
+            ack = e;
+            break;
+        }
+        ack = try z.client.pollControl();
+        if (ack != null) break;
+    }
+    try testing.expectEqual(@as(usize, "no-hello-yet".len), sess.counters.discarded_pre_cut_output);
+    try testing.expectEqual(@as(usize, 0), sess.counters.daemon_output_frames);
+    for (0..8) |i| {
+        if (ack != null) break;
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + 1000 + @as(i64, @intCast(i)))) |e| {
+            ack = e;
+            break;
+        }
+        ack = try z.client.pollControl();
+    }
+    try testing.expect(ack != null and ack.? == .hello_ack);
 
     // Output while awaiting_resize: discarded, counted, never relayed.
     try ipc.send(z.loop.daemon_fd, .Output, "too-early");
     for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 50 + @as(i64, @intCast(i)));
-    try testing.expectEqual(@as(usize, "too-early".len), sess.counters.discarded_pre_cut_output);
+    try testing.expectEqual(@as(usize, "no-hello-yet".len + "too-early".len), sess.counters.discarded_pre_cut_output);
     try testing.expectEqual(@as(usize, 0), sess.counters.daemon_output_frames);
     var obuf: [64]u8 = undefined;
     try testing.expect((try z.client.pollOutput(&obuf, null)) == null);
 
     // And again in awaiting_snapshot_begin, before Begin.
     try z.client.sendResize(24, 80, 0, 0);
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 1100 + @as(i64, @intCast(i)));
     _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
     try ipc.send(z.loop.daemon_fd, .Output, "pre-begin");
-    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
-    try testing.expectEqual(@as(usize, "too-early".len + "pre-begin".len), sess.counters.discarded_pre_cut_output);
+    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 1200 + @as(i64, @intCast(i)));
+    try testing.expectEqual(@as(usize, "no-hello-yet".len + "too-early".len + "pre-begin".len), sess.counters.discarded_pre_cut_output);
     try testing.expectEqual(@as(usize, 0), sess.counters.daemon_output_frames);
     try testing.expect(!sess.closedOrEnding());
 }
@@ -2180,10 +2209,15 @@ test "zmq1 q4: snapshot credit exhaustion parks one unit, buffers the next, reco
     try testing.expect(sess.pending_snapshot.items.len > 0);
     try testing.expect(!sess.snapshot_end_validated);
     {
+        // The buffered head is the parked chunk's own remainder —
+        // possibly PARTIAL: the header-aware gate stops reading an
+        // unacceptable frame's payload mid-frame.
         const rb = z.loop.gw.unix_read_buf;
         const bytes = rb.buf.items[rb.head..];
         const total = ipc.expectedLength(bytes) orelse return error.NoBufferedFrame;
-        try testing.expect(bytes.len >= total); // a complete chunk, untouched
+        const hdr = std.mem.bytesToValue(ipc.Header, bytes[0..@sizeOf(ipc.Header)]);
+        try testing.expectEqual(ipc.Tag.SnapshotChunk, hdr.tag);
+        try testing.expect(bytes.len <= total);
     }
     try testing.expect(!z.loop.gw.daemonReadEligible());
     try testing.expect(!sess.snapshot_fin_sent);
@@ -2321,6 +2355,268 @@ test "zmq1 q4: negotiated snapshot limit from HELLO is enforced" {
     try testing.expect(sess.closedOrEnding());
     try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), sess.end_code.code());
     try testing.expect(!sess.snapshot_fin_sent);
+}
+
+test "zmq1 q4: post-End output relays while the snapshot FIN is still pending" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+    try zmq1ToInitSnapshot(&z, &dr, base);
+
+    // ONE 8 KiB chunk and NO client stream-7 reads: the ~2 KiB window
+    // leaves most of it parked, so End validates with the FIN unsent.
+    try daemonSendRaw(z.loop.daemon_fd, .SnapshotBegin, &.{1});
+    var body: [8 * 1024]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @intCast((i * 13 + 5) % 251);
+    try daemonSendRaw(z.loop.daemon_fd, .SnapshotChunk, &body);
+    var endp: [8]u8 = undefined;
+    std.mem.writeInt(u64, &endp, body.len, .big);
+    try daemonSendRaw(z.loop.daemon_fd, .SnapshotEnd, &endp);
+    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+
+    // BEFORE any client read: End validated, FIN pending, and the
+    // post-cut Output must be CONSUMED from IPC (counted), not
+    // terminal — this is the race the stage-4 interleave missed.
+    try testing.expect(sess.snapshot_end_validated);
+    try testing.expect(!sess.snapshot_fin_sent);
+    try testing.expect(sess.pending_snapshot.items.len > 0);
+    try ipc.send(z.loop.daemon_fd, .Output, "post-end-pre-fin");
+    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+    try testing.expect(!sess.closedOrEnding());
+    try testing.expectEqual(@as(usize, 1), sess.counters.daemon_output_frames);
+
+    // Drain: snapshot bytes, the FIN, and the Output all arrive
+    // losslessly, in that order of release.
+    var drain: std.ArrayList(u8) = .empty;
+    defer drain.deinit(alloc);
+    var drain_rx: quic_test.ClientSnapshotRx = .{};
+    var observed: ?quic_wire.SnapshotHeader = null;
+    var got: []const u8 = "";
+    var obuf: [64]u8 = undefined;
+    for (0..80) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+        observed = try quic_test.clientObserveSnapshot(z.client.transport, alloc, &drain_rx, &drain);
+        if (got.len == 0) {
+            if (try z.client.pollOutput(&obuf, null)) |n| got = try alloc.dupe(u8, obuf[0..n]);
+        }
+        if (observed != null and got.len > 0) break;
+    }
+    try testing.expect(observed != null);
+    try testing.expectEqualSlices(u8, &body, drain.items);
+    try testing.expect(sess.snapshot_fin_sent);
+    try testing.expectEqualStrings("post-end-pre-fin", got);
+    alloc.free(got);
+    try quic_test.sendSnapshotInstalledOn(z.client.transport);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 500 + @as(i64, @intCast(i)));
+    try testing.expect(sess.phase == .active);
+}
+
+test "zmq1 q4: malformed chunks fail immediately behind a parked legal unit" {
+    const alloc = testing.allocator;
+    // Each kind runs on its own fresh pair: any one of them ends the
+    // session, and the limit kind needs its own negotiated HELLO.
+    const Kind = enum { zero_len, oversize, limit_overflow };
+    const cases = [_]Kind{ .zero_len, .oversize, .limit_overflow };
+    for (cases) |kind| {
+        var bootstrap: [32]u8 = undefined;
+        var psk: [32]u8 = undefined;
+        try testing.io.randomSecure(&bootstrap);
+        quic_transport.derivePsk(&psk, &bootstrap);
+        defer std.crypto.secureZero(u8, &bootstrap);
+        defer std.crypto.secureZero(u8, &psk);
+
+        if (kind == .limit_overflow) {
+            // A negotiated 4096-byte limit: the parked legal chunk must
+            // fit under it, the violating chunk must not.
+            var loop = try quic_test.Loop.init(alloc, &psk, false);
+            defer loop.deinit();
+            try quic_test.driveHandshake(&loop);
+            _ = try loop.gw.runOnce(0);
+            const sess = if (loop.gw.session) |*x| x else return error.NoSession;
+            var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+            defer client.deinit();
+            const lbase: i64 = lib_posix.nowNs();
+            {
+                const cconn = client.transport.connection();
+                _ = try cconn.openStream();
+                var pre: [quic_wire.preface_len]u8 = undefined;
+                quic_wire.writePreface(&pre, .control);
+                _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+                var hello = quic_wire.Hello.serverV1(quic_wire.mode_attach);
+                hello.snapshot_limit = 4096;
+                var payload: [quic_wire.hello_payload_len]u8 = undefined;
+                hello.encode(&payload);
+                var hdr: [quic_wire.control_header_len]u8 = undefined;
+                quic_wire.writeControlHeader(&hdr, .hello, payload.len, 0);
+                _ = try cconn.sendOnStream(quic_client.control_stream_id, &hdr, false);
+                _ = try cconn.sendOnStream(quic_client.control_stream_id, &payload, false);
+            }
+            for (0..8) |i| {
+                _ = try quic_test.sessionRound(&loop, &client, lbase + @as(i64, @intCast(i)));
+                if ((try client.pollControl()) != null) break;
+            }
+            try testing.expectEqual(@as(u64, 4096), sess.snapshot_limit);
+            try client.sendResize(24, 80, 0, 0);
+            for (0..8) |i| _ = try quic_test.sessionRound(&loop, &client, lbase + 100 + @as(i64, @intCast(i)));
+
+            // Park a legal 2 KiB chunk (under the limit), no reads.
+            try daemonSendRaw(loop.daemon_fd, .SnapshotBegin, &.{1});
+            var legal: [2 * 1024]u8 = undefined;
+            @memset(&legal, 'P');
+            try daemonSendRaw(loop.daemon_fd, .SnapshotChunk, &legal);
+            for (0..4) |i| _ = try quic_test.sessionRound(&loop, &client, lbase + 150 + @as(i64, @intCast(i)));
+            try testing.expect(sess.pending_snapshot.items.len > 0);
+
+            // The violating chunk exceeds the negotiated limit. NO
+            // client reads: it must fail immediately anyway.
+            var big: [8 * 1024]u8 = undefined;
+            @memset(&big, 'V');
+            try daemonSendRaw(loop.daemon_fd, .SnapshotChunk, &big);
+            for (0..8) |i| _ = try quic_test.sessionRound(&loop, &client, lbase + 200 + @as(i64, @intCast(i)));
+            try testing.expect(sess.closedOrEnding());
+            try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), sess.end_code.code());
+            try testing.expect(!sess.snapshot_fin_sent);
+            const cst = (try client.transport.connection().streamState(quic_session.snapshot_stream_id)) orelse return error.NoClientStream7;
+            try testing.expect(cst.receive == .reset_received or cst.receive == .reset_read);
+            continue;
+        }
+
+        var z = try zmq1Setup(alloc, &psk);
+        defer z.loop.deinit();
+        defer z.client.deinit();
+        const sess = try z.session();
+        var dr = try quic_test.DaemonReader.init(alloc);
+        defer dr.deinit();
+        const base: i64 = lib_posix.nowNs();
+        try zmq1ToInitSnapshot(&z, &dr, base);
+
+        // Park a legal 8 KiB chunk with NO client reads.
+        try daemonSendRaw(z.loop.daemon_fd, .SnapshotBegin, &.{1});
+        var legal: [8 * 1024]u8 = undefined;
+        @memset(&legal, 'P');
+        try daemonSendRaw(z.loop.daemon_fd, .SnapshotChunk, &legal);
+        for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+        try testing.expect(sess.pending_snapshot.items.len > 0);
+
+        switch (kind) {
+            .zero_len => try daemonSendRaw(z.loop.daemon_fd, .SnapshotChunk, ""),
+            .oversize => {
+                var big: [33 * 1024]u8 = undefined;
+                @memset(&big, 'V');
+                try daemonSendRaw(z.loop.daemon_fd, .SnapshotChunk, &big);
+            },
+            else => unreachable,
+        }
+        // NO client reads anywhere: flow control cannot delay the
+        // fail-closed handling.
+        for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        try testing.expect(sess.closedOrEnding());
+        try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), sess.end_code.code());
+        try testing.expect(!sess.snapshot_fin_sent);
+        const cst = (try z.client.transport.connection().streamState(quic_session.snapshot_stream_id)) orelse return error.NoClientStream7;
+        try testing.expect(cst.receive == .reset_received or cst.receive == .reset_read);
+    }
+}
+
+test "zmq1 q4: reads stop at an unacceptable frame header and resume losslessly" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+    try zmq1Dance(&z, &dr, base);
+
+    // Occupied output storage: pending_output at its cap.
+    var filler: [32 * 1024]u8 = undefined;
+    @memset(&filler, 'F');
+    try sess.pending_output.appendSlice(alloc, &filler);
+    try sess.pending_output.appendSlice(alloc, &filler);
+    try testing.expectEqual(quic_session.pending_output_cap, sess.pending_output.items.len);
+
+    // ONLY an 8-byte Output header (declaring 1 KiB) reaches the
+    // daemon socket — no payload.
+    const only_hdr = ipc.Header{ .tag = .Output, .len = 1024 };
+    _ = try lib_posix.write(z.loop.daemon_fd, std.mem.asBytes(&only_hdr));
+    _ = try z.loop.gw.runOnce(0);
+    // The same turn pumped a little of the stuffed backlog out (initial
+    // credit): top pending_output back up to its cap so the declared
+    // 1 KiB frame genuinely cannot be accepted.
+    while (sess.pending_output.items.len < quic_session.pending_output_cap) {
+        const room = quic_session.pending_output_cap - sess.pending_output.items.len;
+        try sess.pending_output.appendSlice(alloc, filler[0..@min(room, filler.len)]);
+    }
+
+    // The header is buffered, the gate rejects the DECLARED frame, and
+    // no further payload bytes are read into the buffer (reads stop at
+    // the header; the eligibility flip below re-arms them only after
+    // output credit returns).
+    try testing.expect(!z.loop.gw.daemonReadEligible());
+    {
+        const rb = z.loop.gw.unix_read_buf;
+        try testing.expectEqual(@sizeOf(ipc.Header), rb.buf.items.len - rb.head);
+    }
+    // (Writing arbitrary partial payload bytes as a further probe is
+    // deliberately avoided: a real daemon never sends mid-frame
+    // garbage, and the bounded reader correctly fails closed on it.)
+
+    // Output credit returns (the client drains the backlog): the gate
+    // opens, and a COMPLETE frame relays losslessly.
+    var drained: usize = 0;
+    var obuf: [16 * 1024]u8 = undefined;
+    for (0..80) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        while (try z.client.pollOutput(&obuf, null)) |n| drained += n;
+        if (sess.pending_output.items.len == 0 and z.loop.gw.daemonReadEligible()) break;
+    }
+    try testing.expect(sess.pending_output.items.len == 0);
+    try testing.expect(z.loop.gw.daemonReadEligible());
+    // Complete the declared frame: its 1 KiB 'R' payload relays in
+    // full after the 'F' backlog (stragglers may interleave in
+    // flight, so the proof is the byte pattern, not a bare count).
+    var rest: [1024]u8 = undefined;
+    @memset(&rest, 'R');
+    _ = try lib_posix.write(z.loop.daemon_fd, &rest);
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(alloc);
+    for (0..80) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
+        while (try z.client.pollOutput(&obuf, null)) |n| {
+            try acc.appendSlice(alloc, obuf[0..n]);
+        }
+        if (acc.items.len >= 64 * 1024 + 1024) break;
+    }
+    // The backlog ('F') relayed completely and the payload ('R') sits
+    // exactly at the tail.
+    // The backlog drained during the credit-recovery loop; the newly
+    // completed frame relays as exactly its 1 KiB 'R' payload.
+    try testing.expectEqual(@as(usize, 1024), acc.items.len);
+    try testing.expectEqual(@as(usize, 1), sess.counters.daemon_output_frames);
+    for (acc.items) |b| {
+        try testing.expectEqual(@as(u8, 'R'), b);
+    }
+    try testing.expect(!sess.closedOrEnding());
 }
 
 test "zmq1 session: HELLO mismatches reject with the frozen codes and never initialize the daemon" {
@@ -3139,9 +3435,10 @@ test "zmq1 r7: control responses survive exhausted credit, computed request coun
     try zmq1ToActive(&z, &dr, base);
 
     // COMPUTED count: each response is header 8 + ERROR payload
-    // (4 + "snapshot is Q4".len = 19) = 27 B; the preface (8) already
-    // left. Requests that exhaust the 2 KiB control credit, plus slack.
-    const response_len = quic_wire.control_header_len + 4 + "snapshot is Q4".len;
+    // (4 + "replacement snapshots are Q5".len = 32) = 40 B; the
+    // preface (8) already left. Requests that exhaust the 2 KiB
+    // control credit, plus slack.
+    const response_len = quic_wire.control_header_len + 4 + "replacement snapshots are Q5".len;
     const requests = quic_transport.stream_credit / response_len + 8;
 
     // The client does NOT read control (raw drain) so responses pile
@@ -3191,7 +3488,7 @@ test "zmq1 r7: terminal replacement of a parked response keeps framing whole" {
     const base: i64 = lib_posix.nowNs();
     try zmq1ToActive(&z, &dr, base);
 
-    const response_len = quic_wire.control_header_len + 4 + "snapshot is Q4".len;
+    const response_len = quic_wire.control_header_len + 4 + "replacement snapshots are Q5".len;
     const requests = quic_transport.stream_credit / response_len + 8;
     for (0..requests) |_| try z.client.sendSnapshotRequest();
     for (0..10) |i| {

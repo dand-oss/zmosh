@@ -1036,10 +1036,11 @@ test "snapshot header golden, split parse, and field validation" {
     try testing.expect(!(try parseSnapshotHeader(&buf)).present);
 
     // Every split boundary resumes mid-field: 1 byte at a time, AND
-    // every fresh two-part split (prefix [0..i], then the rest).
+    // every fresh two-part split (prefix [0..i], then the rest),
+    // INCLUDING the 23+1 boundary.
     writeSnapshotHeader(&buf, snapshot_epoch_v1, true);
     var i: usize = 0;
-    while (i < snapshot_header_len - 1) : (i += 1) {
+    while (i < snapshot_header_len) : (i += 1) {
         var p2: SnapshotHeaderParser = .{};
         const ra = p2.feed(buf[0..i]);
         switch (ra.result) {

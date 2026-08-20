@@ -16,8 +16,9 @@ pub const output_stream_id: u64 = 3;
 pub const snapshot_stream_id: u64 = 7;
 /// One snapshot chunk as the daemon frames it (ipc.snapshot_chunk_max).
 pub const snapshot_chunk_cap = ipc.snapshot_chunk_max;
-/// The daemon's frozen transaction bound (128 MiB of Ghostty bytes).
-pub const snapshot_total_max: u64 = 128 * 1024 * 1024;
+/// The daemon's frozen transaction bound — the wire's negotiated-limit
+/// ceiling (128 MiB of Ghostty bytes).
+pub const snapshot_total_max: u64 = quic_wire.snapshot_limit_v1;
 /// The single bounded pending snapshot unit: the 24-byte header plus
 /// one chunk. A second chunk is never accepted while one is blocked.
 pub const pending_snapshot_cap = quic_wire.snapshot_header_len + snapshot_chunk_cap;
@@ -161,9 +162,8 @@ pub const QuicSession = struct {
     last_size: ipc.Resize = .{ .rows = 24, .cols = 80 },
     init_sent: bool = false,
     /// The snapshot byte limit NEGOTIATED in HELLO (the min the client
-    /// declared and the server default) — enforced in place of any
-    /// duplicated constant.
-    snapshot_limit: u64 = snapshot_total_max,
+    /// declared and the server default from the wire constant).
+    snapshot_limit: u64 = quic_wire.snapshot_limit_v1,
 
     output_opened: bool = false,
     output_fin_sent: bool = false,
@@ -279,16 +279,28 @@ pub const QuicSession = struct {
             .Output => switch (self.phase) {
                 // Discarded pre-cut output (or a terminal interleave
                 // once consumed): no storage required.
-                .awaiting_hello, .awaiting_resize, .awaiting_snapshot_begin, .snapshot_streaming => return true,
+                .awaiting_hello, .awaiting_resize, .awaiting_snapshot_begin => return true,
+                // Between Begin and End an Output is a terminal
+                // interleave (always consumable); AFTER the validated
+                // End it is legal post-cut output — capacity-gated
+                // even while the stream-7 FIN is still pending.
+                .snapshot_streaming => {
+                    if (!self.snapshot_end_validated) return true;
+                    return payload_len <= pending_output_cap - self.pending_output.items.len;
+                },
                 else => return payload_len <= pending_output_cap - self.pending_output.items.len,
             },
             .SnapshotChunk => {
-                // A chunk the session will reject terminally (outside
-                // streaming, after a validated End, or under
-                // PRESENT=0) is always consumable; only a legal data
-                // chunk needs the free pending unit.
+                // A chunk the session will reject terminally is
+                // ALWAYS consumable — client-withheld stream-7 credit
+                // can never delay fail-closed handling: outside
+                // streaming, after a validated End, under PRESENT=0,
+                // with an illegal length, or over the negotiated
+                // limit.
                 if (self.phase != .snapshot_streaming) return true;
                 if (self.snapshot_end_validated or !self.snapshot_present) return true;
+                if (payload_len == 0 or payload_len > snapshot_chunk_cap) return true;
+                if (self.snapshot_total + payload_len > self.snapshot_limit) return true;
                 return self.pending_snapshot.items.len == 0;
             },
             // Begin/End/Error/Resize/Switch and unknown tags carry no
@@ -314,7 +326,15 @@ pub const QuicSession = struct {
                 self.counters.discarded_pre_cut_output += payload.len;
                 return;
             },
-            .snapshot_streaming => return self.failSnapshot(now, "output interleaved with snapshot"),
+            .snapshot_streaming => {
+                // Before the validated End this is a terminal
+                // interleave; after it, the Output is legal post-cut
+                // output even while the stream-7 FIN is still pending
+                // (capacity was prechecked by canConsumeDaemonFrame).
+                if (!self.snapshot_end_validated) {
+                    return self.failSnapshot(now, "output interleaved with snapshot");
+                }
+            },
             else => {},
         }
         if (payload.len > pending_output_cap - self.pending_output.items.len) {
@@ -761,7 +781,7 @@ pub const QuicSession = struct {
                         return self.enterTerminal(now, .protocol_violation, "bad SNAPSHOT_REQUEST length", .error_frame, unix_out);
                     }
                     // NONTERMINAL: answered, session continues.
-                    return self.queueError(.unimplemented, "snapshot is Q4", false);
+                    return self.queueError(.unimplemented, "replacement snapshots are Q5", false);
                 },
                 .snapshot_installed => {
                     if (payload.len != 0) {
