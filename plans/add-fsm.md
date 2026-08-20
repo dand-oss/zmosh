@@ -383,3 +383,56 @@ Final gates:
   known r3b flake if encountered.
 - q2-2 pin, tag, and backup remain unchanged.
 - Stop for review with Q4 locked.
+
+## r8.5 amendment (review findings on the r8 landing — frozen contract)
+
+The r8 audit found the landing at `544d952` not sign-off ready. This
+amendment freezes the correction contract; the sections above stand
+except where amended here.
+
+1. **Egress-retry ownership (P1).** One latch path, one owner per
+   datagram: an idempotent `latchSocketFailure(context)` (still calling
+   `ClientSession.failLocal()` so session shutdown/state stay
+   consistent) sets `io_failed`, frees `pending_egress` exactly once,
+   stores the reason in the stable buffer, and sets
+   `dstate = .event_ready{err, internal_error}`. `sockSend` never
+   frees; `sendOrPark` frees its own not-yet-parked datagram on
+   failure; `retryPendingEgress` propagates without freeing.
+   `failSocket`, `failSocketNoDatagram`, `returned_event`, and the
+   unused public `Client.failLocal()` are deleted.
+2. **Typed `.detaching` (P1).** `ProtocolState.detaching{control_tx,
+   control_rx, output_rx}` — `control_tx` RETAINED so a parked DETACH
+   survives; `PendingKind.detach`; entered by `beginDetach()` after
+   ownership transfers (sent or parked whole). The server's bare FIN is
+   clean only at `control_tx == .idle` (a parked DETACH has not reached
+   quicz — FIN before flush is a protocol violation). With
+   `InputTx == .preface_pending`, `sendDetach()` returns
+   `error.WouldBlock` without queueing or transitioning. All application
+   writes reject in `.detaching`. A peer close while detaching (before
+   the required control FIN) is a protocol violation; terminal frames
+   still transition to normal draining.
+3. **Complete path binding.** The pending-egress slot stores the whole
+   `UdpTuple` (`dst`), not `dst.remote` alone.
+4. **Classifier.** Only `error.UnsupportedPacketType` peek failures
+   pass to the adapter (Retry validation); every other peek error is
+   counted and discarded at the driver boundary.
+5. **Driver FSM authority.** `.event_ready` is actually assigned and
+   all terminal delivery flows through one `deliverTerminal()`;
+   `io_failed` remains solely the socket-I/O latch.
+6. **Restored proofs** (deterministic fixtures, private machinery
+   stays private, no test-only gateway API): permanent send failure
+   during retry via an `egress_fail_n` fixture (no fd manipulation);
+   the DETACH matrix; feed-OOM through the public `pump()` with a
+   toggle allocator armed around one known authenticated packet
+   (counter-proven inside feed); handshake-space pruning; live
+   gate-skip replay on an in-file `QuicGateway` peer — capture the real
+   server Initial and Handshake, insert a SYNTHETIC short-form junk
+   packet first (parks behind the one-RTT gate; the gateway cannot
+   emit a valid short-form packet ahead of the server Handshake),
+   park the real Handshake second, feed the real Initial directly;
+   assert the Handshake processed despite the earlier short entry,
+   `datagrams_received` +2, `junk_received` +1, `parked_len == 0`,
+   one-RTT keys available, remaining rounds complete.
+7. **Records.** The r8 addendum's chain SHA `01a4c84` is corrected to
+   the actual `249d01c` (the r8.2 amend renamed it); git history
+   untouched.
