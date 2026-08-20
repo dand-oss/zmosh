@@ -1218,6 +1218,49 @@ of a dropped first-send datagram could not be driven through the bare
 -transport harness (the gateway-side drop recovery — the same quicz
 machinery — IS proven deterministically); the driver's pump drives the
 same serviceDueDeadline path in production.
+### r8 historical addendum (supersedes the r7 completion claim above)
+
+The statement above that r7 "fixes all seven review findings and lands
+every proof" was INACCURATE and is superseded by this addendum (the
+frozen text above is retained verbatim for the record). The r8 review
+found the claim false on both halves: six P1 client/driver defects
+remained (terminal output stranded through the `.ended` output gate;
+blocked writes violating the parked-copy contract with a dead
+`input_preface_pending` retry branch; truncated/reset streams failing
+silently; replay feeding parked datagrams twice and advancing past the
+shifted entry; actual UDP source addresses discarded for the
+configured peer; driver failures swallowed with a repeatable timeout
+event), plus a constructor-cleanup P2, and six test-record gaps
+(wrong-role only on stream 6; split tests on the wrong paths;
+SNAPSHOT_INSTALLED payload untested; client validation incomplete;
+none of the blocked-write/truncation/parking/bounded-queue/close/
+terminal-race proofs existed).
+
+The r8 correction round (this history: `330d51d` → `01a4c84` →
+`649ad98`, plus the r8.4 addendum commit) replaces the flag-oriented
+client/driver logic with the hierarchical protocol FSM frozen in
+`plans/add-fsm.md`: ZMQ1 FINAL=0x01 (ERROR-only; fatal ERROR FINAL+FIN;
+snapshot response flags-zero nonterminal; SESSION_END flags-zero
+terminal), the ClientSession ProtocolState machine with typed
+ControlTx/InputTx/ControlRx/OutputRx substates and five transition
+helpers, the DriverState lifecycle with deferred terminal events held
+until ControlRx.finished + OutputRx.finished (or the disclosed
+degradation arms), ParkedDatagram FIFO replay that never stalls behind
+a closed gate, actual-source routing with challenge rotation, tagged
+egress retention across WouldBlock, state-frozen deadline composition,
+and latched permanent-failure handling. Final state: 239/239 Debug and
+ReleaseSafe, check/builds/fmt/diff clean, adapter SLOC 467 unchanged,
+full Bats 58 ok / 0 failed / 4 Q5 skips (no r3b flake encountered).
+
+Disclosed r8 limitations (not silently dropped): inbound OOM
+propagation from `feed` has no deterministic fixture (the code path
+exists and is compile-checked only); the
+`packetNumberSpaceDiscarded(.handshake)` pruning branch is covered by
+code review rather than a wired test (no fixture reaches the discard
+window with parked entries); the gate-skip scan is proven on the pure
+`firstReadyIdx` helper rather than a live reordered handshake; and the
+r7 limitation on client-originated PTO drop recovery still stands.
+
 
 ## Phase Q4: Ghostty binary snapshot export
 
