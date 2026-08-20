@@ -436,3 +436,58 @@ except where amended here.
 7. **Records.** The r8 addendum's chain SHA `01a4c84` is corrected to
    the actual `249d01c` (the r8.2 amend renamed it); git history
    untouched.
+
+## r8.6 amendment (sign-off correction — frozen contract)
+
+The r8.5 audit confirmed all gates green but found three contract
+gaps and missing durable documentation. This amendment freezes the
+r8.6 contract; earlier sections stand except where amended.
+
+1. **Authoritative terminal delivery.** A private `stageTerminal(event)`
+   accepts only terminal SESSION_END/ERROR, copies the reason into the
+   stable driver storage, and assigns `.event_ready`; it never returns
+   the event. `deliverTerminal()` is the SOLE event-return path. The
+   timeout, both socket-failure sites, and the failure-during-drain
+   release all route through `stageTerminal()` + `deliverTerminal()`.
+2. **Frozen failure precedence.** (1) An existing stored
+   session/protocol failure wins with its matching code and reason.
+   (2) An already-deferred FINAL ERROR wins over a later socket
+   failure. (3) A socket failure while draining a clean SESSION_END —
+   or with no prior failure — becomes `internal_error` (output
+   completeness is no longer provable). (4) A failed session with no
+   stored event becomes `internal_error("failed session missing
+   terminal event")`; stale deferred metadata is never released. The
+   socket latch stays idempotent and single-owner; after terminal
+   delivery, later settling-socket errors only disable I/O and close.
+3. **Genuine proofs.** The parked-DETACH proof uses ATTACHED
+   session-level `ClientSession` fixtures (a raw gateway cannot
+   observe `.Detach`): authorize at control offset 64, apply peer
+   connection/control credit 80, send the 16-byte first RESIZE and
+   then DETACH before any round (`retryPendingSends()` is NOT called
+   before the only-`.Init` assertion, so the driver cannot
+   auto-retry); the DETACH parks naturally through FlowControlBlocked
+   → `beginDetach`. Fixture A restores credit, retries explicitly, and
+   proves exactly one `.Detach` plus clean completion; Fixture B
+   leaves it parked, injects the control FIN, and proves
+   `protocol_violation`. Event-coherence tests cover: protocol
+   failure during drain (own code/reason, once, through the driver),
+   socket failure after a protocol failure (first failure preserved),
+   and socket failure during clean SESSION_END drain
+   (`internal_error`). The gate-skip stages exactly ONE real
+   Handshake datagram and ONE synthetic short datagram, holds the
+   other captured packets outside the driver, feeds the Initial
+   directly, and — WITHOUT another peer round — asserts
+   `datagrams_received` +2, `junk_received` +1, `parked_len == 0`,
+   key installation, and eventual handshake completion. No test
+   mutates protocol state directly.
+4. **Durable documentation.** `docs/quic-wire.md` gains the normative
+   DETACH ordering, flush-before-FIN, terminal-FIN classes, and
+   amended-v1 status; `docs/quic-client-runtime.md` documents both
+   FSMs, ownership rules, terminal precedence and reason lifetime,
+   replay/budgets/routing, and egress-failure handling (local API
+   behavior such as preface-pending WouldBlock lives here, not in the
+   wire spec); `docs/decisions/0001-zig-quicz-network-stack.md`
+   records the Zig/quicz-versus-Rust decision and its reconsideration
+   triggers; `AGENTS.md` acknowledges Ghostty and quicz as the two
+   pinned dependencies and links the documents. Evidence is appended
+   only after every claimed proof passes.
