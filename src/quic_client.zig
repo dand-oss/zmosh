@@ -555,6 +555,7 @@ pub const ClientSession = struct {
     /// failure.
     pub fn pollControl(self: *ClientSession) !?ControlEvent {
         if (self.takeEvent()) |e| return e;
+
         switch (self.state) {
             .awaiting_ack, .awaiting_first_resize, .active, .draining => {},
             .failed, .closed => return null,
@@ -1003,16 +1004,6 @@ pub const DriverState = union(enum) {
     closed,
 };
 
-/// Which parked gate has opened. Short-form packets gate on the
-/// EXISTENCE of 1-RTT protection keys — never on handshake
-/// confirmation, because HANDSHAKE_DONE itself arrives short-form.
-fn gateOpen(transport: *quic_transport.Transport, gate: @TypeOf(@as(ParkedDatagram, undefined).gate)) bool {
-    return switch (gate) {
-        .handshake_keys => transport.conn.hasHandshakeProtectionKeys(),
-        .one_rtt_keys => transport.connection().hasOneRttProtectionKeys(),
-    };
-}
-
 pub const Client = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1059,6 +1050,9 @@ pub const Client = struct {
     /// A terminal event produced by a mid-turn local failure, delivered
     /// by this pump's epilogue or the next pump call.
     returned_event: ?ControlEvent = null,
+    /// TEST-ONLY deterministic send-helper fixture: when nonzero, that
+    /// many egress sends behave as WouldBlock before any real sendTo.
+    egress_block_n: usize = 0,
 
     pub fn connect(alloc: std.mem.Allocator, io: std.Io, psk: *const [32]u8, remote: lib_posix.Address, now: i64) !Client {
         const family: u32 = switch (remote.any.family) {
@@ -1184,11 +1178,37 @@ pub const Client = struct {
             @memcpy(self.out_buf[self.out_len .. self.out_len + n], dst[0..n]);
             self.out_len += n;
         }
+        // A full queue must still observe the output FIN: one
+        // zero-length read consumes nothing (recvOnStream with an
+        // empty buffer never moves data) but settles the stream when
+        // everything readable was already queued — the
+        // exact-capacity-plus-FIN release.
+        if (self.outputFull()) {
+            _ = try self.session.pollOutput(&[_]u8{}, null);
+        }
     }
 
     // -- egress: one send-or-park path for every datagram -------------------
 
     const Egress = enum { sent, parked };
+
+    /// The one kernel-send path. Returns true when sent, false on
+    /// WouldBlock (the caller retains the datagram). `egress_block_n`
+    /// is the deterministic send-helper fixture: when nonzero, that
+    /// many sends behave as WouldBlock before any real sendTo —
+    /// loopback UDP never otherwise blocks.
+    fn sockSend(self: *Client, dg: []u8, dst: quicz.endpoint.UdpAddress) error{SocketFailed}!bool {
+        if (self.egress_block_n > 0) {
+            self.egress_block_n -= 1;
+            return false;
+        }
+        if (self.sock.sendTo(dg, udp.udpAddressToSockaddr(dst))) {
+            return true;
+        } else |e| switch (e) {
+            error.WouldBlock => return false,
+            else => return self.failSocket(dg, "socket send failed"),
+        }
+    }
 
     /// Sends one tagged datagram to its OWN destination
     /// (TaggedDatagram.dst.remote — never the configured peer). A
@@ -1196,11 +1216,7 @@ pub const Client = struct {
     /// path binding, and ping metadata in the pending-egress slot; a
     /// permanent failure latches the no-more-I/O state.
     fn sendOrPark(self: *Client, tagged: quic_transport.Transport.TaggedDatagram) !Egress {
-        const sent = if (self.sock.sendTo(tagged.dg, udp.udpAddressToSockaddr(tagged.dst.remote))) true else |e| switch (e) {
-            error.WouldBlock => false,
-            else => return self.failSocket(tagged.dg, "socket send failed"),
-        };
-        if (sent) {
+        if (try self.sockSend(tagged.dg, tagged.dst.remote)) {
             self.alloc.free(tagged.dg);
             return .sent;
         }
@@ -1212,11 +1228,7 @@ pub const Client = struct {
     /// polled.
     fn retryPendingEgress(self: *Client) !bool {
         const p = self.pending_egress orelse return true;
-        const sent = if (self.sock.sendTo(p.dg, udp.udpAddressToSockaddr(p.dst))) true else |e| switch (e) {
-            error.WouldBlock => false,
-            else => return self.failSocket(p.dg, "socket send failed"),
-        };
-        if (sent) {
+        if (try self.sockSend(p.dg, p.dst)) {
             self.alloc.free(p.dg);
             self.pending_egress = null;
             return true;
@@ -1226,9 +1238,18 @@ pub const Client = struct {
 
     /// One bounded egress turn: pending retry first, then freshly
     /// polled output and deadline output through the same path, all
-    /// under the shared outbound budget.
+    /// under the shared outbound budget. A permanent socket failure is
+    /// LATCHED here (event stored, I/O disabled); the pump epilogue
+    /// delivers the event — it never escapes as a transport error.
     fn pumpEgress(self: *Client, now: i64) !void {
         if (self.io_failed) return;
+        self.egressTurn(now) catch |e| switch (e) {
+            error.SocketFailed => {},
+            else => return e,
+        };
+    }
+
+    fn egressTurn(self: *Client, now: i64) !void {
         _ = try self.retryPendingEgress();
         var outbound: usize = 0;
         while (outbound < pump_max_outbound and self.pending_egress == null) : (outbound += 1) {
@@ -1314,14 +1335,26 @@ pub const Client = struct {
         return true;
     }
 
-    /// Replays ready parked datagrams. NEVER stalls behind an unopened
-    /// gate — packet-number spaces advance independently, so an early
-    /// 1-RTT datagram must not block a later Handshake datagram that
-    /// installs the very keys needed to unblock it. Scan in arrival
-    /// order, skip unready entries, feed the first ready one, remove
-    /// WITHOUT advancing the index, then restart from index 0 (feeding
-    /// may open another gate). Obsolete handshake-space entries are
-    /// dropped once that space is discarded. Each replayed datagram
+    /// The pure replay decision: the index of the FIRST ready entry,
+    /// scanning in arrival order and SKIPPING unready gates — replay
+    /// never stalls behind one, because packet-number spaces advance
+    /// independently: an early 1-RTT datagram must not block a later
+    /// Handshake datagram that installs the very keys needed to
+    /// unblock it. Callers remove WITHOUT advancing the index and
+    /// restart from 0 (feeding may open another gate).
+    fn firstReadyIdx(entries: []const ParkedDatagram, handshake_keys: bool, one_rtt_keys: bool) ?usize {
+        for (entries, 0..) |e, i| {
+            const ready = switch (e.gate) {
+                .handshake_keys => handshake_keys,
+                .one_rtt_keys => one_rtt_keys,
+            };
+            if (ready) return i;
+        }
+        return null;
+    }
+
+    /// Replays ready parked datagrams. Obsolete handshake-space entries
+    /// are dropped once that space is discarded. Each replayed datagram
     /// consumes the shared inbound budget.
     fn replayParked(self: *Client, now: i64, budget: *usize) !void {
         if (self.transport.connection().packetNumberSpaceDiscarded(.handshake)) {
@@ -1335,21 +1368,15 @@ pub const Client = struct {
             }
         }
         while (budget.* < pump_max_inbound) {
-            var idx: usize = 0;
-            var processed = false;
-            while (idx < self.parked_len) {
-                if (!gateOpen(self.transport, self.parked[idx].gate)) {
-                    idx += 1;
-                    continue;
-                }
-                const entry = &self.parked[idx];
-                try self.feed(entry.arrival, now, entry.bytes[0..entry.len]);
-                self.removeParked(idx);
-                budget.* += 1;
-                processed = true;
-                break;
-            }
-            if (!processed) return;
+            const idx = firstReadyIdx(
+                self.parked[0..self.parked_len],
+                self.transport.conn.hasHandshakeProtectionKeys(),
+                self.transport.connection().hasOneRttProtectionKeys(),
+            ) orelse return;
+            const entry = &self.parked[idx];
+            try self.feed(entry.arrival, now, entry.bytes[0..entry.len]);
+            self.removeParked(idx);
+            budget.* += 1;
         }
     }
 
@@ -1457,6 +1484,10 @@ pub const Client = struct {
         }
         try self.session.retryPendingSends();
         try self.pumpEgress(now);
+        if (self.returned_event) |e| {
+            self.returned_event = null;
+            return e;
+        }
 
         // Drain output BEFORE control, before receiving.
         var ev: ?ControlEvent = null;
@@ -1475,9 +1506,12 @@ pub const Client = struct {
             !self.sessionDrainComplete()) : (inbound += 1)
         {
             // A full output queue blocks receiving ONLY while the
-            // output side is unfinished — with FIN consumed and all
-            // output queued (even exactly 64 KiB) the release stands.
-            if (self.outputFull() and !self.session.outputSettled()) break;
+            // output side is unfinished AND no terminal is deferred:
+            // once one is, the remaining flights (output FIN, control
+            // FIN) must still arrive to release it — receiving them
+            // adds nothing to the full queue (drainOutput refuses),
+            // and quicz's flow control throttles any further output.
+            if (self.outputFull() and !self.session.outputSettled() and self.dstate != .draining) break;
             const r = self.sock.recvFrom(&buf) catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => {
@@ -1532,6 +1566,11 @@ pub const Client = struct {
             return;
         }
         try self.pumpEgress(now);
+        if (self.returned_event != null) {
+            self.dstate = .closed;
+            self.returned_event = null;
+            return;
+        }
         var inbound: usize = 0;
         var buf: [quic_transport.max_udp_payload]u8 = undefined;
         while (inbound < pump_max_inbound) : (inbound += 1) {
@@ -1631,4 +1670,134 @@ test "client event union carries hello_ack, session_end, and error shapes" {
 test "client max frame bound is the preface + header + HELLO" {
     try testing.expectEqual(@as(usize, 64), client_max_frame);
     try testing.expectEqual(quic_wire.preface_len + quic_wire.control_header_len + quic_wire.hello_payload_len, client_max_frame);
+}
+
+// ---------------------------------------------------------------------------
+// Driver unit tests (private-machinery coverage: classification, FIFO
+// parking, budget, and egress retention on a dead remote)
+// ---------------------------------------------------------------------------
+
+/// A driver bound to a black-hole remote: no handshake ever completes,
+/// so the transport sits keyless — exactly the state in which parking
+/// decisions are made.
+fn deadDriver(alloc: std.mem.Allocator, psk: *const [32]u8, hole: *udp.UdpSocket) !Client {
+    hole.* = try udp.UdpSocket.bindEphemeral(lib_posix.AF.INET);
+    const addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, hole.bound_port);
+    return Client.connect(alloc, std.testing.io, psk, addr, 1_000_000);
+}
+
+test "driver classify: empty junk, short-form parks on 1-RTT keys, handshake parks on handshake keys" {
+    const alloc = std.testing.allocator;
+    var psk: [32]u8 = undefined;
+    try std.testing.io.randomSecure(&psk);
+    var hole: udp.UdpSocket = undefined;
+    var driver = try deadDriver(alloc, &psk, &hole);
+    defer hole.close();
+    defer driver.deinit();
+
+    const src = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, 4242);
+    try std.testing.expect(!driver.transport.connection().hasOneRttProtectionKeys());
+    try std.testing.expect(!driver.transport.conn.hasHandshakeProtectionKeys());
+
+    // Empty datagrams are counted and discarded, never parked.
+    const before = driver.junk_received;
+    _ = try driver.classifyAndFeed(src, 0, &.{});
+    try std.testing.expectEqual(before + 1, driver.junk_received);
+    try std.testing.expectEqual(@as(usize, 0), driver.parked_len);
+
+    // Short-form (high bit clear) parks behind the one-RTT-key gate
+    // with its ACTUAL source tuple retained.
+    const short_pkt = [_]u8{ 0x00, 0x01, 0x02, 0x03 };
+    try std.testing.expectEqual(false, try driver.classifyAndFeed(src, 0, &short_pkt));
+    try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+    try std.testing.expectEqual(quicz.endpoint.UdpAddress.init4(.{ 127, 0, 0, 1 }, 4242), driver.parked[0].arrival.remote);
+    try std.testing.expect(driver.parked[0].gate == .one_rtt_keys);
+
+    // A long-form datagram whose protected-long peek fails (Retry or
+    // malformed) passes ONCE to the adapter — never parked, never an
+    // error out of the driver boundary.
+    const junk_long = [_]u8{0xFF} ** 32;
+    try std.testing.expectEqual(true, try driver.classifyAndFeed(src, 0, &junk_long));
+    try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+
+    // A long-form datagram peeking as a v1 INITIAL parses and feeds
+    // (the adapter counts the undecryptable header as junk).
+    var initial_pkt: [1200]u8 = undefined;
+    @memset(&initial_pkt, 0);
+    initial_pkt[0] = 0xC0; // long header, version 1 bits
+    initial_pkt[1] = 0x00;
+    initial_pkt[2] = 0x00;
+    initial_pkt[3] = 0x00;
+    initial_pkt[4] = 0x01; // version 1
+    const j2 = driver.junk_received;
+    _ = try driver.classifyAndFeed(src, 0, &initial_pkt);
+    try std.testing.expectEqual(j2 + 1, driver.junk_received);
+    try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+
+    // With no gates open, replay processes NOTHING and retains FIFO
+    // order — and a fully consumed budget blocks replay entirely.
+    var budget: usize = pump_max_inbound;
+    try driver.replayParked(0, &budget);
+    try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+    var budget2: usize = 0;
+    try driver.replayParked(0, &budget2);
+    try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+
+    // The gate-skip scan: a parked 1-RTT entry AHEAD of a Handshake
+    // entry must not stall the scan — with only handshake keys open,
+    // the Handshake entry is selected; with both open, arrival order
+    // wins; with none, nothing is selected.
+    var entries: [3]ParkedDatagram = undefined;
+    entries[0] = .{ .len = 0, .arrival = undefined, .gate = .one_rtt_keys, .bytes = undefined };
+    entries[1] = .{ .len = 0, .arrival = undefined, .gate = .handshake_keys, .bytes = undefined };
+    entries[2] = .{ .len = 0, .arrival = undefined, .gate = .one_rtt_keys, .bytes = undefined };
+    try std.testing.expectEqual(@as(?usize, null), Client.firstReadyIdx(&entries, false, false));
+    try std.testing.expectEqual(@as(?usize, 1), Client.firstReadyIdx(&entries, true, false));
+    try std.testing.expectEqual(@as(?usize, 0), Client.firstReadyIdx(&entries, true, true));
+    try std.testing.expectEqual(@as(?usize, 0), Client.firstReadyIdx(&entries, false, true));
+
+    // The park bound drops beyond parked_max rather than allocating.
+    driver.parked_len = 0;
+    var i: usize = 0;
+    while (i < parked_max + 4) : (i += 1) {
+        driver.parkDatagram(short_pkt.len, driver.parked[0].arrival, .one_rtt_keys, &short_pkt);
+    }
+    try std.testing.expectEqual(@as(usize, parked_max), driver.parked_len);
+
+    // Removal compacts in order.
+    driver.removeParked(0);
+    try std.testing.expectEqual(@as(usize, parked_max - 1), driver.parked_len);
+}
+
+test "driver egress: WouldBlock retains the complete tagged datagram and retries it first" {
+    const alloc = std.testing.allocator;
+    var psk: [32]u8 = undefined;
+    try std.testing.io.randomSecure(&psk);
+    var hole: udp.UdpSocket = undefined;
+    var driver = try deadDriver(alloc, &psk, &hole);
+    defer hole.close();
+    defer driver.deinit();
+
+    // The deterministic send-helper fixture forces the WouldBlock
+    // path (loopback UDP never otherwise blocks). A tagged datagram
+    // hitting it parks COMPLETE:
+    // bytes, destination, path binding, and ping metadata retained.
+    const body = try alloc.dupe(u8, "tagged-egress-datagram");
+    const tagged = quic_transport.Transport.TaggedDatagram{
+        .dg = body,
+        .dst = .{ .local = driver.local_udp, .remote = driver.remote_udp },
+        .emitted_ping = true,
+    };
+    driver.egress_block_n = 1;
+    try std.testing.expectEqual(Client.Egress.parked, try driver.sendOrPark(tagged));
+    try std.testing.expect(driver.pending_egress != null);
+    try std.testing.expectEqualStrings("tagged-egress-datagram", driver.pending_egress.?.dg);
+    try std.testing.expectEqual(driver.remote_udp, driver.pending_egress.?.dst);
+    try std.testing.expect(driver.pending_egress.?.emitted_ping);
+
+    // With the fixture cleared, the retry sends it exactly once; the
+    // slot clears and a duplicate retry is a no-op.
+    try std.testing.expectEqual(true, try driver.retryPendingEgress());
+    try std.testing.expect(driver.pending_egress == null);
+    try std.testing.expectEqual(true, try driver.retryPendingEgress());
 }

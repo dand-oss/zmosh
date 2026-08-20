@@ -3640,3 +3640,873 @@ test "client driver r8: terminal deferral holds output, releases after both FINs
     try testing.expect((try driver.pump(lib_posix.nowNs())) == null);
     alloc.free(got_bytes);
 }
+
+test "zmq1 r8: wrong-role prefaces on the control stream reject with unknown_role" {
+    const alloc = testing.allocator;
+    for ([_]quic_wire.Role{ .input, .output, .snapshot, .command }) |role| {
+        var bootstrap: [32]u8 = undefined;
+        var psk: [32]u8 = undefined;
+        try testing.io.randomSecure(&bootstrap);
+        quic_transport.derivePsk(&psk, &bootstrap);
+        defer std.crypto.secureZero(u8, &bootstrap);
+        defer std.crypto.secureZero(u8, &psk);
+
+        var loop = try quic_test.Loop.init(alloc, &psk, false);
+        defer loop.deinit();
+        try quic_test.driveHandshake(&loop);
+
+        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        defer client.deinit();
+        const cconn = client.transport.connection();
+        _ = try cconn.openStream();
+        // Preface only, so the server's stream-0 send side exists.
+        var pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&pre, .control);
+        _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+        // The WRONG server preface for stream 0.
+        var bad_pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&bad_pre, role);
+        const base: i64 = lib_posix.nowNs();
+        try loop.clientPump(base);
+        _ = try loop.gw.runOnce(0);
+        try craftServerControl(&loop, &.{&bad_pre});
+
+        var err_ev: ?quic_client.ControlEvent = null;
+        for (0..10) |i| {
+            err_ev = try serverControlRound(&loop, &client, base, i);
+            if (err_ev != null) break;
+        }
+        try testing.expect(err_ev != null);
+        switch (err_ev.?) {
+            .err => |e| {
+                try testing.expectEqual(quic_wire.ErrCode.unknown_role.code(), e.code);
+                try testing.expect(e.terminal);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqual(quic_client.StateTag.failed, client.stateTag());
+    }
+}
+
+test "zmq1 r8: FINAL ERROR after authorization drains; delayed FIN keeps draining" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+
+    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    defer client.deinit();
+    const cconn = client.transport.connection();
+    _ = try cconn.openStream();
+    var pre: [quic_wire.preface_len]u8 = undefined;
+    quic_wire.writePreface(&pre, .control);
+    _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+
+    var ack = quic_wire.Hello.serverV1(quic_wire.mode_attach);
+    var ack_payload: [quic_wire.hello_payload_len]u8 = undefined;
+    ack.encode(&ack_payload);
+    var ack_hdr: [quic_wire.control_header_len]u8 = undefined;
+    quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len, 0);
+    var ack_pre: [quic_wire.preface_len]u8 = undefined;
+    quic_wire.writePreface(&ack_pre, .control);
+    // A FINAL ERROR (flags 0x01) with its FIN following separately.
+    var err_hdr: [quic_wire.control_header_len]u8 = undefined;
+    quic_wire.writeControlHeader(&err_hdr, .err, 8, quic_wire.control_flag_final);
+    var err_payload: [8]u8 = undefined;
+    _ = quic_wire.writeErrorPayload(&err_payload, .internal_error, "boom") catch unreachable;
+    const base: i64 = lib_posix.nowNs();
+    try loop.clientPump(base);
+    _ = try loop.gw.runOnce(0);
+    try craftServerControl(&loop, &.{ &ack_pre, &ack_hdr, &ack_payload, &err_hdr, &err_payload });
+
+    var got_ack = false;
+    var term: ?quic_client.ControlEvent = null;
+    for (0..10) |i| {
+        if (try serverControlRound(&loop, &client, base, i)) |e| {
+            if (e == .hello_ack and !got_ack) {
+                got_ack = true;
+                continue;
+            }
+            term = e;
+            break;
+        }
+    }
+    try testing.expect(got_ack);
+    try testing.expect(term != null);
+    switch (term.?) {
+        .err => |e| {
+            try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), e.code);
+            try testing.expect(e.terminal);
+            try testing.expectEqualStrings("boom", e.reason);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // The FINAL marker recorded the drain WITHOUT the FIN: the session
+    // is draining, waiting for the clean control FIN.
+    try testing.expectEqual(quic_client.StateTag.draining, client.stateTag());
+    try testing.expect(!client.controlFinished());
+
+    // The FIN arrives in a later delivery: control finishes cleanly.
+    const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+    try t.connection().sendOnStream(quic_client.control_stream_id, &.{}, true);
+    for (0..8) |i| {
+        _ = try serverControlRound(&loop, &client, base + 100, i);
+        if (client.controlFinished()) break;
+    }
+    try testing.expect(client.controlFinished());
+    try testing.expectEqual(quic_client.StateTag.draining, client.stateTag());
+}
+
+test "zmq1 r8: truncated control frame FIN and post-terminal frames are violations" {
+    const alloc = testing.allocator;
+    const Kind = enum { truncated_frame, post_terminal, control_reset };
+    for ([_]Kind{ .truncated_frame, .post_terminal, .control_reset }) |kind| {
+        var bootstrap: [32]u8 = undefined;
+        var psk: [32]u8 = undefined;
+        try testing.io.randomSecure(&bootstrap);
+        quic_transport.derivePsk(&psk, &bootstrap);
+        defer std.crypto.secureZero(u8, &bootstrap);
+        defer std.crypto.secureZero(u8, &psk);
+
+        var loop = try quic_test.Loop.init(alloc, &psk, false);
+        defer loop.deinit();
+        try quic_test.driveHandshake(&loop);
+
+        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        defer client.deinit();
+        const cconn = client.transport.connection();
+        _ = try cconn.openStream();
+        var pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&pre, .control);
+        _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+
+        var ack = quic_wire.Hello.serverV1(quic_wire.mode_attach);
+        var ack_payload: [quic_wire.hello_payload_len]u8 = undefined;
+        ack.encode(&ack_payload);
+        var ack_hdr: [quic_wire.control_header_len]u8 = undefined;
+        quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len, 0);
+        var ack_pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&ack_pre, .control);
+        const base: i64 = lib_posix.nowNs();
+        try loop.clientPump(base);
+        _ = try loop.gw.runOnce(0);
+        const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+
+        var err_ev: ?quic_client.ControlEvent = null;
+        switch (kind) {
+            .truncated_frame => {
+                // A frame header declaring 8 payload bytes, then only
+                // 4 — and the FIN.
+                var hdr: [quic_wire.control_header_len]u8 = undefined;
+                quic_wire.writeControlHeader(&hdr, .session_end, 8, 0);
+                try craftServerControl(&loop, &.{ &ack_pre, &ack_hdr, &ack_payload, &hdr, "abcd" });
+                try t.connection().sendOnStream(quic_client.control_stream_id, &.{}, true);
+                var got_ack = false;
+                for (0..10) |i| {
+                    if (try serverControlRound(&loop, &client, base, i)) |e| {
+                        if (e == .hello_ack and !got_ack) {
+                            got_ack = true;
+                            continue;
+                        }
+                        err_ev = e;
+                        break;
+                    }
+                }
+                try testing.expect(got_ack);
+            },
+            .post_terminal => {
+                // SESSION_END (terminal), then ANOTHER frame after it.
+                var end_hdr: [quic_wire.control_header_len]u8 = undefined;
+                quic_wire.writeControlHeader(&end_hdr, .session_end, 0, 0);
+                var extra_hdr: [quic_wire.control_header_len]u8 = undefined;
+                quic_wire.writeControlHeader(&extra_hdr, .session_end, 0, 0);
+                try craftServerControl(&loop, &.{ &ack_pre, &ack_hdr, &ack_payload, &end_hdr, &extra_hdr });
+                var got_ack = false;
+                var saw_terminal = false;
+                for (0..10) |i| {
+                    if (try serverControlRound(&loop, &client, base, i)) |e| {
+                        if (e == .hello_ack and !got_ack) {
+                            got_ack = true;
+                            continue;
+                        }
+                        if (e == .session_end and !saw_terminal) {
+                            saw_terminal = true;
+                            continue;
+                        }
+                        err_ev = e;
+                        break;
+                    }
+                }
+                try testing.expect(got_ack);
+                try testing.expect(saw_terminal);
+            },
+            .control_reset => {
+                // A partial frame header, then the stream is RESET
+                // mid-frame.
+                var hdr: [quic_wire.control_header_len]u8 = undefined;
+                quic_wire.writeControlHeader(&hdr, .session_end, 8, 0);
+                try craftServerControl(&loop, &.{ &ack_pre, &ack_hdr, &ack_payload, &hdr, "abcd" });
+                var got_ack2 = false;
+                for (0..10) |i| {
+                    if (i == 4) {
+                        try t.connection().resetStream(quic_client.control_stream_id, 0);
+                    }
+                    if (try serverControlRound(&loop, &client, base, i)) |e| {
+                        if (e == .hello_ack and !got_ack2) {
+                            got_ack2 = true;
+                            continue;
+                        }
+                        err_ev = e;
+                        break;
+                    }
+                }
+                try testing.expect(got_ack2);
+            },
+        }
+        try testing.expect(err_ev != null);
+        switch (err_ev.?) {
+            .err => |e| try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.code),
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqual(quic_client.StateTag.failed, client.stateTag());
+    }
+}
+
+test "zmq1 r8: truncated output header FIN and output reset are violations" {
+    const alloc = testing.allocator;
+    const Kind = enum { truncated_header, reset };
+    for ([_]Kind{ .truncated_header, .reset }) |kind| {
+        var bootstrap: [32]u8 = undefined;
+        var psk: [32]u8 = undefined;
+        try testing.io.randomSecure(&bootstrap);
+        quic_transport.derivePsk(&psk, &bootstrap);
+        defer std.crypto.secureZero(u8, &bootstrap);
+        defer std.crypto.secureZero(u8, &psk);
+
+        var loop = try quic_test.Loop.init(alloc, &psk, false);
+        defer loop.deinit();
+        try quic_test.driveHandshake(&loop);
+
+        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        defer client.deinit();
+        const cconn = client.transport.connection();
+        _ = try cconn.openStream();
+        var pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&pre, .control);
+        _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+
+        var ack = quic_wire.Hello.serverV1(quic_wire.mode_attach);
+        var ack_payload: [quic_wire.hello_payload_len]u8 = undefined;
+        ack.encode(&ack_payload);
+        var ack_hdr: [quic_wire.control_header_len]u8 = undefined;
+        quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len, 0);
+        var ack_pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&ack_pre, .control);
+        const base: i64 = lib_posix.nowNs();
+        try loop.clientPump(base);
+        _ = try loop.gw.runOnce(0);
+        try craftServerControl(&loop, &.{ &ack_pre, &ack_hdr, &ack_payload });
+        // A crafted OUTPUT stream: the server's first uni stream.
+        const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+        const oid = try t.connection().openUniStream();
+        try testing.expectEqual(quic_client.output_stream_id, oid);
+        var ohdr: [quic_wire.output_header_len]u8 = undefined;
+        quic_wire.writeOutputHeader(&ohdr, 1);
+        switch (kind) {
+            .truncated_header => {
+                // Only 9 of the 16 header bytes, then the FIN.
+                try t.connection().sendOnStream(oid, ohdr[0..9], false);
+                try t.connection().sendOnStream(oid, &.{}, true);
+            },
+            .reset => {
+                try t.connection().sendOnStream(oid, ohdr[0..16], false);
+                try t.connection().resetStream(oid, 0);
+            },
+        }
+
+        var got_ack = false;
+        var err_ev: ?quic_client.ControlEvent = null;
+        for (0..12) |i| {
+            if (try serverControlRound(&loop, &client, base, i)) |e| {
+                if (e == .hello_ack and !got_ack) {
+                    got_ack = true;
+                    // The authorized output side now reads the header.
+                    var obuf: [64]u8 = undefined;
+                    var epoch: u64 = 0;
+                    if (kind == .reset) _ = try client.pollOutput(&obuf, &epoch);
+                    continue;
+                }
+                err_ev = e;
+                break;
+            }
+            // pollOutput takes the failure path on its own schedule.
+            var obuf: [64]u8 = undefined;
+            if (err_ev == null) {
+                _ = try client.pollOutput(&obuf, null);
+                if (client.stateTag() == .failed) break;
+            }
+        }
+        try testing.expect(got_ack);
+        try testing.expectEqual(quic_client.StateTag.failed, client.stateTag());
+        if (err_ev) |e| {
+            try testing.expect(e == .err);
+            try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.err.code);
+        } else {
+            const late = try client.pollControl();
+            try testing.expect(late != null and late.? == .err);
+            try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), late.?.err.code);
+        }
+    }
+}
+
+test "zmq1 r8: output header splits 9+7+body; input preface splits 5+(3+body)" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+    try zmq1ToActive(&z, &dr, base);
+
+    // The CLIENT's input preface arrives 5 + (3 + body): the gateway
+    // session parks the partial preface and resumes exactly once.
+    const cconn = z.client.transport.connection();
+    const iid = try cconn.openUniStream();
+    try testing.expectEqual(quic_client.input_stream_id, iid);
+    var ipre: [quic_wire.preface_len]u8 = undefined;
+    quic_wire.writePreface(&ipre, .input);
+    _ = try cconn.sendOnStream(quic_client.input_stream_id, ipre[0..5], false);
+    for (0..6) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = try cconn.sendOnStream(quic_client.input_stream_id, ipre[5..], false);
+    _ = try cconn.sendOnStream(quic_client.input_stream_id, "split-body", false);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+    const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoSplitInput;
+    try testing.expectEqual(ipc.Tag.Input, f.tag);
+    try testing.expectEqualStrings("split-body", f.payload);
+    // Exactly one .Input frame — no duplicated or partial preface body.
+    try testing.expect((try dr.next(z.loop.daemon_fd)) == null);
+}
+
+test "zmq1 r8: SNAPSHOT_INSTALLED with or without payload is a Q3 violation" {
+    const alloc = testing.allocator;
+    const Kind = enum { empty, payload };
+    for ([_]Kind{ .empty, .payload }) |kind| {
+        var bootstrap: [32]u8 = undefined;
+        var psk: [32]u8 = undefined;
+        try testing.io.randomSecure(&bootstrap);
+        quic_transport.derivePsk(&psk, &bootstrap);
+        defer std.crypto.secureZero(u8, &bootstrap);
+        defer std.crypto.secureZero(u8, &psk);
+
+        var z = try zmq1Setup(alloc, &psk);
+        defer z.loop.deinit();
+        defer z.client.deinit();
+        var dr = try quic_test.DaemonReader.init(alloc);
+        defer dr.deinit();
+        const base: i64 = lib_posix.nowNs();
+        try zmq1ToActive(&z, &dr, base);
+
+        const cconn = z.client.transport.connection();
+        const iid = try cconn.openUniStream();
+        try testing.expectEqual(quic_client.input_stream_id, iid);
+        var hdr: [quic_wire.control_header_len]u8 = undefined;
+        quic_wire.writeControlHeader(&hdr, .snapshot_installed, if (kind == .payload) 4 else 0, 0);
+        _ = try cconn.sendOnStream(quic_client.control_stream_id, &hdr, false);
+        if (kind == .payload) _ = try cconn.sendOnStream(quic_client.control_stream_id, "abcd", false);
+
+        var err_ev: ?quic_client.ControlEvent = null;
+        for (0..10) |i| {
+            if (try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)))) |e| {
+                err_ev = e;
+                break;
+            }
+            err_ev = try z.client.pollControl();
+            if (err_ev != null) break;
+        }
+        // The server's terminal is a FINAL ERROR: the client surfaces
+        // the violation event and the session ends.
+        try testing.expect(err_ev != null);
+        switch (err_ev.?) {
+            .err => |e| try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.code),
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expect((try z.session()).closedOrEnding());
+    }
+}
+
+test "client driver r8: transport-level close surfaces distinctly from application close" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, loop.gw_addr, lib_posix.nowNs());
+    defer driver.deinit();
+
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..80) |i| {
+        ack = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        if (ack != null) break;
+    }
+    try testing.expect(ack != null and ack.? == .hello_ack);
+    try driver.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    _ = (try dr.next(loop.daemon_fd)) orelse return error.NoInit;
+
+    // A TRANSPORT-level CONNECTION_CLOSE (not the adapter's
+    // application shutdown): the client reports kind == .transport
+    // with the wire code, distinct from the application close.
+    const t = loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+    try t.connection().closeConnection(0x0B, 0x03, "transport-level");
+    for (0..16) |i| {
+        _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        if (driver.peerClose() != null) break;
+    }
+    const pc = driver.peerClose();
+    try testing.expect(pc != null);
+    try testing.expect(pc.?.kind == .transport);
+    try testing.expectEqual(@as(u64, 0x0B), pc.?.code);
+}
+
+test "zmq1 r8: blocked-write contract under controlled peer transport parameters" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+    // Drive to authorized (HELLO_ACK) WITHOUT the first RESIZE.
+    try zmq1ToActive0(&z);
+    try testing.expectEqual(quic_client.StateTag.awaiting_first_resize, z.client.stateTag());
+
+    const conn = z.client.transport.connection();
+    // TEST-ONLY fault injection (public peer transport-parameter API):
+    // zero the peer-granted stream credit so the next control send and
+    // the input preface block. The peer's negotiated identity fields
+    // are preserved so the re-application validates.
+    var low = quicz.transport_parameters.TransportParameters{};
+    low.initial_source_connection_id = conn.peerInitialSourceConnectionId();
+    low.original_destination_connection_id = conn.originalDestinationConnectionId();
+    low.retry_source_connection_id = conn.retrySourceConnectionId();
+    low.initial_max_data = 64; // exactly the HELLO already consumed
+    low.initial_max_stream_data_bidi_remote = 64; // stream 0 consumed
+    low.initial_max_stream_data_uni = 0;
+    low.initial_max_streams_bidi = 100;
+    low.initial_max_streams_uni = 100;
+    try conn.applyPeerTransportParameters(low);
+
+    // A blocked first RESIZE parks the WHOLE encoded copy and the
+    // call SUCCEEDS (ownership transferred); the state has not
+    // advanced.
+    try z.client.sendResize(24, 80, 0, 0);
+    try testing.expectEqual(quic_client.StateTag.awaiting_first_resize, z.client.stateTag());
+    // A second write while one is parked is ControlWritePending.
+    try testing.expectError(error.ControlWritePending, z.client.sendResize(25, 81, 0, 0));
+
+    // Restore generous credit (limits only grow).
+    var high = quicz.transport_parameters.TransportParameters{};
+    high.initial_source_connection_id = conn.peerInitialSourceConnectionId();
+    high.original_destination_connection_id = conn.originalDestinationConnectionId();
+    high.retry_source_connection_id = conn.retrySourceConnectionId();
+    high.initial_max_data = 1024 * 1024;
+    high.initial_max_stream_data_bidi_remote = 64 * 1024;
+    high.initial_max_stream_data_bidi_local = 64 * 1024;
+    high.initial_max_stream_data_uni = 64 * 1024;
+    high.initial_max_streams_bidi = 100;
+    high.initial_max_streams_uni = 100;
+    try conn.applyPeerTransportParameters(high);
+
+    // The parked first RESIZE retries whole: exactly one activation,
+    // exactly one .Init. (The session-level harness has no driver pump,
+    // so retries are explicit.)
+    for (0..8) |i| {
+        try z.client.retryPendingSends();
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    }
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+    {
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+        try testing.expectEqual(ipc.Tag.Init, f.tag);
+        const rz = std.mem.bytesToValue(ipc.Resize, f.payload[0..@sizeOf(ipc.Resize)]);
+        try testing.expectEqual(@as(u16, 24), rz.rows);
+    }
+
+    // Second injection, ACTIVE session: the input PREFACE alone
+    // blocks — the body stays caller-owned and unsent.
+    var low2 = quicz.transport_parameters.TransportParameters{};
+    low2.initial_source_connection_id = conn.peerInitialSourceConnectionId();
+    low2.original_destination_connection_id = conn.originalDestinationConnectionId();
+    low2.retry_source_connection_id = conn.retrySourceConnectionId();
+    low2.initial_max_data = 1024 * 1024;
+    low2.initial_max_stream_data_bidi_remote = 64 * 1024;
+    low2.initial_max_stream_data_uni = 0;
+    low2.initial_max_streams_bidi = 100;
+    low2.initial_max_streams_uni = 100;
+    try conn.applyPeerTransportParameters(low2);
+    try testing.expectError(error.WouldBlock, z.client.sendInput("blocked-body"));
+    // A retry while the preface is staged stays WouldBlock.
+    try testing.expectError(error.WouldBlock, z.client.sendInput("blocked-body"));
+    // Restore: the staged preface retries on the SAME stream; the
+    // body follows exactly once.
+    try conn.applyPeerTransportParameters(high);
+    for (0..8) |i| {
+        try z.client.retryPendingSends();
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+    }
+    try z.client.sendInput("blocked-body");
+    for (0..8) |i| {
+        try z.client.retryPendingSends();
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+    }
+    {
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoBlockedBody;
+        try testing.expectEqual(ipc.Tag.Input, f.tag);
+        try testing.expectEqualStrings("blocked-body", f.payload);
+    }
+    try testing.expect((try dr.next(z.loop.daemon_fd)) == null);
+}
+
+test "client driver r8: permanent receive failure latches with ONE internal_error event" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    // No gateway: the handshake never completes.
+    var gw_sock = try udp.UdpSocket.bind(60600, 60700);
+    defer gw_sock.close();
+    const gw_addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, gw_sock.bound_port);
+
+    const anchor: i64 = 2_000_000;
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, gw_addr, anchor);
+    // Kill the socket: every receive now fails permanently.
+    lib_posix.close(driver.sock.getFd());
+    driver.sock.fd = -1;
+
+    const ev = try driver.pump(anchor + 10);
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .err => |e| {
+            try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), e.code);
+            try testing.expect(e.terminal);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Latched: later pumps attempt no I/O and never repeat the event.
+    try testing.expect((try driver.pump(anchor + 20)) == null);
+    try testing.expect((try driver.pump(anchor + 30)) == null);
+    // Swap in a live fd so deinit's close never double-closes the
+    // dead one (0.16's Threaded close panics on EBADF).
+    const dummy = try udp.UdpSocket.bindEphemeral(lib_posix.AF.INET);
+    driver.sock.fd = dummy.fd;
+    driver.deinit();
+}
+
+test "client driver r8: bounded output queue suspends reception and resumes losslessly" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, loop.gw_addr, lib_posix.nowNs());
+    defer driver.deinit();
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..80) |i| {
+        ack = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        if (ack != null) break;
+    }
+    try testing.expect(ack != null and ack.? == .hello_ack);
+    try driver.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    _ = (try dr.next(loop.daemon_fd)) orelse return error.NoInit;
+
+    // Flood > 64 KiB of daemon output while the caller does NOT
+    // drain: the bounded queue fills, reception suspends, and the
+    // remaining datagrams stay queued — never dropped. A full daemon
+    // socket (the whole pipeline is bounded end to end) simply waits
+    // for pump rounds — that IS the backpressure under test.
+    const frames: usize = 96; // 96 × 1 KiB = 96 KiB > the 64 KiB bound
+    var payload: [1024]u8 = undefined;
+    var seq: usize = 0;
+    var stuck: usize = 0;
+    while (seq < frames) {
+        @memset(&payload, @intCast('A' + (seq % 26)));
+        payload[0] = @intCast(seq % 26);
+        payload[1] = @intCast((seq / 26) % 26);
+        ipc.send(loop.daemon_fd, .Output, &payload) catch |e| switch (e) {
+            error.WouldBlock => {
+                stuck += 1;
+                try testing.expect(stuck < 500);
+                _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(stuck)));
+                continue;
+            },
+            else => return e,
+        };
+        seq += 1;
+        if (seq % 16 == 15) {
+            for (0..2) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        }
+    }
+
+    // Drain everything; the byte count must be exactly frames × 1024
+    // with every sequence marker seen exactly once, in order.
+    var got_total: usize = 0;
+    var expect_seq: usize = 0;
+    var obuf: [4096]u8 = undefined;
+    var rounds: usize = 0;
+    while (got_total < frames * 1024 and rounds < 400) : (rounds += 1) {
+        _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(rounds)));
+        while (try driver.pollOutput(&obuf)) |n| {
+            var off: usize = 0;
+            while (off < n) : (off += 1024) {
+                const marker = @as(usize, obuf[off]) + 26 * @as(usize, obuf[off + 1]);
+                try testing.expectEqual(expect_seq, marker);
+                expect_seq += 1;
+                got_total += 1024;
+            }
+        }
+    }
+    try testing.expectEqual(frames * 1024, got_total);
+}
+
+test "r8: partially-failed construction leaks nothing (ClientSession, QuicSession, Client.connect)" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    // ClientSession.init: the transport (and its allocations) stay
+    // outside the failing allocator so only the session's own
+    // allocation points are exercised.
+    {
+        const transport = try quic_transport.Transport.createClient(alloc, .{
+            .psk = &psk,
+            .scid = .{ 1, 2, 3, 4 },
+            .original_dcid = .{ 9, 9, 9, 9, 9, 9, 9, 9 },
+        });
+        defer transport.destroy();
+        var fail_index: usize = 0;
+        while (fail_index < 16) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+            if (quic_client.ClientSession.init(failing.allocator(), transport)) |s| {
+                var sess = s;
+                sess.deinit();
+                break;
+            } else |e| try testing.expect(error.OutOfMemory == e);
+        }
+    }
+
+    // QuicSession.init: three preallocated buffers → three failure
+    // points, each cleaned by errdefer.
+    {
+        const transport = try quic_transport.Transport.createClient(alloc, .{
+            .psk = &psk,
+            .scid = .{ 5, 6, 7, 8 },
+            .original_dcid = .{ 8, 8, 8, 8, 8, 8, 8, 8 },
+        });
+        defer transport.destroy();
+        var fail_index: usize = 0;
+        while (fail_index < 16) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+            if (quic_session.QuicSession.init(failing.allocator(), transport)) |s| {
+                var sess = s;
+                sess.deinit();
+                break;
+            } else |e| try testing.expect(error.OutOfMemory == e);
+        }
+    }
+
+    // Client.connect: socket + transport + session + parked capacity,
+    // every partial construction fully unwound.
+    {
+        var gw_sock = try udp.UdpSocket.bind(60700, 60800);
+        defer gw_sock.close();
+        const gw_addr = lib_posix.Address.initIp4(.{ 127, 0, 0, 1 }, gw_sock.bound_port);
+        var fail_index: usize = 0;
+        while (fail_index < 24) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+            if (quic_client.Client.connect(failing.allocator(), testing.io, &psk, gw_addr, 1_000_000)) |c| {
+                var driver = c;
+                driver.deinit();
+                break;
+            } else |e| try testing.expect(error.OutOfMemory == e);
+        }
+    }
+}
+
+test "r8: gateway observes the ACTUAL source path and keeps the registered route" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+    try zmq1ToActive(&z, &dr, base);
+
+    // The original route's integrity is proven BEFORE the alt
+    // experiment: stream reassembly would legitimately stall behind
+    // an unvalidated-path frame, so relay one input normally first.
+    try z.client.sendInput("original-path-still-works");
+    for (0..8) |i| {
+        try z.client.retryPendingSends();
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 500 + @as(i64, @intCast(i)));
+    }
+    var saw_orig = false;
+    while (try dr.next(z.loop.daemon_fd)) |f| {
+        if (f.tag == .Input and std.mem.eql(u8, f.payload, "original-path-still-works")) saw_orig = true;
+    }
+    try testing.expect(saw_orig);
+
+    // Take one REAL authenticated client datagram and send it from an
+    // ALTERNATE UDP source: the gateway feeds the kernel-reported
+    // tuple to quicz, which answers with path validation addressed to
+    // the alternate path — the registered route is never silently
+    // rewritten.
+    var alt = try udp.UdpSocket.bindEphemeral(lib_posix.AF.INET);
+    defer alt.close();
+    try z.client.sendInput("from-alt-path");
+    var sent_alt = false;
+    for (0..8) |i| {
+        const now = base + 600 + @as(i64, @intCast(i));
+        const dg = (try z.loop.client.pollOutbound(now)) orelse continue;
+        defer alloc.free(dg);
+        try alt.sendTo(dg, z.loop.gw_addr);
+        sent_alt = true;
+        _ = try z.loop.gw.runOnce(0);
+        // The alternate socket receives the path-validation response.
+        var rbuf: [quic_transport.max_udp_payload]u8 = undefined;
+        const r = alt.recvFrom(&rbuf) catch break;
+        try testing.expect(r.len > 0);
+        break;
+    }
+    try testing.expect(sent_alt);
+
+    // The session survived the unvalidated-path packet: no terminal,
+    // no close — the route was not corrupted by the alternate source.
+    const sess = try z.session();
+    try testing.expect(!sess.closedOrEnding());
+}
+
+test "client driver r8: exact-capacity output with FIN releases the terminal without draining" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, loop.gw_addr, lib_posix.nowNs());
+    defer driver.deinit();
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..80) |i| {
+        ack = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        if (ack != null) break;
+    }
+    try testing.expect(ack != null and ack.? == .hello_ack);
+    try driver.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    _ = (try dr.next(loop.daemon_fd)) orelse return error.NoInit;
+
+    // Exactly 64 KiB of output, then EOF: the queue fills to its bound
+    // at the same moment the FIN is consumed — a FULL queue does not
+    // hold the terminal once the output side is settled.
+    var payload: [1024]u8 = undefined;
+    @memset(&payload, 'E');
+    var stuck: usize = 0;
+    var seq: usize = 0;
+    while (seq < 64) {
+        ipc.send(loop.daemon_fd, .Output, &payload) catch |e| switch (e) {
+            error.WouldBlock => {
+                stuck += 1;
+                try testing.expect(stuck < 500);
+                _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(stuck)));
+                continue;
+            },
+            else => return e,
+        };
+        seq += 1;
+        if (seq % 16 == 15) {
+            for (0..2) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        }
+    }
+    while (try dr.next(loop.daemon_fd)) |_| {}
+    lib_posix.close(loop.daemon_fd);
+    loop.daemon_fd = -1;
+
+    var end_seen = false;
+    for (0..200) |i| {
+        if (try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)))) |e| {
+            if (e == .session_end) end_seen = true;
+        }
+        if (end_seen) break;
+    }
+    try testing.expect(end_seen);
+
+    // The caller drains the full bound afterwards, losslessly.
+    var got: usize = 0;
+    var obuf: [4096]u8 = undefined;
+    var rounds: usize = 0;
+    while (got < 64 * 1024 and rounds < 100) : (rounds += 1) {
+        while (try driver.pollOutput(&obuf)) |n| got += n;
+    }
+    try testing.expectEqual(@as(usize, 64 * 1024), got);
+}
