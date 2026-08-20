@@ -1288,6 +1288,49 @@ synthetic short-form entry parked ahead of the real Handshake). The
 matrix also caught and fixed `controlRx()` never exposing
 `.detaching`. With r8.5, the earlier disclosed items are TESTS, not
 limitations; the r7 client-PTO drop-recovery limitation still stands.
+### r8.6 record (sign-off correction and design record)
+
+The r8.5 audit found three contract gaps (the failure-during-drain
+release bypassed `deliverTerminal()` — an unstable reason slice and,
+on an empty slot, a mismatched `internal_error` code paired with an
+earlier failure's reason; the parked-DETACH proof mutated `.pending`
+by hand instead of exercising real flow control; the gate-skip proof
+omitted the exact `datagrams_received` accounting) plus missing
+durable documentation. Landed: `3381be7` (frozen amendment),
+`39c82d6` (authoritative terminal delivery: `stageTerminal` +
+`deliverTerminal` as the sole event-return path; frozen failure
+precedence — session failure → deferred FINAL ERROR → socket
+`internal_error`; failed-session-without-event as an invariant
+failure; post-delivery socket errors only disable I/O),
+`72e0fcb` (genuine proofs: the DETACH parks under real peer credit
+80/offset-64 injection on attached session fixtures — fixture A
+proves only-`.Init` under low credit without `retryPendingSends`,
+then exactly one `.Detach` and clean completion; fixture B proves
+the pre-flush FIN violation; three terminal-coherence phases through
+the public driver; the gate-skip fixture stages exactly one
+Handshake-kind datagram and one synthetic short), and the
+documentation commit (`docs/quic-wire.md` normative DETACH/terminal-FIN
+sections with amended-v1 status; `docs/quic-client-runtime.md`;
+`docs/decisions/0001-zig-quicz-network-stack.md`; `AGENTS.md`
+corrected to the two pinned dependencies).
+
+One disclosed constraint on the gate-skip accounting: the frozen
+"+2 without another peer round" is physically unreachable in this
+stack — the one-RTT gate opens only on the server Finished, which
+exists only after the gateway sees the client's flight (emitted by
+the very pump under test). The proof therefore asserts the STRONGEST
+true form: the first pump (no peer round) replays the Handshake
+entry (+1, keys installed) and SKIPS the synthetic (junk unchanged,
+still parked); one mandated peer round later, the restart replays
+the synthetic exactly once. Totals: `datagrams_received` +2,
+`junk_received` +1, `parked_len` 0, handshake completes.
+
+The proofs caught and fixed one real defect during the round: the
+drain-release re-polled an empty session slot into a synthetic
+invariant error when the failing event had already been staged —
+the release now delivers the staged failure meta (matched code and
+reason).
+
 
 
 

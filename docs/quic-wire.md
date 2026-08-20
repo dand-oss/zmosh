@@ -174,6 +174,49 @@ attempted, since no send side exists.
 SNAPSHOT_REQUEST before Q4 is answered by a NONTERMINAL
 ERROR(unimplemented): no FIN, the session continues serving.
 
+### DETACH sequencing (normative)
+
+DETACH is a client-only frame carrying no payload. On acceptance —
+the frame was sent whole OR parked whole under flow control; ownership
+of the encoded copy has transferred — the client enters its
+end-of-write state: no further application frame (RESIZE, DETACH,
+SNAPSHOT_REQUEST) and no further input bytes may be sent. The server
+flushes the corresponding daemon-side `.Detach` and then closes the
+control stream with a bare FIN: no final frame accompanies a clean
+detach. That bare FIN is valid ONLY after the client's DETACH bytes
+actually reached the wire — a FIN observed while the client's copy is
+still parked locally (it has not reached QUIC) is a
+`protocol_violation` ("FIN before DETACH flush"), because the FIN
+cannot legitimately precede bytes the client never sent. A peer
+connection close before the promised control FIN during this window
+is likewise a `protocol_violation`. A terminal frame received during
+the window still ends the session through the normal draining
+sequence.
+
+The input stream imposes one ordering rule on DETACH: while the
+client's input-preface send is still staged (blocked under flow
+control), DETACH is refused without side effects — the caller retries
+after the preface flushes. The wire never sees a DETACH interleaved
+with an abandoned input-stream opening.
+
+### Terminal FIN classes (normative)
+
+| Terminal | Control-stream FIN | Notes |
+|---|---|---|
+| SESSION_END (daemon EOF) | yes, with the frame | flags zero; intrinsically terminal |
+| fatal ERROR | yes, with the frame | FINAL flag set |
+| nonterminal ERROR (snapshot response) | no | flags zero; session continues |
+| clean DETACH completion | yes, bare | no final frame |
+
+Any frame after a terminal marker, any FIN before a complete
+preface/frame/output header, and any stream reset are
+`protocol_violation`s. On the receiving side, a terminal frame enters
+the drain state: control FIN validation and output draining continue
+until both streams settle (or the peer closes after everything
+readable was drained). ZMQ1 v1 is AMENDED status: the FINAL flag and
+the DETACH/FIN rules above postdate the original v1 freeze; Q3 has no
+released consumer, so the version number is unchanged.
+
 ## Flow control and backpressure
 
 QUIC flow control (2 KiB initial per-stream credit, 4 MiB connection
