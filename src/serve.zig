@@ -269,24 +269,42 @@ pub const Gateway = struct {
         return @intCast(@min(ms, 1000));
     }
 
-    /// Frame-aware daemon-read eligibility: a bounded read is permitted
-    /// whenever it could discover an unknown header or finish an
-    /// incomplete frame. Reading stops only while the pump is parked on
-    /// a COMPLETE head frame the session cannot consume (its bounded
-    /// relay storage is occupied) or the session is terminal — so a
-    /// blocked output frame can never starve SnapshotBegin or snapshot
-    /// chunks.
-    fn daemonReadEligible(self: *const Gateway) bool {
-        const s = if (self.session) |*sp| sp else return true;
-        if (s.closedOrEnding()) return false;
+    /// The ONE authoritative daemon read-cap calculation: how many
+    /// bytes the next daemon read may admit, clamped by the remaining
+    /// turn budget. Zero means no read. A blocked output frame can
+    /// never starve SnapshotBegin or snapshot chunks (unacceptable
+    /// frames cap reads, they never block the pump).
+    ///   no session          — up to 4096: pre-session traffic is
+    ///                         closed and counted, never relayed;
+    ///   terminal            — zero;
+    ///   incomplete header   — exactly its remaining bytes, so a
+    ///                         coalesced header+payload arrival cannot
+    ///                         admit the payload before the header is
+    ///                         inspectable;
+    ///   unacceptable
+    ///   declared frame      — zero;
+    ///   acceptable
+    ///   incomplete frame    — min(frame remaining, 4096, budget);
+    ///   complete buffered
+    ///   frame               — zero: pumpDaemonFrames owns consumption
+    ///                         of a whole buffered unit.
+    fn daemonReadCap(self: *const Gateway, budget_left: usize) usize {
+        const s = if (self.session) |*sp| sp else return @min(@as(usize, 4096), budget_left);
+        if (s.closedOrEnding()) return 0;
         const bytes = self.unix_read_buf.buf.items[self.unix_read_buf.head..];
-        // Header-aware: once an IPC header (8 bytes) is buffered, the
-        // DECLARED frame's acceptability gates further reads — an
-        // unacceptable frame's payload never enters the buffer. Only
-        // an unreadable header (fewer than 8 bytes) still reads.
-        const total = ipc.expectedLength(bytes) orelse return true;
+        const total = ipc.expectedLength(bytes) orelse
+            return @min(@sizeOf(ipc.Header) - bytes.len, budget_left);
+        if (bytes.len >= total) return 0;
         const hdr = std.mem.bytesToValue(ipc.Header, bytes[0..@sizeOf(ipc.Header)]);
-        return s.canConsumeDaemonFrame(hdr.tag, total - @sizeOf(ipc.Header));
+        if (!s.canConsumeDaemonFrame(hdr.tag, total - @sizeOf(ipc.Header))) return 0;
+        return @min(total - bytes.len, @min(@as(usize, 4096), budget_left));
+    }
+
+    /// Frame-aware daemon-read eligibility: the read cap is non-zero —
+    /// tests and poll arming decide through the same calculation the
+    /// read loop uses.
+    fn daemonReadEligible(self: *const Gateway) bool {
+        return self.daemonReadCap(max_daemon_discard_per_turn) > 0;
     }
 
     /// Processes COMPLETE buffered daemon IPC frames with NO new
@@ -335,21 +353,25 @@ pub const Gateway = struct {
         }
     }
 
-    /// The daemon read path: bounded reads through the bounded reader
-    /// (an oversized DECLARED frame fails closed), re-checking
-    /// frame-aware eligibility before EVERY read, pumping buffered
+    /// The daemon read path: capped reads through the bounded reader
+    /// (an oversized DECLARED frame fails closed), re-deriving the
+    /// frame-aware read cap before EVERY read — a read never admits
+    /// more than the authorized cap, so an unacceptable frame's
+    /// payload cannot ride in behind its header — pumping buffered
     /// frames after each. The session dispatch itself lives in
     /// pumpDaemonFrames. Daemon EOF runs the SESSION_END terminal
     /// sequence when a session exists; the pre-session fallback keeps
     /// the Q2 CONNECTION_CLOSE path (through the shared TurnBudget).
     fn relayDaemon(self: *Gateway, now: i64, budget: *quic_gateway.TurnBudget) !void {
-        // Exact bound: each read is ≤ 4096 B, so the loop stops while
-        // a full read would exceed the turn limit — it is never
-        // overshot.
+        // Exact bound: every read is capped to min(read cap, remaining
+        // turn budget), so the loop consumes the 64 KiB turn limit
+        // exactly — never overshooting, and never stopping early by
+        // pre-reserving a full 4096 B it may not need.
         var read_total: usize = 0;
-        while (read_total + 4096 <= max_daemon_discard_per_turn) {
-            if (!self.daemonReadEligible()) return;
-            const n = self.unix_read_buf.read(self.unix_fd) catch |err| switch (err) {
+        while (read_total < max_daemon_discard_per_turn) {
+            const cap = self.daemonReadCap(max_daemon_discard_per_turn - read_total);
+            if (cap == 0) return;
+            const n = self.unix_read_buf.readAtMost(self.unix_fd, cap) catch |err| switch (err) {
                 error.WouldBlock => return,
                 error.FrameTooLarge => {
                     log.warn("oversized daemon frame rejected at the cap", .{});
@@ -2220,9 +2242,9 @@ test "zmq1 q4: snapshot credit exhaustion parks one unit, buffers the next, reco
     try testing.expect(sess.pending_snapshot.items.len > 0);
     try testing.expect(!sess.snapshot_end_validated);
     {
-        // The buffered head is the parked chunk's own remainder —
-        // possibly PARTIAL: the header-aware gate stops reading an
-        // unacceptable frame's payload mid-frame.
+        // The buffered head is the parked chunk's own leading bytes —
+        // at most its header: the capped read stops an unacceptable
+        // frame at the header boundary, so no payload rides in.
         const rb = z.loop.gw.unix_read_buf;
         const bytes = rb.buf.items[rb.head..];
         const total = ipc.expectedLength(bytes) orelse return error.NoBufferedFrame;
@@ -2627,6 +2649,109 @@ test "zmq1 q4: reads stop at an unacceptable frame header and resume losslessly"
     for (acc.items) |b| {
         try testing.expectEqual(@as(u8, 'R'), b);
     }
+    try testing.expect(!sess.closedOrEnding());
+}
+
+test "zmq1 q4: a coalesced header+payload write never over-reads an unacceptable frame" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+    try zmq1Dance(&z, &dr, base);
+
+    // 1. ACTIVE with a stuffed output backlog.
+    var filler: [32 * 1024]u8 = undefined;
+    @memset(&filler, 'F');
+    try sess.pending_output.appendSlice(alloc, &filler);
+    try sess.pending_output.appendSlice(alloc, &filler);
+    try testing.expectEqual(quic_session.pending_output_cap, sess.pending_output.items.len);
+
+    // 2. Exhaust the server's output-stream credit WITHOUT any client
+    // output read (sessionRound never polls output): rounds pump the
+    // backlog only as the frozen window allows, until the stream state
+    // itself proves send_max_data == send_offset. The backlog may be
+    // fully OR partially drained at that point — the exhaustion, not
+    // the backlog level, is what this step pins. Whatever drained is
+    // re-added in step 3 and must all reach the client eventually.
+    var f_after_exhaust: usize = 0;
+    {
+        var exhausted = false;
+        for (0..100) |i| {
+            _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+            const st = (try sess.transport.connection().streamState(quic_session.output_stream_id)) orelse
+                return error.NoStream3State;
+            const max = st.send_max_data orelse return error.NoSendMaxData;
+            const off = st.send_offset orelse return error.NoSendOffset;
+            if (max == off) {
+                exhausted = true;
+                break;
+            }
+        }
+        try testing.expect(exhausted);
+        f_after_exhaust = sess.pending_output.items.len;
+    }
+
+    // 3. Refill the backlog to capacity; with credit exhausted another
+    // round must not drain a single byte.
+    while (sess.pending_output.items.len < quic_session.pending_output_cap) {
+        const room = quic_session.pending_output_cap - sess.pending_output.items.len;
+        try sess.pending_output.appendSlice(alloc, filler[0..@min(room, filler.len)]);
+    }
+    _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300);
+    try testing.expectEqual(quic_session.pending_output_cap, sess.pending_output.items.len);
+
+    // 4. ONE contiguous write: the Output header declaring 1024 bytes
+    // plus its entire payload in a single syscall — the coalesced
+    // arrival the separate-write proof cannot exercise.
+    const hdr = ipc.Header{ .tag = .Output, .len = 1024 };
+    var coalesced: [@sizeOf(ipc.Header) + 1024]u8 = undefined;
+    @memcpy(coalesced[0..@sizeOf(ipc.Header)], std.mem.asBytes(&hdr));
+    @memset(coalesced[@sizeOf(ipc.Header)..], 'C');
+    _ = try lib_posix.write(z.loop.daemon_fd, &coalesced);
+
+    // 5. One gateway turn. An over-reading gate buffers all 1032 bytes
+    // here; the capped read must buffer EXACTLY the 8-byte header,
+    // keep the gate closed, count nothing, and stay nonterminal.
+    _ = try z.loop.gw.runOnce(0);
+    try testing.expect(!z.loop.gw.daemonReadEligible());
+    {
+        const rb = z.loop.gw.unix_read_buf;
+        try testing.expectEqual(@sizeOf(ipc.Header), rb.buf.items.len - rb.head);
+    }
+    try testing.expectEqual(@as(usize, 0), sess.counters.daemon_output_frames);
+    try testing.expect(!sess.closedOrEnding());
+
+    // 6. Restore credit by draining the client; NO second daemon
+    // write. Every 'F' byte — those the exhaust rounds drained plus
+    // the full refilled backlog — and then exactly 1024 'C' bytes
+    // arrive, in order; the frame counter increments exactly once.
+    const total_f: usize = 64 * 1024 + (64 * 1024 - f_after_exhaust);
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(alloc);
+    var obuf: [16 * 1024]u8 = undefined;
+    for (0..160) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
+        while (try z.client.pollOutput(&obuf, null)) |n| {
+            try acc.appendSlice(alloc, obuf[0..n]);
+        }
+        if (acc.items.len >= total_f + 1024) break;
+    }
+    try testing.expectEqual(total_f + 1024, acc.items.len);
+    try testing.expectEqual(@as(usize, 1), sess.counters.daemon_output_frames);
+    try testing.expectEqual(@as(usize, 0), sess.pending_output.items.len);
+    for (acc.items[0..total_f]) |b| try testing.expectEqual(@as(u8, 'F'), b);
+    for (acc.items[total_f..]) |b| try testing.expectEqual(@as(u8, 'C'), b);
     try testing.expect(!sess.closedOrEnding());
 }
 

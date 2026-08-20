@@ -212,6 +212,16 @@ pub const SocketBuffer = struct {
     /// pending frame's declared length exceeds `max_frame_len` — the
     /// caller fails closed; the buffer state is then poisoned.
     pub fn read(self: *SocketBuffer, fd: i32) !usize {
+        return self.readAtMost(fd, 4096);
+    }
+
+    /// `read` bounded to AT MOST `max_bytes` (1..4096): the reader
+    /// never admits more per call than the caller has authorized, so
+    /// a caller gating on a not-yet-inspectable header can cap the
+    /// read to exactly that header's remaining bytes — a coalesced
+    /// header+payload arrival cannot pull the payload in early.
+    pub fn readAtMost(self: *SocketBuffer, fd: i32, max_bytes: usize) !usize {
+        std.debug.assert(max_bytes >= 1 and max_bytes <= 4096);
         if (self.head > 0) {
             const remaining = self.buf.items.len - self.head;
             if (remaining > 0) {
@@ -224,7 +234,7 @@ pub const SocketBuffer = struct {
         }
 
         var tmp: [4096]u8 = undefined;
-        const n = try lib_posix.read(fd, &tmp);
+        const n = try lib_posix.read(fd, tmp[0..max_bytes]);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
         }
@@ -562,6 +572,51 @@ test "bounded SocketBuffer rejects an oversized declared length before payload a
         }
         try std.testing.expect(rejected);
     }
+}
+
+test "SocketBuffer.readAtMost admits only the authorized bytes of a coalesced frame" {
+    const alloc = std.testing.allocator;
+    const fds = try lib_posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer lib_posix.close(fds[0]);
+    defer lib_posix.close(fds[1]);
+
+    var sb = try SocketBuffer.initBounded(alloc, gateway_frame_cap);
+    defer sb.deinit();
+
+    // One contiguous header + 16-byte payload preloaded in the pipe —
+    // the coalesced arrival shape.
+    try send(fds[1], .Output, "0123456789abcdef");
+
+    // Capped at the header: exactly its 8 bytes enter the buffer, the
+    // payload stays in the pipe, and the frame is correctly incomplete.
+    {
+        const n = try sb.readAtMost(fds[0], @sizeOf(Header));
+        try std.testing.expectEqual(@sizeOf(Header), n);
+        try std.testing.expectEqual(@sizeOf(Header), sb.buf.items.len);
+        try std.testing.expect(sb.next() == null);
+    }
+    // A one-byte cap stays binding mid-payload.
+    {
+        const n = try sb.readAtMost(fds[0], 1);
+        try std.testing.expectEqual(@as(usize, 1), n);
+        try std.testing.expectEqual(@sizeOf(Header) + 1, sb.buf.items.len);
+    }
+    // The remainder recovers exactly: the frame completes losslessly
+    // through further capped reads.
+    var msg: ?SocketMsg = null;
+    while (true) {
+        if (sb.next()) |m| {
+            msg = m;
+            break;
+        }
+        _ = sb.readAtMost(fds[0], 4096) catch |e| switch (e) {
+            error.WouldBlock => return error.PayloadLost,
+            else => return e,
+        };
+    }
+    const m = msg.?;
+    try std.testing.expectEqual(Tag.Output, m.header.tag);
+    try std.testing.expectEqualStrings("0123456789abcdef", m.payload);
 }
 
 pub fn roundTripForTag(
