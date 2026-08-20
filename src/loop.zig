@@ -1101,9 +1101,13 @@ pub const Daemon = struct {
         }
     }
 
-    /// Leader-only PTY + Ghostty resize shared by `.Init` and
+    /// Leader-only Ghostty + PTY resize shared by `.Init` and
     /// `.InitSnapshot` (Q4 factored the mechanics; both callers keep
-    /// their own replay/leadership ordering).
+    /// their own replay/leadership ordering). The fallible Ghostty
+    /// resize runs BEFORE TIOCSWINSZ: on failure neither geometry has
+    /// changed, so a contained resize failure can never leave the PTY
+    /// and the terminal at different sizes. The ioctl itself stays
+    /// best-effort with its result ignored, as it always was.
     fn applyLeaderResize(
         self: *Daemon,
         gpa: std.mem.Allocator,
@@ -1113,13 +1117,6 @@ pub const Daemon = struct {
     ) !void {
         _ = self;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = resize.xpixel,
-            .ws_ypixel = resize.ypixel,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
         // Disable prompt_redraw before resize. The daemon's internal terminal
         // would otherwise clear prompt lines expecting the shell to redraw them,
         // but the shell's redraw goes to the PTY (forwarded to clients), not to
@@ -1132,6 +1129,13 @@ pub const Daemon = struct {
             .rows = resize.rows,
         };
         try term.resize(gpa, opts);
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = resize.rows,
+            .ws_col = resize.cols,
+            .ws_xpixel = resize.xpixel,
+            .ws_ypixel = resize.ypixel,
+        };
+        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
         std.log.debug("leader resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1185,14 +1189,18 @@ pub const Daemon = struct {
         }
 
         // The size travels in this payload, so leadership is established
-        // directly (no .Resize ask-back), then the resize applies. A
-        // resize failure is snapshot-local: code 5 through the normal
-        // rollback, never an unwind.
-        if (self.leader_client_fd != client.socket_fd) {
+        // directly (no .Resize ask-back), then the resize applies. The
+        // previous leader is preserved and restored if the resize fails:
+        // a failed attach never steals the session. The resize failure
+        // itself is snapshot-local: code 5 through the normal rollback,
+        // never an unwind.
+        const prev_leader = self.leader_client_fd;
+        if (prev_leader != client.socket_fd) {
             std.log.info("setting snapshot leader client_fd={d}", .{client.socket_fd});
             self.leader_client_fd = client.socket_fd;
         }
         self.applyLeaderResize(gpa, pty_fd, term, payload) catch |e| {
+            self.leader_client_fd = prev_leader;
             self.rollbackSnapshot(client, mark, ipc.snapshot_error_out_of_memory, @errorName(e));
             return false;
         };
@@ -2298,6 +2306,7 @@ test "snapshot reservation failure closes only the requester; daemon and peers s
     // reservation is the first allocation, so fail_index 0 reaches it.
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     const payload = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100, .xpixel = 0, .ypixel = 0 });
+    const a_fd = a.socket_fd; // closeClient frees `a` below; read it now
     const close = daemon.handleInitSnapshot(failing.allocator(), a, -1, &term, &vts, payload);
     try std.testing.expect(close);
     try std.testing.expectEqual(@as(usize, 0), a.write_buf.items.len);
@@ -2305,10 +2314,11 @@ test "snapshot reservation failure closes only the requester; daemon and peers s
 
     // The daemon lives, the peer is intact, and the peer can still run
     // its own successful snapshot transaction on the same terminal.
+    // Nothing below may touch `a` — closeClient destroyed it.
     try std.testing.expect(daemon.running);
     try std.testing.expectEqual(@as(usize, 1), daemon.clients.items.len);
     try std.testing.expect(daemon.clients.items[0] == b);
-    try std.testing.expect(daemon.leader_client_fd == null or daemon.leader_client_fd != a.socket_fd);
+    try std.testing.expect(daemon.leader_client_fd == null or daemon.leader_client_fd != a_fd);
     try std.testing.expectEqual(false, daemon.handleInitSnapshot(alloc, b, -1, &term, &vts, payload));
     const frames = try collectFrames(alloc, b.write_buf.items);
     defer alloc.free(frames);
@@ -2400,7 +2410,7 @@ test "handleInitSnapshot rejects zero dimensions before leadership" {
     try std.testing.expectEqual(@as(@TypeOf(term.rows), 24), term.rows);
 }
 
-test "handleInitSnapshot resize failure rolls back to code 5 without unwinding" {
+test "handleInitSnapshot resize failure is atomic across PTY, terminal, and leadership" {
     const alloc = std.testing.allocator;
     var daemon = snapshotTestDaemon();
     daemon.has_pty_output = true;
@@ -2414,28 +2424,64 @@ test "handleInitSnapshot resize failure rolls back to code 5 without unwinding" 
         .continuation_max_bytes = Daemon.snapshot_continuation_max,
     });
     defer vts.deinit();
-    // Enough scrollback that the 24x80 -> 30x100 reflow must allocate.
-    var n: usize = 0;
-    while (n < 60) : (n += 1) {
-        vts.nextSlice("resize failure probe line\r\n");
+
+    // A real PTY sized 24x80, as daemonLoop's sessions are: the failure
+    // must leave BOTH geometries untouched, which only a genuine pty fd
+    // can prove.
+    var pty_master: c_int = -1;
+    var pty_slave: c_int = -1;
+    const initial: cross.c.struct_winsize = .{
+        .ws_row = 24,
+        .ws_col = 80,
+        .ws_xpixel = 0,
+        .ws_ypixel = 0,
+    };
+    if (cross.c.openpty(&pty_master, &pty_slave, null, null, &initial) != 0) {
+        return error.TestUnexpectedResult;
     }
+    defer lib_posix.close(pty_master);
+    defer lib_posix.close(pty_slave);
 
-    // fail_index 1: the reservation succeeds, the next allocation — the
-    // resize reflow to a new geometry — fails.
+    // A prior leader owns the session; the failed attach must hand the
+    // session back rather than keep stolen leadership.
+    daemon.leader_client_fd = 4242;
+
+    // cols 513 crosses the pinned Ghostty Tabstops' 512 prealloc
+    // columns, so Terminal.resize allocates (the dynamic tabstop
+    // segment) as its FIRST fallible step — before any terminal state
+    // changes. Reservation is allocation 0, so fail_index 1 fails
+    // inside the resize, deterministically.
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
-    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100, .xpixel = 0, .ypixel = 0 });
-    try std.testing.expectEqual(false, daemon.handleInitSnapshot(failing.allocator(), &client, -1, &term, &vts, payload));
+    const payload = std.mem.asBytes(&ipc.Resize{ .rows = 24, .cols = 513, .xpixel = 0, .ypixel = 0 });
+    try std.testing.expectEqual(false, daemon.handleInitSnapshot(failing.allocator(), &client, pty_master, &term, &vts, payload));
+    try std.testing.expect(failing.has_induced_failure);
 
+    // Containment: exactly one SnapshotError(5), no Begin/Chunk/End
+    // residue, no close signal (the expectEqual above), no unwind.
     const frames = try collectFrames(alloc, client.write_buf.items);
     defer alloc.free(frames);
     try std.testing.expectEqual(@as(usize, 1), frames.len);
     try std.testing.expectEqual(ipc.Tag.SnapshotError, frames[0].tag);
     const ew = try ipc.parseSnapshotErrorPayload(frames[0].payload);
     try std.testing.expectEqual(ipc.snapshot_error_out_of_memory, ew.code);
-    // Note: whether the first post-reservation allocation lands in the
-    // resize reflow or the encoder is Ghostty-internal; both orders
-    // produce the same containment (code 5, no unwind, no close signal,
-    // queue restored to its pre-transaction length).
+
+    // Atomicity: the Ghostty terminal never left 24x80...
+    try std.testing.expectEqual(@as(@TypeOf(term.cols), 80), term.cols);
+    try std.testing.expectEqual(@as(@TypeOf(term.rows), 24), term.rows);
+    // ...and because the fallible resize runs before TIOCSWINSZ, the
+    // failed attempt never reached the PTY either.
+    var now: cross.c.struct_winsize = undefined;
+    if (cross.c.ioctl(pty_master, cross.c.TIOCGWINSZ, &now) != 0) {
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(c_ushort, 24), now.ws_row);
+    try std.testing.expectEqual(@as(c_ushort, 80), now.ws_col);
+
+    // Leadership restored to the prior owner; the terminal-client flags
+    // were never committed.
+    try std.testing.expectEqual(@as(?i32, 4242), daemon.leader_client_fd);
+    try std.testing.expect(!daemon.has_had_client);
+    try std.testing.expect(!daemon.has_terminal_client);
 }
 
 test "handleInit reattach emits legacy replay before the resize ask-back" {
