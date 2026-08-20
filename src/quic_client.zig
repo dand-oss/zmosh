@@ -6,13 +6,24 @@
 //!
 //! Ordering contract: ONLY the control stream (preface + HELLO) is
 //! sent first; after HELLO_ACK validates, RESIZE is the first control
-//! frame; input flows after it. Every malformed receive condition is
-//! converted by ONE helper (`failControl`) into a queued
-//! `.err(protocol_violation)` event plus an application close — the
-//! event lives in the one-event slot and survives a following
-//! CONNECTION_CLOSE. Every control write is ONE all-or-nothing send
-//! of an encoded copy; a second write while one is parked is
-//! `error.ControlWritePending`.
+//! frame; input flows after it.
+//!
+//! State model: one hierarchical protocol FSM. The top-level state is
+//! the application lifecycle; each live variant embeds ONLY the
+//! stream substates possible there, so invalid combinations (output
+//! readable before authorization, input before the first RESIZE, a
+//! parked first RESIZE without its transition metadata) are
+//! unrepresentable. QUIC streams advance independently, so the
+//! substates are separate small unions rather than one flat
+//! cross-product. Every top-level transition goes through exactly one
+//! of five helpers — nothing else assigns `state`.
+//!
+//! Events: every event is STORED in the one-event slot and delivered
+//! exactly once through `takeEvent`; the reason slice stays valid in
+//! the fixed buffer until the next event is produced. Every control
+//! write is ONE all-or-nothing send of an encoded copy; a blocked
+//! send parks the copy and SUCCEEDS (ownership transferred), and a
+//! second write while one is parked is `error.ControlWritePending`.
 
 const std = @import("std");
 const quic_wire = @import("quic_wire.zig");
@@ -31,29 +42,129 @@ pub const client_max_frame = quic_wire.preface_len +
 pub const ControlEvent = union(enum) {
     hello_ack: quic_wire.Hello,
     session_end,
-    err: struct { code: u32, reason: []const u8 },
+    /// `terminal` is true for a FINAL ERROR (fatal, control FIN to
+    /// follow) and false for a nonterminal response (flags zero, the
+    /// session continues). Locally generated failures are terminal.
+    err: struct { code: u32, reason: []const u8, terminal: bool },
 };
 
-pub const ClientPhase = enum {
-    /// HELLO sent (or parked); awaiting HELLO_ACK. Output bytes stay
-    /// parked (unconsumed, credit withheld).
-    awaiting_ack,
-    /// HELLO_ACK validated; the first RESIZE must still be accepted.
-    /// Input API calls are rejected here.
-    awaiting_first_resize,
+// -- typed stream substates --------------------------------------------------
+
+/// The client's control-send side: idle, one parked whole frame
+/// (ownership transferred at park time), or closed.
+pub const ControlTx = union(enum) {
+    idle,
+    pending: struct {
+        kind: PendingKind,
+        len: usize,
+        bytes: [client_max_frame]u8,
+    },
+    closed,
+};
+
+pub const PendingKind = enum { hello, first_resize, ordinary };
+
+/// The client's input-send side. `preface_pending` holds the staged
+/// preface; the body bytes remain caller-owned.
+pub const InputTx = union(enum) {
+    unopened,
+    preface_pending: [quic_wire.preface_len]u8,
+    open,
+    closed,
+};
+
+/// The control-receive side. A clean FIN is legal only from
+/// `terminal_wait_fin` (after a terminal SESSION_END or FINAL ERROR).
+pub const ControlRx = enum {
+    preface,
+    frames,
+    terminal_wait_fin,
+    finished,
+    reset,
+};
+
+/// The output-receive side: unauthorized until HELLO_ACK, then header
+/// → body, finishing at a clean FIN. `unavailable_after_close` marks
+/// an output FIN the peer close made unreachable (queued output still
+/// drains).
+pub const OutputRx = union(enum) {
+    unauthorized,
+    header,
+    body: struct { epoch: u64 },
+    finished: struct { epoch: u64 },
+    reset,
+    unavailable_after_close,
+};
+
+/// Which terminal frame began the drain (evidence for the deferred
+/// event and the FIN contract). `detach_fin` is the clean-detach arm:
+/// the server's bare FIN (no final frame) completes a client DETACH.
+pub const TerminalMeta = struct {
+    kind: enum { session_end, err, detach_fin },
+    code: u32,
+};
+
+pub const CloseKind = enum { application, transport };
+
+/// The top-level application protocol FSM.
+pub const ProtocolState = union(enum) {
+    /// HELLO sent or parked; control receive active; output
+    /// unauthorized; no input.
+    awaiting_ack: struct {
+        control_tx: ControlTx = .idle,
+        control_rx: ControlRx = .preface,
+    },
+    /// HELLO_ACK validated; the first RESIZE is idle or parked;
+    /// output authorized; input still rejected.
+    awaiting_first_resize: struct {
+        control_tx: ControlTx,
+        control_rx: ControlRx,
+        output_rx: OutputRx,
+    },
     /// The first RESIZE was accepted in full; input may flow.
-    active,
-    /// Terminal: local failure, server terminal frame, or closure.
-    ended,
+    active: struct {
+        control_tx: ControlTx,
+        control_rx: ControlRx,
+        input_tx: InputTx = .unopened,
+        output_rx: OutputRx,
+        /// A DETACH was accepted (sent or parked): the server's bare
+        /// control FIN completes the session cleanly.
+        detach_sent: bool = false,
+    },
+    /// A terminal marker was received after authorization: no new
+    /// sends; control FIN validation and output draining continue.
+    /// `peer` records a later peer close WITHOUT discarding the
+    /// stream evidence still needed to judge the FIN contract.
+    draining: struct {
+        peer: enum { open, closed } = .open,
+        control_rx: ControlRx,
+        output_rx: OutputRx,
+        terminal: TerminalMeta,
+    },
+    /// One local/protocol failure recorded; application close
+    /// initiated.
+    failed: struct { code: u32 },
+    /// Peer connection close recorded outside draining (or after
+    /// terminal delivery completed); no further transport operations.
+    closed: CloseKind,
 };
 
-pub const InputState = enum { closed, opening, open };
+pub const StateTag = enum {
+    awaiting_ack,
+    awaiting_first_resize,
+    active,
+    draining,
+    failed,
+    closed,
+};
 
 pub const ClientSession = struct {
     alloc: std.mem.Allocator,
     transport: *quic_transport.Transport,
-    phase: ClientPhase = .awaiting_ack,
+    state: ProtocolState = .{ .awaiting_ack = .{} },
 
+    // Stable parser/storage members — variants carry only semantic
+    // state and owned fixed-size pending data.
     control_preface: quic_wire.PrefaceParser = .{},
     control: quic_wire.ControlParser,
     /// Control bytes read but not yet parsed — PREALLOCATED to its
@@ -67,29 +178,15 @@ pub const ClientSession = struct {
     /// The one-event slot: holds at most one event; consumed when
     /// returned. A stored event survives a following CONNECTION_CLOSE.
     pending_event: ?ControlEvent = null,
-    connection_closed: bool = false,
 
-    /// One parked, fully encoded control frame awaiting credit
-    /// (atomic retry through `retryPendingSends`).
-    control_pending: [client_max_frame]u8 = undefined,
-    control_pending_len: usize = 0,
-    /// Set when the parked frame is the first (preface + HELLO).
-    control_pending_is_hello: bool = false,
-
-    input_state: InputState = .closed,
-    /// The input stream's preface when its send blocked: retried by
-    /// `retryPendingSends`; `openUniStream` is never called twice.
-    input_pending_preface: [quic_wire.preface_len]u8 = undefined,
-    input_preface_pending: bool = false,
-
-    output_preface: quic_wire.OutputHeaderParser = .{},
-    output_epoch: u64 = 0,
+    output_hdr: quic_wire.OutputHeaderParser = .{},
 
     /// Constructs and sends preface + HELLO as ONE atomic frame
-    /// (parked if credit is withheld — nothing else is ever sent
-    /// first).
+    /// (parked whole if credit is withheld — nothing else is ever
+    /// sent first).
     pub fn init(alloc: std.mem.Allocator, transport: *quic_transport.Transport) !ClientSession {
         var s = try ClientSession.initSilentPreallocated(alloc, transport);
+        errdefer s.deinit();
         const id = try transport.connection().openStream();
         if (id != control_stream_id) return error.UnexpectedControlStreamId;
         var frame: [client_max_frame]u8 = undefined;
@@ -97,14 +194,14 @@ pub const ClientSession = struct {
         quic_wire.writePreface(frame[flen..][0..quic_wire.preface_len], .control);
         flen += quic_wire.preface_len;
         var hdr: [quic_wire.control_header_len]u8 = undefined;
-        quic_wire.writeControlHeader(&hdr, .hello, quic_wire.hello_payload_len);
+        quic_wire.writeControlHeader(&hdr, .hello, quic_wire.hello_payload_len, 0);
         @memcpy(frame[flen..][0..quic_wire.control_header_len], &hdr);
         flen += quic_wire.control_header_len;
         var hello: [quic_wire.hello_payload_len]u8 = undefined;
         quic_wire.Hello.serverV1(quic_wire.mode_attach).encode(&hello);
         @memcpy(frame[flen..][0..quic_wire.hello_payload_len], &hello);
         flen += quic_wire.hello_payload_len;
-        try s.sendFrameAtomic(frame[0..flen], true);
+        try s.sendFrameAtomic(.hello, frame[0..flen]);
         return s;
     }
 
@@ -116,6 +213,7 @@ pub const ClientSession = struct {
 
     fn initSilentPreallocated(alloc: std.mem.Allocator, transport: *quic_transport.Transport) !ClientSession {
         var stash: std.ArrayList(u8) = .empty;
+        errdefer stash.deinit(alloc);
         try stash.ensureTotalCapacity(alloc, client_stash_cap);
         return .{
             .alloc = alloc,
@@ -131,110 +229,330 @@ pub const ClientSession = struct {
     }
 
     pub fn ended(self: *const ClientSession) bool {
-        return self.phase == .ended;
-    }
-
-    pub fn connectionClosed(self: *const ClientSession) bool {
-        return self.connection_closed;
-    }
-
-    // -- the one failure path ---------------------------------------------
-
-    /// Every malformed receive condition funnels here: the event is
-    /// STORED (it survives a following CONNECTION_CLOSE) and the
-    /// connection closes with the same application code.
-    fn failControl(self: *ClientSession, code: quic_wire.ErrCode, reason: []const u8) !?ControlEvent {
-        if (self.pending_event == null) {
-            const rlen = @min(reason.len, self.err_buf.len);
-            @memcpy(self.err_buf[0..rlen], reason[0..rlen]);
-            self.err_len = rlen;
-            self.pending_event = .{ .err = .{ .code = code.code(), .reason = self.err_buf[0..rlen] } };
-        }
-        self.phase = .ended;
-        self.transport.shutdown(code.code(), reason) catch {};
-        return self.pending_event;
-    }
-
-    // -- atomic control writes --------------------------------------------
-
-    /// Sends one fully encoded frame in a single all-or-nothing
-    /// sendOnStream. On FlowControlBlocked the frame stays parked
-    /// (nothing partially transmitted, nothing reordered past it).
-    fn sendFrameAtomic(self: *ClientSession, frame: []const u8, is_hello: bool) !void {
-        if (self.control_pending_len != 0) return error.ControlWritePending;
-        self.transport.connection().sendOnStream(control_stream_id, frame, false) catch |e| switch (e) {
-            error.FlowControlBlocked => {
-                @memcpy(self.control_pending[0..frame.len], frame);
-                self.control_pending_len = frame.len;
-                self.control_pending_is_hello = is_hello;
-                return error.WouldBlock;
-            },
-            error.StreamClosed => {
-                self.phase = .ended;
-                return;
-            },
-            else => return e,
+        return switch (self.state) {
+            .draining, .failed, .closed => true,
+            else => false,
         };
     }
 
-    /// Retries the parked frame and the parked input preface. A
-    /// successful first RESIZE here completes the phase transition;
-    /// retrying can never duplicate bytes or open a second stream.
+    pub fn connectionClosed(self: *const ClientSession) bool {
+        return switch (self.state) {
+            .closed => true,
+            .draining => |d| d.peer == .closed,
+            else => false,
+        };
+    }
+
+    /// The live top-level state tag (transition-test assertions).
+    pub fn stateTag(self: *const ClientSession) StateTag {
+        return switch (self.state) {
+            .awaiting_ack => .awaiting_ack,
+            .awaiting_first_resize => .awaiting_first_resize,
+            .active => .active,
+            .draining => .draining,
+            .failed => .failed,
+            .closed => .closed,
+        };
+    }
+
+    // -- the five transition helpers (nothing else assigns state) ----------
+
+    /// Valid HELLO_ACK: awaiting_ack → awaiting_first_resize; output
+    /// becomes authorized (header phase).
+    fn acceptHelloAck(self: *ClientSession) void {
+        const a = switch (self.state) {
+            .awaiting_ack => |a| a,
+            else => return,
+        };
+        self.state = .{
+            .awaiting_first_resize = .{
+                .control_tx = a.control_tx,
+                // The control preface is necessarily validated by now.
+                .control_rx = .frames,
+                .output_rx = .header,
+            },
+        };
+    }
+
+    /// The first RESIZE was accepted in full (immediately or by
+    /// retry): awaiting_first_resize → active, exactly once.
+    fn acceptFirstResize(self: *ClientSession) void {
+        const a = switch (self.state) {
+            .awaiting_first_resize => |a| a,
+            else => return,
+        };
+        self.state = .{ .active = .{
+            .control_tx = .idle,
+            .control_rx = a.control_rx,
+            .input_tx = .unopened,
+            .output_rx = a.output_rx,
+        } };
+    }
+
+    /// A terminal SESSION_END or FINAL ERROR after authorization: the
+    /// live state enters draining, keeps its output evidence, and
+    /// stops all new sends.
+    fn beginDrain(self: *ClientSession, meta: TerminalMeta) void {
+        const output_rx = switch (self.state) {
+            .awaiting_first_resize => |a| a.output_rx,
+            .active => |a| a.output_rx,
+            else => return,
+        };
+        self.state = .{ .draining = .{
+            .control_rx = .terminal_wait_fin,
+            .output_rx = output_rx,
+            .terminal = meta,
+        } };
+    }
+
+    /// One local/protocol failure: the event is STORED (it survives a
+    /// following CONNECTION_CLOSE) and the connection closes with the
+    /// same application code. A second failure never replaces the
+    /// first.
+    fn failProtocol(self: *ClientSession, code: quic_wire.ErrCode, reason: []const u8) void {
+        if (self.state == .failed) return;
+        if (self.pending_event == null) {
+            self.storeErrorEvent(code, reason, true);
+        }
+        self.state = .{ .failed = .{ .code = code.code() } };
+        self.transport.shutdown(code.code(), reason) catch {};
+    }
+
+    /// A wire terminal frame received before authorization (the
+    /// HELLO-rejection arm): surfaced IMMEDIATELY with the wire's own
+    /// code — no drain contract exists yet — and the session fails
+    /// closed.
+    fn failBeforeAuthorization(self: *ClientSession, code: u32, reason: []const u8) void {
+        if (self.state == .failed) return;
+        if (self.pending_event == null) {
+            self.storeErrorEventCode(code, reason, true);
+        }
+        self.state = .{ .failed = .{ .code = code } };
+        self.transport.shutdown(code, reason) catch {};
+    }
+
+    /// A peer connection close. Outside draining this is the clean
+    /// top-level `.closed`. INSIDE draining it flips only
+    /// `draining.peer` and preserves the stream evidence: a missing
+    /// control FIN is a protocol violation (the terminal frame
+    /// promised one), and an output FIN the close made unreachable
+    /// degrades to `.unavailable_after_close` so the queued output
+    /// still drains.
+    fn recordPeerClose(self: *ClientSession, kind: CloseKind) void {
+        switch (self.state) {
+            .draining => {
+                self.state.draining.peer = .closed;
+                if (self.state.draining.control_rx == .terminal_wait_fin) {
+                    self.failProtocol(.protocol_violation, "peer closed without control FIN");
+                } else if (self.state.draining.control_rx == .finished) {
+                    switch (self.state.draining.output_rx) {
+                        .body => self.state.draining.output_rx = .unavailable_after_close,
+                        else => {},
+                    }
+                }
+            },
+            .failed, .closed => {},
+            else => self.state = .{ .closed = kind },
+        }
+    }
+
+    /// Classifies an observed close from the transport and records it.
+    fn recordPeerCloseFromTransport(self: *ClientSession) void {
+        if (self.transport.connection().peerClose()) |pc| {
+            self.recordPeerClose(switch (pc) {
+                .application => .application,
+                .connection => .transport,
+            });
+        }
+        // No close frame observed (e.g. our own close racing): no
+        // transition.
+    }
+
+    // -- the one event slot -------------------------------------------------
+
+    fn storeErrorEventCode(self: *ClientSession, code: u32, reason: []const u8, terminal: bool) void {
+        const rlen = @min(reason.len, self.err_buf.len);
+        @memcpy(self.err_buf[0..rlen], reason[0..rlen]);
+        self.err_len = rlen;
+        self.pending_event = .{ .err = .{
+            .code = code,
+            .reason = self.err_buf[0..rlen],
+            .terminal = terminal,
+        } };
+    }
+
+    fn storeErrorEvent(self: *ClientSession, code: quic_wire.ErrCode, reason: []const u8, terminal: bool) void {
+        self.storeErrorEventCode(code.code(), reason, terminal);
+    }
+
+    /// THE delivery point: every event is returned exactly once and
+    /// the slot cleared atomically with the return.
+    fn takeEvent(self: *ClientSession) ?ControlEvent {
+        const e = self.pending_event orelse return null;
+        self.pending_event = null;
+        return e;
+    }
+
+    /// A local failure surfaced exactly like a wire one: stores the
+    /// terminal event and hands it over once.
+    pub fn failLocal(self: *ClientSession, code: quic_wire.ErrCode, reason: []const u8) ?ControlEvent {
+        self.failProtocol(code, reason);
+        return self.takeEvent();
+    }
+
+    // -- substate accessors --------------------------------------------------
+
+    fn controlTx(self: *ClientSession) ?*ControlTx {
+        return switch (self.state) {
+            .awaiting_ack => |*a| &a.control_tx,
+            .awaiting_first_resize => |*a| &a.control_tx,
+            .active => |*a| &a.control_tx,
+            else => null,
+        };
+    }
+
+    fn inputTx(self: *ClientSession) ?*InputTx {
+        return switch (self.state) {
+            .active => |*a| &a.input_tx,
+            else => null,
+        };
+    }
+
+    fn controlRx(self: *ClientSession) ?*ControlRx {
+        return switch (self.state) {
+            .awaiting_ack => |*a| &a.control_rx,
+            .awaiting_first_resize => |*a| &a.control_rx,
+            .active => |*a| &a.control_rx,
+            .draining => |*d| &d.control_rx,
+            else => null,
+        };
+    }
+
+    fn outputRx(self: *ClientSession) ?*OutputRx {
+        return switch (self.state) {
+            .awaiting_first_resize => |*a| &a.output_rx,
+            .active => |*a| &a.output_rx,
+            .draining => |*d| &d.output_rx,
+            else => null,
+        };
+    }
+
+    // -- atomic control writes ---------------------------------------------
+
+    /// Sends one fully encoded frame in a single all-or-nothing
+    /// sendOnStream. On FlowControlBlocked the COMPLETE frame is
+    /// copied into the pending slot and the call SUCCEEDS — ownership
+    /// transferred, nothing partially transmitted, nothing reordered
+    /// past it. Stream or connection closure FAILS: an ended session
+    /// never counts an unaccepted frame as sent.
+    fn sendFrameAtomic(self: *ClientSession, kind: PendingKind, frame: []const u8) !void {
+        const tx = self.controlTx() orelse return error.NotActive;
+        switch (tx.*) {
+            .pending => return error.ControlWritePending,
+            .closed => return error.StreamClosed,
+            .idle => {},
+        }
+        if (self.transport.connection().sendOnStream(control_stream_id, frame, false)) {
+            tx.* = .idle;
+            if (kind == .first_resize) self.acceptFirstResize();
+        } else |e| switch (e) {
+            error.FlowControlBlocked => {
+                var bytes: [client_max_frame]u8 = undefined;
+                @memcpy(bytes[0..frame.len], frame);
+                tx.* = .{ .pending = .{ .kind = kind, .len = frame.len, .bytes = bytes } };
+            },
+            error.StreamClosed => {
+                tx.* = .closed;
+                return error.StreamClosed;
+            },
+            error.ConnectionClosed => {
+                self.recordPeerCloseFromTransport();
+                return error.ConnectionClosed;
+            },
+            else => return e,
+        }
+    }
+
+    /// Retries the parked control frame and the parked input
+    /// preface. A successful first-RESIZE retry activates the session
+    /// exactly once; a retry can never duplicate bytes or open a
+    /// second stream.
     pub fn retryPendingSends(self: *ClientSession) !void {
-        if (self.control_pending_len != 0) {
-            const frame = self.control_pending[0..self.control_pending_len];
-            const is_hello = self.control_pending_is_hello;
-            self.control_pending_len = 0;
-            self.transport.connection().sendOnStream(control_stream_id, frame, false) catch |e| switch (e) {
-                error.FlowControlBlocked => {
-                    self.control_pending_len = frame.len;
-                    self.control_pending_is_hello = is_hello;
-                },
-                error.StreamClosed => self.phase = .ended,
-                else => return e,
-            };
-        }
-        if (self.input_preface_pending) {
-            self.transport.connection().sendOnStream(input_stream_id, &self.input_pending_preface, false) catch |e| switch (e) {
-                error.FlowControlBlocked => return,
-                error.StreamClosed => self.phase = .ended,
-                else => return e,
-            };
-            self.input_preface_pending = false;
-            self.input_state = .open;
-        }
+        if (self.controlTx()) |tx| switch (tx.*) {
+            .pending => |p| {
+                if (self.transport.connection().sendOnStream(control_stream_id, p.bytes[0..p.len], false)) {
+                    tx.* = .idle;
+                    if (p.kind == .first_resize) self.acceptFirstResize();
+                } else |e| switch (e) {
+                    error.FlowControlBlocked => return, // stays parked, whole
+                    error.StreamClosed => {
+                        tx.* = .closed;
+                        self.failProtocol(.protocol_violation, "control stream reset");
+                    },
+                    error.ConnectionClosed => self.recordPeerCloseFromTransport(),
+                    else => return e,
+                }
+            },
+            else => {},
+        };
+        if (self.inputTx()) |t| switch (t.*) {
+            .preface_pending => |pre| {
+                if (self.transport.connection().sendOnStream(input_stream_id, &pre, false)) {
+                    t.* = .open;
+                } else |e| switch (e) {
+                    error.FlowControlBlocked => return, // stays staged
+                    error.StreamClosed => t.* = .closed,
+                    error.ConnectionClosed => self.recordPeerCloseFromTransport(),
+                    else => return e,
+                }
+            },
+            else => {},
+        };
     }
 
     // -- control stream (client receive side) ------------------------------
 
-    /// Pumps the control stream. Returns the stored event first
-    /// (consuming the slot); parses at most the bounded stash per
-    /// call. Malformed anything → failControl; ConnectionClosed sets
-    /// explicit state rather than vanishing.
+    /// Pumps the control stream. Delivers the stored event first
+    /// (exactly once), reads one bounded stash, then parses. Every
+    /// malformed condition funnels into `failProtocol`; a peer close
+    /// is recorded distinctly and never masquerades as a protocol
+    /// failure.
     pub fn pollControl(self: *ClientSession) !?ControlEvent {
-        if (self.pending_event) |e| {
-            self.pending_event = null;
-            return e;
+        if (self.takeEvent()) |e| return e;
+        switch (self.state) {
+            .awaiting_ack, .awaiting_first_resize, .active, .draining => {},
+            .failed, .closed => return null,
         }
-        if (self.phase == .ended) return null;
 
         if (self.control_stash.items.len == 0) {
             var rbuf: [client_stash_cap]u8 = undefined;
-            const n = self.transport.connection().recvOnStream(control_stream_id, &rbuf) catch |e| switch (e) {
+            const got = self.transport.connection().recvOnStream(control_stream_id, &rbuf) catch |e| switch (e) {
+                // RST_STREAM / STOP_SENDING: the stream was reset.
                 error.StreamClosed => {
-                    self.phase = .ended;
-                    return null;
+                    if (self.controlRx()) |crx| crx.* = .reset;
+                    self.failProtocol(.protocol_violation, "control stream reset");
+                    return self.takeEvent();
                 },
                 error.ConnectionClosed => {
-                    self.connection_closed = true;
-                    self.phase = .ended;
+                    self.recordPeerCloseFromTransport();
                     return null;
                 },
                 else => return e,
-            } orelse 0;
-            if (n > 0) try self.control_stash.appendSlice(self.alloc, rbuf[0..n]);
+            };
+            if (got) |n| {
+                if (n > 0) try self.control_stash.appendSlice(self.alloc, rbuf[0..n]);
+            }
+            if (self.control_stash.items.len == 0) {
+                self.resolveControlFin();
+                return self.takeEvent();
+            }
         }
-        if (self.control_stash.items.len == 0) return null;
+
+        // Any byte after the terminal marker starts an illegal frame.
+        if (self.state == .draining and self.control_stash.items.len != 0) {
+            self.failProtocol(.protocol_violation, "frame after terminal marker");
+            return self.takeEvent();
+        }
 
         var rest: []const u8 = self.control_stash.items;
         var consumed_total: usize = 0;
@@ -250,10 +568,17 @@ pub const ClientSession = struct {
                 rest = rest[r.consumed..];
                 switch (r.result) {
                     .done => |role| {
-                        if (role != .control) return self.failControl(quic_wire.prefaceErrCode(error.UnknownRole), "wrong role on control stream");
+                        if (role != .control) {
+                            self.failProtocol(quic_wire.prefaceErrCode(error.UnknownRole), "wrong role on control stream");
+                            return self.takeEvent();
+                        }
+                        if (self.controlRx()) |crx| crx.* = .frames;
                     },
                     .need => return null,
-                    .invalid => |e| return self.failControl(quic_wire.prefaceErrCode(e), "bad control preface"),
+                    .invalid => |e| {
+                        self.failProtocol(quic_wire.prefaceErrCode(e), "bad control preface");
+                        return self.takeEvent();
+                    },
                 }
                 continue;
             }
@@ -262,212 +587,326 @@ pub const ClientSession = struct {
             rest = rest[adv.consumed..];
             switch (adv.result) {
                 .need => return null,
-                .invalid => |e| return self.failControl(quic_wire.controlHeaderErrCode(e), "bad control frame"),
-                .done => |t| {
-                    const ev = try self.handleFrame(t, self.control.payload());
+                .invalid => |e| {
+                    self.failProtocol(quic_wire.controlHeaderErrCode(e), "bad control frame");
+                    return self.takeEvent();
+                },
+                .done => |h| {
+                    try self.handleFrame(h, self.control.payload());
                     self.control.reset();
-                    if (ev) |e| {
-                        self.pending_event = e;
-                        self.pending_event = null;
-                        return e;
-                    }
+                    if (self.pending_event != null) return self.takeEvent();
                 },
             }
         }
-        return null;
+        self.resolveControlFin();
+        return self.takeEvent();
     }
 
-    fn handleFrame(self: *ClientSession, t: quic_wire.ControlType, payload: []const u8) !?ControlEvent {
-        switch (t) {
+    /// A FIN observed while no bytes remain: clean ONLY from
+    /// `terminal_wait_fin`. Mid-preface, mid-frame, between frames
+    /// without a terminal, or before any preface — truncated-stream
+    /// protocol violation.
+    fn resolveControlFin(self: *ClientSession) void {
+        const crx = self.controlRx() orelse return;
+        const finished = self.transport.connection().recvStreamFinished(control_stream_id) catch return;
+        if (!finished) return;
+        switch (crx.*) {
+            .terminal_wait_fin => crx.* = .finished,
+            .finished, .reset => {},
+            .preface => self.failProtocol(.protocol_violation, "FIN before control preface"),
+            .frames => {
+                if (self.control_preface.expecting() or self.control.expectingFrame()) {
+                    self.failProtocol(.protocol_violation, "truncated control stream");
+                } else if (self.state == .active and self.state.active.detach_sent) {
+                    // The clean-detach arm: the server FINs without a
+                    // final frame once our DETACH was flushed.
+                    self.beginDrain(.{ .kind = .detach_fin, .code = 0 });
+                    if (self.controlRx()) |c2| c2.* = .finished;
+                } else {
+                    self.failProtocol(.protocol_violation, "control FIN without terminal frame");
+                }
+            },
+        }
+    }
+
+    fn handleFrame(self: *ClientSession, h: quic_wire.ControlHeader, payload: []const u8) !void {
+        switch (h.t) {
             .hello_ack => {
-                if (self.phase != .awaiting_ack) {
-                    return self.failControl(.protocol_violation, "duplicate HELLO_ACK");
+                switch (self.state) {
+                    .awaiting_ack => {},
+                    else => return self.failProtocol(.protocol_violation, "duplicate HELLO_ACK"),
                 }
                 const ack = quic_wire.Hello.decode(payload) catch {
-                    return self.failControl(.protocol_violation, "bad HELLO_ACK encoding");
+                    return self.failProtocol(.protocol_violation, "bad HELLO_ACK encoding");
                 };
                 // The frozen validation order; a mismatch closes with
                 // its code — mixed versions/fingerprints can never
                 // reach session data.
                 if (ack.version_major != quic_wire.Hello.v1_version_major) {
-                    return self.failControl(.version_mismatch, "version mismatch");
+                    return self.failProtocol(.version_mismatch, "version mismatch");
                 }
                 if (ack.required_capabilities != quic_wire.capabilities_v1) {
-                    return self.failControl(.capability_mismatch, "capability mismatch");
+                    return self.failProtocol(.capability_mismatch, "capability mismatch");
                 }
                 if (!std.mem.eql(u8, &ack.snapshot_abi_id, &quic_wire.snapshot_abi_id)) {
-                    return self.failControl(.fingerprint_mismatch, "snapshot abi mismatch");
+                    return self.failProtocol(.fingerprint_mismatch, "snapshot abi mismatch");
                 }
                 if (ack.mode != quic_wire.mode_attach) {
-                    return self.failControl(.protocol_violation, "bad ack mode");
+                    return self.failProtocol(.protocol_violation, "bad ack mode");
                 }
                 if (ack.snapshot_limit > quic_wire.snapshot_limit_v1 or
                     ack.command_limit > quic_wire.command_limit_v1)
                 {
-                    return self.failControl(.protocol_violation, "bad negotiated limits");
+                    return self.failProtocol(.protocol_violation, "bad negotiated limits");
                 }
-                self.phase = .awaiting_first_resize;
-                return .{ .hello_ack = ack };
+                self.acceptHelloAck();
+                self.pending_event = .{ .hello_ack = ack };
             },
             .session_end => {
                 if (payload.len != 0) {
-                    return self.failControl(.protocol_violation, "bad SESSION_END length");
+                    return self.failProtocol(.protocol_violation, "bad SESSION_END length");
                 }
-                self.phase = .ended;
-                return .session_end;
+                switch (self.state) {
+                    .awaiting_ack => return self.failBeforeAuthorization(quic_wire.ErrCode.session_ended.code(), "session ended"),
+                    .awaiting_first_resize, .active => {
+                        self.beginDrain(.{ .kind = .session_end, .code = 0 });
+                        self.pending_event = .session_end;
+                    },
+                    else => return self.failProtocol(.protocol_violation, "frame after terminal marker"),
+                }
             },
             .err => {
                 const parsed = quic_wire.parseErrorPayload(payload) catch {
-                    return self.failControl(.protocol_violation, "bad ERROR payload");
+                    return self.failProtocol(.protocol_violation, "bad ERROR payload");
                 };
                 if (parsed.reason.len > quic_wire.error_reason_max) {
-                    return self.failControl(.protocol_violation, "oversized ERROR reason");
+                    return self.failProtocol(.protocol_violation, "oversized ERROR reason");
                 }
                 const rlen = @min(parsed.reason.len, self.err_buf.len);
                 @memcpy(self.err_buf[0..rlen], parsed.reason[0..rlen]);
                 self.err_len = rlen;
-                // Terminal ERRORs arrive with a control FIN; a
-                // nonterminal response carries none and the session
-                // continues.
-                const fin = self.transport.connection().recvStreamFinished(control_stream_id) catch true;
-                if (fin) self.phase = .ended;
-                return .{ .err = .{ .code = parsed.code, .reason = self.err_buf[0..rlen] } };
+                // FINAL marks the fatal ERROR (control FIN follows);
+                // flags zero is a nonterminal response and the
+                // session continues. Pre-authorization, a terminal is
+                // surfaced immediately with the wire's own code.
+                if (h.isFinal()) {
+                    switch (self.state) {
+                        .awaiting_ack => return self.failBeforeAuthorization(parsed.code, parsed.reason),
+                        .awaiting_first_resize, .active => {
+                            self.beginDrain(.{ .kind = .err, .code = parsed.code });
+                        },
+                        else => return self.failProtocol(.protocol_violation, "frame after terminal marker"),
+                    }
+                }
+                self.pending_event = .{ .err = .{
+                    .code = parsed.code,
+                    .reason = self.err_buf[0..rlen],
+                    .terminal = h.isFinal(),
+                } };
             },
             // The server never sends these in v1 — anything else on
             // the client's receive side is a protocol failure.
             .hello, .resize, .detach, .snapshot_request, .snapshot_installed => {
-                return self.failControl(.protocol_violation, "illegal server frame");
+                return self.failProtocol(.protocol_violation, "illegal server frame");
             },
         }
     }
 
     // -- client sends -------------------------------------------------------
 
-    /// RESIZE — the FIRST control frame after HELLO_ACK. The encoded
-    /// copy is made at queue time; the queued call succeeds, and the
-    /// phase advances only once the whole frame was ACCEPTED (a
-    /// parked frame is retried by `retryPendingSends`).
+    /// RESIZE — the FIRST control frame after HELLO_ACK. A blocked
+    /// send parks the whole encoded copy and SUCCEEDS; the state
+    /// advances to active only once the frame was ACCEPTED in full
+    /// (immediately or by `retryPendingSends`), exactly once.
     pub fn sendResize(self: *ClientSession, rows: u16, cols: u16, xpixel: u16, ypixel: u16) !void {
-        if (self.phase == .awaiting_first_resize or self.phase == .active) {} else {
-            return error.NotActive;
-        }
-        var frame: [quic_wire.control_header_len + 8]u8 = undefined;
-        quic_wire.writeControlHeader(frame[0..quic_wire.control_header_len], .resize, 8);
-        quic_wire.writeResizePayload(frame[quic_wire.control_header_len..][0..8], rows, cols, xpixel, ypixel);
-        const first = self.phase == .awaiting_first_resize;
-        const blocked = error.WouldBlock;
-        self.sendFrameAtomic(frame[0..], false) catch |e| {
-            if (e == blocked) return error.WouldBlock;
-            return e;
+        const first = switch (self.state) {
+            .awaiting_first_resize => true,
+            .active => false,
+            else => return error.NotActive,
         };
-        if (first) self.phase = .active;
+        var frame: [quic_wire.control_header_len + 8]u8 = undefined;
+        quic_wire.writeControlHeader(frame[0..quic_wire.control_header_len], .resize, 8, 0);
+        quic_wire.writeResizePayload(frame[quic_wire.control_header_len..][0..8], rows, cols, xpixel, ypixel);
+        return self.sendFrameAtomic(if (first) .first_resize else .ordinary, frame[0..]);
     }
 
     pub fn sendDetach(self: *ClientSession) !void {
-        if (self.phase != .active) return error.NotActive;
+        switch (self.state) {
+            .active => {},
+            else => return error.NotActive,
+        }
         var frame: [quic_wire.control_header_len]u8 = undefined;
-        quic_wire.writeControlHeader(&frame, .detach, 0);
-        return self.sendFrameAtomic(frame[0..], false);
+        quic_wire.writeControlHeader(&frame, .detach, 0, 0);
+        try self.sendFrameAtomic(.ordinary, frame[0..]);
+        // Accepted (sent whole or parked whole): the bare FIN that
+        // follows now completes the session cleanly.
+        if (self.state == .active) self.state.active.detach_sent = true;
     }
 
     pub fn sendSnapshotRequest(self: *ClientSession) !void {
-        if (self.phase != .active) return error.NotActive;
+        switch (self.state) {
+            .active => {},
+            else => return error.NotActive,
+        }
         var frame: [quic_wire.control_header_len]u8 = undefined;
-        quic_wire.writeControlHeader(&frame, .snapshot_request, 0);
-        return self.sendFrameAtomic(frame[0..], false);
+        quic_wire.writeControlHeader(&frame, .snapshot_request, 0, 0);
+        return self.sendFrameAtomic(.ordinary, frame[0..]);
     }
 
-    /// Raw terminal input. Blocking semantics: when the input
-    /// preface send blocks, the preface stays internally pending, the
-    /// body bytes remain CALLER-OWNED and unsent, and the call
-    /// returns error.WouldBlock; retrying after a pump can neither
-    /// duplicate bytes nor open a second stream.
+    /// Raw terminal input. Blocking semantics: when the input-preface
+    /// send blocks, the preface stays staged in `preface_pending`
+    /// (same stream, retried by `retryPendingSends`), the body bytes
+    /// remain CALLER-OWNED and unsent, and the call returns
+    /// error.WouldBlock. Retrying can neither duplicate bytes nor
+    /// open a second stream.
     pub fn sendInput(self: *ClientSession, bytes: []const u8) !void {
-        if (self.phase != .active) return error.NotActive;
-        const conn = self.transport.connection();
-        if (self.input_state == .closed) {
-            const id = try conn.openUniStream();
-            if (id != input_stream_id) return error.UnexpectedInputStreamId;
-            self.input_state = .opening;
-            quic_wire.writePreface(&self.input_pending_preface, .input);
-            conn.sendOnStream(input_stream_id, &self.input_pending_preface, false) catch |e| switch (e) {
-                error.FlowControlBlocked => {
-                    // The preface copy is already staged; nothing else
-                    // has been sent on this stream.
-                    return error.WouldBlock;
-                },
-                else => return e,
-            };
-            self.input_state = .open;
+        switch (self.state) {
+            .active => {},
+            else => return error.NotActive,
         }
-        if (self.input_state == .opening) return error.WouldBlock;
+        const t = self.inputTx() orelse return error.NotActive;
+        switch (t.*) {
+            .unopened => {
+                const id = try self.transport.connection().openUniStream();
+                if (id != input_stream_id) return error.UnexpectedInputStreamId;
+                var pre: [quic_wire.preface_len]u8 = undefined;
+                quic_wire.writePreface(&pre, .input);
+                if (self.transport.connection().sendOnStream(input_stream_id, &pre, false)) {
+                    t.* = .open;
+                } else |e| switch (e) {
+                    error.FlowControlBlocked => {
+                        // The preface copy is staged; nothing else has
+                        // been sent on this stream.
+                        t.* = .{ .preface_pending = pre };
+                        return error.WouldBlock;
+                    },
+                    error.StreamClosed => {
+                        t.* = .closed;
+                        return error.StreamClosed;
+                    },
+                    error.ConnectionClosed => {
+                        self.recordPeerCloseFromTransport();
+                        return error.ConnectionClosed;
+                    },
+                    else => return e,
+                }
+            },
+            .preface_pending => return error.WouldBlock,
+            .closed => return error.StreamClosed,
+            .open => {},
+        }
         if (bytes.len == 0) return;
-        conn.sendOnStream(input_stream_id, bytes, false) catch |e| switch (e) {
+        if (self.transport.connection().sendOnStream(input_stream_id, bytes, false)) {} else |e| switch (e) {
             error.FlowControlBlocked => return error.WouldBlock,
+            error.StreamClosed => {
+                t.* = .closed;
+                return error.StreamClosed;
+            },
+            error.ConnectionClosed => {
+                self.recordPeerCloseFromTransport();
+                return error.ConnectionClosed;
+            },
             else => return e,
-        };
+        }
     }
 
     // -- output stream (server → client), parked until authorized ---------
 
     /// Reads output bytes ONLY once HELLO_ACK validated the session;
     /// before that, bytes stay parked in QUIC (unconsumed, credit
-    /// withheld). Header reads take EXACTLY the missing bytes; an
-    /// epoch other than 1 is invalid in Q3 and takes the failure
-    /// path. `epoch_out` reports the epoch once.
+    /// withheld) — `outputRx()` is null in awaiting_ack. Header reads
+    /// take EXACTLY the missing bytes; on header completion the same
+    /// call continues directly into a body read; an epoch other than
+    /// 1 is invalid in Q3 and takes the failure path. `epoch_out`
+    /// reports the epoch once. Output stays readable through
+    /// `.draining` — a terminal control frame never strands it.
     pub fn pollOutput(self: *ClientSession, buf: []u8, epoch_out: ?*u64) !?usize {
-        if (self.phase == .awaiting_ack or self.phase == .ended) return null;
+        const orx = self.outputRx() orelse return null;
         const conn = self.transport.connection();
-        if (!self.output_preface.done) {
-            const want = self.output_preface.remaining();
-            if (want == 0) return null;
-            var hbuf: [quic_wire.output_header_len]u8 = undefined;
-            const n = conn.recvOnStream(output_stream_id, hbuf[0..want]) catch |e| switch (e) {
-                error.StreamClosed => {
-                    self.phase = .ended;
-                    return null;
-                },
-                error.ConnectionClosed => {
-                    self.connection_closed = true;
-                    self.phase = .ended;
-                    return null;
-                },
-                else => return e,
-            } orelse return null;
-            if (n == 0) return null;
-            const r = self.output_preface.feed(hbuf[0..n]);
-            switch (r.result) {
-                .done => |epoch| {
-                    if (epoch != 1) {
-                        _ = try self.failControl(.protocol_violation, "invalid output epoch");
+        if (orx.* == .header) {
+            const want = self.output_hdr.remaining();
+            var header_done = false;
+            if (want > 0) {
+                var hbuf: [quic_wire.output_header_len]u8 = undefined;
+                const got = conn.recvOnStream(output_stream_id, hbuf[0..want]) catch |e| switch (e) {
+                    error.StreamClosed => {
+                        orx.* = .reset;
+                        self.failProtocol(.protocol_violation, "output stream reset");
                         return null;
+                    },
+                    error.ConnectionClosed => {
+                        self.recordPeerCloseFromTransport();
+                        return null;
+                    },
+                    else => return e,
+                };
+                const n = got orelse 0;
+                if (n > 0) {
+                    const r = self.output_hdr.feed(hbuf[0..n]);
+                    switch (r.result) {
+                        .done => |epoch| {
+                            if (epoch != 1) {
+                                self.failProtocol(.protocol_violation, "invalid output epoch");
+                                return null;
+                            }
+                            orx.* = .{ .body = .{ .epoch = epoch } };
+                            if (epoch_out) |o| o.* = epoch;
+                            header_done = true;
+                        },
+                        .need => return null,
+                        .invalid => |e| {
+                            self.failProtocol(quic_wire.prefaceErrCode(e), "bad output header");
+                            return null;
+                        },
                     }
-                    self.output_epoch = epoch;
-                    if (epoch_out) |o| o.* = epoch;
-                },
-                .need => return null,
-                .invalid => |e| {
-                    _ = try self.failControl(quic_wire.prefaceErrCode(e), "bad output header");
+                } else {
+                    self.resolveOutputFin(orx);
                     return null;
-                },
+                }
+            } else {
+                header_done = true;
             }
-            return null;
+            if (!header_done) return null;
         }
-        const n = conn.recvOnStream(output_stream_id, buf) catch |e| switch (e) {
+        switch (orx.*) {
+            .body => {},
+            else => return null,
+        }
+        const got = conn.recvOnStream(output_stream_id, buf) catch |e| switch (e) {
             error.StreamClosed => {
-                self.phase = .ended;
+                orx.* = .reset;
+                self.failProtocol(.protocol_violation, "output stream reset");
                 return null;
             },
             error.ConnectionClosed => {
-                self.connection_closed = true;
-                self.phase = .ended;
+                self.recordPeerCloseFromTransport();
                 return null;
             },
             else => return e,
-        } orelse return null;
+        };
+        const n = got orelse {
+            self.resolveOutputFin(orx);
+            return null;
+        };
         // Zero means only flow-control bookkeeping was emitted.
-        if (n == 0) return null;
+        if (n == 0) {
+            self.resolveOutputFin(orx);
+            return null;
+        }
         return n;
+    }
+
+    /// A FIN observed while no output bytes remain: clean from the
+    /// body phase (record the epoch and finish); a FIN before the
+    /// complete header is a truncated-stream violation.
+    fn resolveOutputFin(self: *ClientSession, orx: *OutputRx) void {
+        const finished = self.transport.connection().recvStreamFinished(output_stream_id) catch return;
+        if (!finished) return;
+        switch (orx.*) {
+            .body => |b| orx.* = .{ .finished = .{ .epoch = b.epoch } },
+            .header => self.failProtocol(.protocol_violation, "truncated output header"),
+            else => {},
+        }
     }
 };
 
@@ -563,7 +1002,8 @@ pub const Client = struct {
         try lib_posix.getsockname(sock.getFd(), &bound.any, &bound_len);
         const local_udp = quic_gateway.sockaddrToUdpAddress(bound) orelse return error.UnsupportedAddressFamily;
         try transport.registerRoute(local_udp, remote_udp);
-        const session = try ClientSession.init(alloc, transport);
+        var session = try ClientSession.init(alloc, transport);
+        errdefer session.deinit();
         var c = Client{
             .alloc = alloc,
             .io = io,
@@ -576,6 +1016,7 @@ pub const Client = struct {
             .challenge = challenge,
             .handshake_deadline_ns = now + handshake_deadline_ns,
         };
+        errdefer c.parked.deinit(alloc);
         try c.parked.ensureTotalCapacity(alloc, parked_max);
         return c;
     }
@@ -770,7 +1211,7 @@ pub const Client = struct {
 
     /// A local failure surfaced exactly like a wire one.
     pub fn failLocal(self: *Client, code: quic_wire.ErrCode, reason: []const u8) !?ControlEvent {
-        return self.session.failControl(code, reason);
+        return self.session.failLocal(code, reason);
     }
 
     pub fn sendInput(self: *Client, bytes: []const u8) !void {
@@ -804,12 +1245,18 @@ test "client event union carries hello_ack, session_end, and error shapes" {
     }
     const ev2: ControlEvent = .session_end;
     try testing.expect(ev2 == .session_end);
-    const ev3: ControlEvent = .{ .err = .{ .code = 8, .reason = "snapshot is Q4" } };
+    const ev3: ControlEvent = .{ .err = .{ .code = 8, .reason = "snapshot is Q4", .terminal = false } };
     switch (ev3) {
         .err => |e| {
             try testing.expectEqual(@as(u32, 8), e.code);
             try testing.expectEqualStrings("snapshot is Q4", e.reason);
+            try testing.expect(!e.terminal);
         },
+        else => return error.TestUnexpectedResult,
+    }
+    const ev4: ControlEvent = .{ .err = .{ .code = 1, .reason = "fatal", .terminal = true } };
+    switch (ev4) {
+        .err => |e| try testing.expect(e.terminal),
         else => return error.TestUnexpectedResult,
     }
 }

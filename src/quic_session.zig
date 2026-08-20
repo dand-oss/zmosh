@@ -175,10 +175,13 @@ pub const QuicSession = struct {
     /// (validated, bounded).
     pub fn init(alloc: std.mem.Allocator, transport: *quic_transport.Transport) error{OutOfMemory}!QuicSession {
         var stash: std.ArrayList(u8) = .empty;
+        errdefer stash.deinit(alloc);
         try stash.ensureTotalCapacity(alloc, control_stash_cap);
         var pending: std.ArrayList(u8) = .empty;
+        errdefer pending.deinit(alloc);
         try pending.ensureTotalCapacity(alloc, max_control_emission);
         var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(alloc);
         try output.ensureTotalCapacity(alloc, pending_output_cap + quic_wire.output_header_len);
         return .{
             .alloc = alloc,
@@ -399,8 +402,8 @@ pub const QuicSession = struct {
                     const code = quic_wire.controlHeaderErrCode(e);
                     return self.enterTerminal(now, code, "bad control frame", .error_frame, unix_out);
                 },
-                .done => |t| {
-                    try self.handleControlFrame(t, self.control.payload(), now, unix_out);
+                .done => |h| {
+                    try self.handleControlFrame(h, self.control.payload(), now, unix_out);
                     self.control.reset();
                     frame_budget.* -= 1;
                     // A response that remains parked STOPS parsing — a
@@ -426,11 +429,12 @@ pub const QuicSession = struct {
 
     fn handleControlFrame(
         self: *QuicSession,
-        t: quic_wire.ControlType,
+        h: quic_wire.ControlHeader,
         payload: []const u8,
         now: i64,
         unix_out: *UnixWriteBuf,
     ) !void {
+        const t = h.t;
         self.counters.control_frames += 1;
         switch (self.phase) {
             .awaiting_hello => switch (t) {
@@ -565,7 +569,10 @@ pub const QuicSession = struct {
             try self.pending_control.appendSlice(self.alloc, &pre);
         }
         var hdr: [quic_wire.control_header_len]u8 = undefined;
-        quic_wire.writeControlHeader(&hdr, t, payload.len);
+        // FINAL rides on fatal ERROR frames alone (it travels with the
+        // control FIN); every other frame — SESSION_END included —
+        // carries flags zero.
+        quic_wire.writeControlHeader(&hdr, t, payload.len, quic_wire.controlFlags(t, fin));
         try self.pending_control.appendSlice(self.alloc, &hdr);
         errdefer self.pending_control.clearRetainingCapacity();
         try self.pending_control.appendSlice(self.alloc, payload);

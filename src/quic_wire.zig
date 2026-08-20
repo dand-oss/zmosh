@@ -60,6 +60,18 @@ pub const ControlType = enum(u8) {
     err = 8,
 };
 
+/// The only defined control-frame flag bit: FINAL (0x01), legal on
+/// ERROR alone. A fatal ERROR carries FINAL and the control-stream
+/// FIN; a nonterminal ERROR (the SNAPSHOT_REQUEST response) carries
+/// flags zero and no FIN. SESSION_END is intrinsically terminal and
+/// also carries flags zero.
+pub const control_flag_final: u8 = 0x01;
+
+/// The legal flags byte for a frame: FINAL only exists on ERROR.
+pub fn controlFlags(t: ControlType, final: bool) u8 {
+    return if (final and t == .err) control_flag_final else 0;
+}
+
 /// Stable application error codes. The same numeric value is used as a
 /// u32 in the ERROR frame payload and as a u64 in closeApplication /
 /// resetStream / stopSending.
@@ -174,9 +186,10 @@ pub fn writeControlHeader(
     out: *[control_header_len]u8,
     t: ControlType,
     payload_len: usize,
+    flags: u8,
 ) void {
     out[0] = @intFromEnum(t);
-    out[1] = 0; // flags: zero in v1
+    out[1] = flags;
     out[2] = 0;
     out[3] = 0; // reserved u16 BE: zero
     std.mem.writeInt(u32, out[4..8], @intCast(payload_len), .big);
@@ -187,11 +200,17 @@ pub const ControlHeader = struct {
     flags: u8,
     reserved: u16,
     payload_len: usize,
+
+    /// Whether this frame carries the FINAL flag.
+    pub fn isFinal(self: ControlHeader) bool {
+        return (self.flags & control_flag_final) != 0;
+    }
 };
 
 pub const ControlHeaderError = error{
     UnknownType,
-    NonzeroFlags,
+    IllegalFlags,
+    FinalOnNonError,
     NonzeroReserved,
     OversizedPayload,
 };
@@ -205,14 +224,17 @@ pub fn controlHeaderErrCode(e: ControlHeaderError) ErrCode {
 
 pub fn parseControlHeader(bytes: *const [control_header_len]u8) ControlHeaderError!ControlHeader {
     const t = std.enums.fromInt(ControlType, bytes[0]) orelse return error.UnknownType;
-    if (bytes[1] != 0) return error.NonzeroFlags;
+    const flags = bytes[1];
+    // FINAL is the only defined bit, and it exists on ERROR alone.
+    if (flags & ~control_flag_final != 0) return error.IllegalFlags;
+    if ((flags & control_flag_final) != 0 and t != .err) return error.FinalOnNonError;
     const reserved = std.mem.readInt(u16, bytes[2..4], .big);
     if (reserved != 0) return error.NonzeroReserved;
     const len = std.mem.readInt(u32, bytes[4..8], .big);
     if (len > max_control_payload) return error.OversizedPayload;
     return .{
         .t = t,
-        .flags = bytes[1],
+        .flags = flags,
         .reserved = reserved,
         .payload_len = len,
     };
@@ -239,8 +261,8 @@ pub const ControlParser = struct {
     }
 
     pub const Result = union(enum) {
-        /// A full frame is available via frameType()/payload().
-        done: ControlType,
+        /// A full frame is available via frameType()/frameFlags()/payload().
+        done: ControlHeader,
         need: usize,
         invalid: ControlHeaderError,
     };
@@ -280,14 +302,21 @@ pub const ControlParser = struct {
         if (self.payload_buf.items.len < self.declared) {
             return .{ .consumed = chunk.len - rest.len, .result = .{ .need = self.declared - self.payload_buf.items.len } };
         }
-        const t = std.enums.fromInt(ControlType, self.hdr[0]) orelse unreachable;
+        const parsed = parseControlHeader(&self.hdr) catch unreachable;
         self.state = .complete;
-        return .{ .consumed = chunk.len - rest.len, .result = .{ .done = t } };
+        return .{ .consumed = chunk.len - rest.len, .result = .{ .done = parsed } };
     }
 
     /// Valid once advance() returned .done and before reset().
     pub fn frameType(self: *const ControlParser) ControlType {
         return std.enums.fromInt(ControlType, self.hdr[0]) orelse unreachable;
+    }
+
+    /// Valid once advance() returned .done and before reset(). FINAL
+    /// is guaranteed legal here — parseControlHeader rejected it
+    /// otherwise before the payload phase began.
+    pub fn frameFlags(self: *const ControlParser) u8 {
+        return self.hdr[1];
     }
 
     /// Valid once advance() returned .done and before reset().
@@ -579,12 +608,13 @@ test "preface reject matrix maps to frozen codes" {
 
 test "control header golden, unknown type, oversized length" {
     var buf: [control_header_len]u8 = undefined;
-    writeControlHeader(&buf, .hello, hello_payload_len);
+    writeControlHeader(&buf, .hello, hello_payload_len, 0);
     try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 48 }, &buf);
 
     const hdr = try parseControlHeader(&buf);
     try testing.expectEqual(ControlType.hello, hdr.t);
     try testing.expectEqual(@as(usize, 48), hdr.payload_len);
+    try testing.expect(!hdr.isFinal());
 
     buf[0] = 9;
     try testing.expectError(error.UnknownType, parseControlHeader(&buf));
@@ -603,10 +633,73 @@ test "control header golden, unknown type, oversized length" {
 
     buf[7] = 0;
     buf[1] = 1;
-    try testing.expectError(error.NonzeroFlags, parseControlHeader(&buf));
+    // FINAL on a non-ERROR frame is a protocol violation (buf[0] is
+    // still 8 = .err here, so use a RESIZE type).
+    buf[0] = 3;
+    try testing.expectError(error.FinalOnNonError, parseControlHeader(&buf));
+    try testing.expectEqual(ErrCode.protocol_violation, controlHeaderErrCode(error.FinalOnNonError));
+    buf[1] = 2;
+    // Bits outside FINAL do not exist in v1.
+    try testing.expectError(error.IllegalFlags, parseControlHeader(&buf));
+    try testing.expectEqual(ErrCode.protocol_violation, controlHeaderErrCode(error.IllegalFlags));
     buf[1] = 0;
     buf[3] = 1;
     try testing.expectError(error.NonzeroReserved, parseControlHeader(&buf));
+}
+
+test "FINAL flag matrix: legal on ERROR alone, terminal metadata round-trips" {
+    var buf: [control_header_len]u8 = undefined;
+
+    // Fatal ERROR: FINAL set, parses back with the flag.
+    writeControlHeader(&buf, .err, 4, controlFlags(.err, true));
+    try testing.expectEqual(control_flag_final, buf[1]);
+    const fatal = try parseControlHeader(&buf);
+    try testing.expect(fatal.isFinal());
+    try testing.expectEqualSlices(u8, &.{ 8, 1, 0, 0, 0, 0, 0, 4 }, &buf);
+
+    // Nonterminal ERROR (snapshot response): flags zero.
+    writeControlHeader(&buf, .err, 4, controlFlags(.err, false));
+    try testing.expectEqual(@as(u8, 0), buf[1]);
+    try testing.expect(!(try parseControlHeader(&buf)).isFinal());
+
+    // SESSION_END is terminal WITHOUT the flag; controlFlags refuses
+    // to set FINAL on it even if asked.
+    writeControlHeader(&buf, .session_end, 0, controlFlags(.session_end, true));
+    try testing.expectEqual(@as(u8, 0), buf[1]);
+    try testing.expect(!(try parseControlHeader(&buf)).isFinal());
+
+    // Client-side frames never carry FINAL.
+    try testing.expectEqual(@as(u8, 0), controlFlags(.hello, true));
+    try testing.expectEqual(@as(u8, 0), controlFlags(.resize, true));
+    try testing.expectEqual(@as(u8, 0), controlFlags(.detach, true));
+    try testing.expectEqual(@as(u8, 0), controlFlags(.snapshot_request, true));
+    try testing.expectEqual(@as(u8, 0), controlFlags(.snapshot_installed, true));
+
+    // Every non-ERROR type with the bit set is rejected.
+    for ([_]ControlType{ .hello, .hello_ack, .resize, .detach, .snapshot_request, .snapshot_installed, .session_end }) |t| {
+        writeControlHeader(&buf, t, 0, control_flag_final);
+        try testing.expectError(error.FinalOnNonError, parseControlHeader(&buf));
+    }
+    // Unknown high bits are rejected on ERROR too.
+    writeControlHeader(&buf, .err, 0, control_flag_final | 0x80);
+    try testing.expectError(error.IllegalFlags, parseControlHeader(&buf));
+
+    // The incremental parser surfaces the same metadata (header plus
+    // the declared payload bytes).
+    var p = ControlParser.init(testing.allocator);
+    defer p.deinit();
+    writeControlHeader(&buf, .err, 4, controlFlags(.err, true));
+    var full: [control_header_len + 4]u8 = undefined;
+    @memcpy(full[0..control_header_len], &buf);
+    const a = try p.advance(&full);
+    switch (a.result) {
+        .done => |h| {
+            try testing.expectEqual(ControlType.err, h.t);
+            try testing.expect(h.isFinal());
+            try testing.expectEqual(control_flag_final, p.frameFlags());
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "control parser: coalesced frames and full round trip" {
@@ -616,9 +709,9 @@ test "control parser: coalesced frames and full round trip" {
     var wire: [control_header_len + hello_payload_len + control_header_len + 8]u8 = undefined;
     var hello: [hello_payload_len]u8 = undefined;
     Hello.serverV1(mode_attach).encode(&hello);
-    writeControlHeader(wire[0..8], .hello, hello.len);
+    writeControlHeader(wire[0..8], .hello, hello.len, 0);
     @memcpy(wire[8 .. 8 + hello_payload_len], &hello);
-    writeControlHeader(wire[56..64], .resize, 8);
+    writeControlHeader(wire[56..64], .resize, 8, 0);
     writeResizePayload(wire[64..72], 24, 80, 0, 0);
 
     // Feed the whole coalesced buffer at once: the parser stops after
@@ -626,7 +719,7 @@ test "control parser: coalesced frames and full round trip" {
     const a1 = try p.advance(&wire);
     try testing.expectEqual(@as(usize, 56), a1.consumed);
     switch (a1.result) {
-        .done => |t| try testing.expectEqual(ControlType.hello, t),
+        .done => |h| try testing.expectEqual(ControlType.hello, h.t),
         else => return error.TestUnexpectedResult,
     }
     const decoded = try Hello.decode(p.payload());
@@ -636,7 +729,7 @@ test "control parser: coalesced frames and full round trip" {
     p.reset();
     const a2 = try p.advance(wire[56..]);
     switch (a2.result) {
-        .done => |t| try testing.expectEqual(ControlType.resize, t),
+        .done => |h| try testing.expectEqual(ControlType.resize, h.t),
         else => return error.TestUnexpectedResult,
     }
     const rz = parseResizePayload(p.payload()[0..8]);
@@ -648,7 +741,7 @@ test "control parser: every split boundary resumes mid-field" {
     var wire: [control_header_len + hello_payload_len]u8 = undefined;
     var hello: [hello_payload_len]u8 = undefined;
     Hello.serverV1(mode_command).encode(&hello);
-    writeControlHeader(wire[0..8], .hello_ack, hello.len);
+    writeControlHeader(wire[0..8], .hello_ack, hello.len, 0);
     @memcpy(wire[8..], &hello);
 
     // One byte at a time.
@@ -684,7 +777,7 @@ test "control parser: invalid header poisons until reset" {
     var p = ControlParser.init(testing.allocator);
     defer p.deinit();
     var wire: [control_header_len]u8 = undefined;
-    writeControlHeader(&wire, .resize, 8);
+    writeControlHeader(&wire, .resize, 8, 0);
     wire[0] = 99; // unknown type
 
     const a = try p.advance(&wire);
@@ -702,7 +795,7 @@ test "control parser: invalid header poisons until reset" {
     }
     const a3 = try p.advance(&[_]u8{0} ** 8);
     switch (a3.result) {
-        .done => |t| try testing.expectEqual(ControlType.resize, t),
+        .done => |h| try testing.expectEqual(ControlType.resize, h.t),
         else => return error.TestUnexpectedResult,
     }
 }

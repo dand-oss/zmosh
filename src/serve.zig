@@ -1524,7 +1524,7 @@ test "zmq1 session: HELLO mismatches reject with the frozen codes and never init
         var payload: [quic_wire.hello_payload_len]u8 = undefined;
         hello.encode(&payload);
         var hdr: [quic_wire.control_header_len]u8 = undefined;
-        quic_wire.writeControlHeader(&hdr, .hello, payload.len);
+        quic_wire.writeControlHeader(&hdr, .hello, payload.len, 0);
         _ = try cconn.sendOnStream(quic_client.control_stream_id, &hdr, false);
         _ = try cconn.sendOnStream(quic_client.control_stream_id, &payload, false);
 
@@ -2597,7 +2597,7 @@ test "zmq1 r7: withheld-HELLO_ACK output parking (positive)" {
     var obuf: [64]u8 = undefined;
     var epoch: u64 = 0;
     try testing.expect((try z.client.pollOutput(&obuf, &epoch)) == null);
-    try testing.expect(z.client.output_preface.remaining() > 0);
+    try testing.expect(z.client.output_hdr.remaining() > 0);
     {
         const st3 = (try z.client.transport.connection().streamState(quic_client.output_stream_id)) orelse return error.NoOutputStream;
         try testing.expectEqual(@as(u64, 0), st3.receive_read_offset orelse 0);
@@ -2985,7 +2985,7 @@ test "zmq1 r7: HELLO mode 2 is unimplemented and mode 3 is a protocol violation"
         var payload: [quic_wire.hello_payload_len]u8 = undefined;
         hello.encode(&payload);
         var hdr: [quic_wire.control_header_len]u8 = undefined;
-        quic_wire.writeControlHeader(&hdr, .hello, payload.len);
+        quic_wire.writeControlHeader(&hdr, .hello, payload.len, 0);
         _ = try cconn.sendOnStream(quic_client.control_stream_id, &hdr, false);
         _ = try cconn.sendOnStream(quic_client.control_stream_id, &payload, false);
 
@@ -3087,7 +3087,7 @@ test "zmq1 r7: split header first, tail and body together next delivery" {
     // the exact regression shape.
     const cconn = z.loop.client.connection();
     var frame: [quic_wire.control_header_len + 8]u8 = undefined;
-    quic_wire.writeControlHeader(frame[0..8], .resize, 8);
+    quic_wire.writeControlHeader(frame[0..8], .resize, 8, 0);
     quic_wire.writeResizePayload(frame[8..16], 31, 91, 0, 0);
     _ = try cconn.sendOnStream(quic_client.control_stream_id, frame[0..4], false);
     const now1: i64 = lib_posix.nowNs();
@@ -3096,7 +3096,7 @@ test "zmq1 r7: split header first, tail and body together next delivery" {
     try z.loop.clientDrain(now1);
 
     var snap_hdr: [quic_wire.control_header_len]u8 = undefined;
-    quic_wire.writeControlHeader(&snap_hdr, .snapshot_request, 0);
+    quic_wire.writeControlHeader(&snap_hdr, .snapshot_request, 0, 0);
     var tail_and_next: [4 + 8 + quic_wire.control_header_len]u8 = undefined;
     @memcpy(tail_and_next[0..4], frame[4..8]);
     @memcpy(tail_and_next[4..12], frame[8..16]);
@@ -3201,7 +3201,7 @@ test "zmq1 r7: server rejects non-empty DETACH and SNAPSHOT_REQUEST payloads" {
         // frozen: protocol_violation.
         const cconn = z.client.transport.connection();
         var frame: [quic_wire.control_header_len + 4]u8 = undefined;
-        quic_wire.writeControlHeader(frame[0..8], case, 4);
+        quic_wire.writeControlHeader(frame[0..8], case, 4, 0);
         @memset(frame[8..12], 'x');
         _ = try cconn.sendOnStream(quic_client.control_stream_id, &frame, false);
 
@@ -3288,7 +3288,7 @@ test "zmq1 r7: client HELLO_ACK matrix — version, capability, fingerprint, mod
         var ack_payload: [quic_wire.hello_payload_len]u8 = undefined;
         ack.encode(&ack_payload);
         var ack_hdr: [quic_wire.control_header_len]u8 = undefined;
-        quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len);
+        quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len, 0);
         var ack_pre: [quic_wire.preface_len]u8 = undefined;
         quic_wire.writePreface(&ack_pre, .control);
         const base: i64 = lib_posix.nowNs();
@@ -3339,7 +3339,7 @@ test "zmq1 r7: client rejects duplicate HELLO_ACK, oversized ERROR reason, illeg
     var ack_payload: [quic_wire.hello_payload_len]u8 = undefined;
     ack.encode(&ack_payload);
     var ack_hdr: [quic_wire.control_header_len]u8 = undefined;
-    quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len);
+    quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len, 0);
     var ack_pre: [quic_wire.preface_len]u8 = undefined;
     quic_wire.writePreface(&ack_pre, .control);
     const base: i64 = lib_posix.nowNs();
@@ -3365,4 +3365,174 @@ test "zmq1 r7: client rejects duplicate HELLO_ACK, oversized ERROR reason, illeg
         .err => |e| try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.code),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "zmq1 r8: protocol-state transition matrix — legal and illegal operations per state" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    // ── awaiting_ack: every send API is rejected; output is parked ──
+    try testing.expectEqual(quic_client.StateTag.awaiting_ack, z.client.stateTag());
+    try testing.expectError(error.NotActive, z.client.sendResize(24, 80, 0, 0));
+    try testing.expectError(error.NotActive, z.client.sendInput("x"));
+    try testing.expectError(error.NotActive, z.client.sendDetach());
+    try testing.expectError(error.NotActive, z.client.sendSnapshotRequest());
+    var obuf: [64]u8 = undefined;
+    var epoch: u64 = 0;
+    try testing.expect((try z.client.pollOutput(&obuf, &epoch)) == null);
+    try testing.expectEqual(quic_client.StateTag.awaiting_ack, z.client.stateTag());
+
+    // ── valid HELLO_ACK → awaiting_first_resize ──
+    try zmq1ToActive0(&z);
+    try testing.expectEqual(quic_client.StateTag.awaiting_first_resize, z.client.stateTag());
+    // Input and every non-first control frame stay rejected; the
+    // first RESIZE alone advances.
+    try testing.expectError(error.NotActive, z.client.sendInput("x"));
+    try testing.expectError(error.NotActive, z.client.sendDetach());
+    try testing.expectError(error.NotActive, z.client.sendSnapshotRequest());
+    // Output is authorized now: the header consumed, epoch reported.
+    try testing.expect((try z.client.pollOutput(&obuf, &epoch)) == null);
+    try testing.expectEqual(@as(u64, 1), epoch);
+
+    // ── first RESIZE accepted → active, exactly once ──
+    try z.client.sendResize(24, 80, 0, 0);
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInit;
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+    // Ordinary frames stay legal in active; an ordinary RESIZE does
+    // not re-trigger anything.
+    try z.client.sendResize(30, 90, 0, 0);
+    try z.client.sendSnapshotRequest();
+    try z.client.sendInput("matrix-input");
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+
+    // ── terminal SESSION_END (daemon EOF) → draining: no new sends,
+    //    output stays readable ──
+    // Consume every relayed frame first: an unread daemon socket
+    // would make the terminal flush fail closed (internal_error)
+    // instead of settling with SESSION_END.
+    while (try dr.next(z.loop.daemon_fd)) |_| {}
+    lib_posix.close(z.loop.daemon_fd);
+    z.loop.daemon_fd = -1;
+    var end_seen = false;
+    for (0..16) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)))) |e| {
+            if (e == .session_end) end_seen = true;
+        }
+        if (end_seen) break;
+    }
+    try testing.expect(end_seen);
+    try testing.expectEqual(quic_client.StateTag.draining, z.client.stateTag());
+    try testing.expectError(error.NotActive, z.client.sendResize(24, 80, 0, 0));
+    try testing.expectError(error.NotActive, z.client.sendInput("x"));
+    try testing.expectError(error.NotActive, z.client.sendDetach());
+    try testing.expectError(error.NotActive, z.client.sendSnapshotRequest());
+    // Draining keeps the output side readable (null, not an error —
+    // the terminal control frame never strands output).
+    try testing.expect((try z.client.pollOutput(&obuf, null)) == null);
+    try testing.expectEqual(quic_client.StateTag.draining, z.client.stateTag());
+}
+
+/// The hello_ack-only prefix of zmq1ToActive (the matrix test drives
+/// the first RESIZE itself to observe the transition).
+fn zmq1ToActive0(z: anytype) !void {
+    var ev: ?quic_client.ControlEvent = null;
+    const base: i64 = lib_posix.nowNs();
+    for (0..8) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)))) |e| {
+            ev = e;
+            break;
+        }
+        ev = try z.client.pollControl();
+        if (ev != null) break;
+    }
+    try testing.expect(ev != null and ev.? == .hello_ack);
+}
+
+test "zmq1 r8: failed state — one failure, no resurrection, sends rejected" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    try quic_test.driveHandshake(&loop);
+
+    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    defer client.deinit();
+    const cconn = client.transport.connection();
+    _ = try cconn.openStream();
+    var pre: [quic_wire.preface_len]u8 = undefined;
+    quic_wire.writePreface(&pre, .control);
+    _ = try cconn.sendOnStream(quic_client.control_stream_id, &pre, false);
+
+    var ack = quic_wire.Hello.serverV1(quic_wire.mode_attach);
+    var ack_payload: [quic_wire.hello_payload_len]u8 = undefined;
+    ack.encode(&ack_payload);
+    var ack_hdr: [quic_wire.control_header_len]u8 = undefined;
+    quic_wire.writeControlHeader(&ack_hdr, .hello_ack, ack_payload.len, 0);
+    var ack_pre: [quic_wire.preface_len]u8 = undefined;
+    quic_wire.writePreface(&ack_pre, .control);
+    // An ILLEGAL server RESIZE follows the valid ack: the session
+    // fails exactly once and stays failed.
+    var bad_hdr: [quic_wire.control_header_len]u8 = undefined;
+    quic_wire.writeControlHeader(&bad_hdr, .resize, 8, 0);
+    var bad_payload: [8]u8 = undefined;
+    quic_wire.writeResizePayload(&bad_payload, 1, 2, 3, 4);
+    const base: i64 = lib_posix.nowNs();
+    try loop.clientPump(base);
+    _ = try loop.gw.runOnce(0);
+    try craftServerControl(&loop, &.{ &ack_pre, &ack_hdr, &ack_payload, &bad_hdr, &bad_payload });
+
+    var got_ack = false;
+    var err_ev: ?quic_client.ControlEvent = null;
+    for (0..10) |i| {
+        if (try serverControlRound(&loop, &client, base, i)) |e| {
+            if (e == .hello_ack and !got_ack) {
+                got_ack = true;
+                continue;
+            }
+            err_ev = e;
+            break;
+        }
+    }
+    try testing.expect(got_ack);
+    try testing.expect(err_ev != null);
+    switch (err_ev.?) {
+        .err => |e| {
+            try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.code);
+            try testing.expect(e.terminal);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(quic_client.StateTag.failed, client.stateTag());
+    try testing.expect(client.ended());
+
+    // Every send API is rejected; the failure event never repeats;
+    // retries never resurrect the session.
+    try testing.expectError(error.NotActive, client.sendResize(24, 80, 0, 0));
+    try testing.expectError(error.NotActive, client.sendInput("x"));
+    try testing.expectError(error.NotActive, client.sendDetach());
+    try testing.expectError(error.NotActive, client.sendSnapshotRequest());
+    try client.retryPendingSends();
+    try testing.expect((try client.pollControl()) == null);
+    try testing.expectEqual(quic_client.StateTag.failed, client.stateTag());
 }

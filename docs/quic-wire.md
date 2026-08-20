@@ -64,8 +64,16 @@ QUIC does not order bytes across streams, only within one:
 
 ## Control frames (on the control stream)
 
-Header (8 bytes): type u8 | flags u8 (zero in v1) | reserved u16
+Header (8 bytes): type u8 | flags u8 | reserved u16
 big-endian (zero) | payload length u32 big-endian (maximum 64 KiB).
+
+The flags byte defines exactly one bit: FINAL = 0x01, legal on ERROR
+alone. A fatal ERROR carries FINAL and arrives with the control-stream
+FIN; a nonterminal ERROR — the SNAPSHOT_REQUEST response — carries
+flags zero and no FIN, and the session continues. SESSION_END is
+intrinsically terminal and also carries flags zero (it too arrives
+with the FIN). Client-sent frames never carry FINAL. Any other flag
+bit, or FINAL on another frame type, is `protocol_violation`.
 
 | Type | Name | Payload |
 |---|---|---|
@@ -135,7 +143,7 @@ and as u64 in QUIC APPLICATION_CLOSE / RESET_STREAM / STOP_SENDING.
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | none | clean close (detach) |
-| 1 | protocol_violation | malformed frame, nonzero flags/reserved, ordering violation, unknown mode |
+| 1 | protocol_violation | malformed frame, illegal flag bits (FINAL off-ERROR), nonzero reserved, ordering violation, unknown mode |
 | 2 | version_mismatch | HELLO version_major ≠ 1 |
 | 3 | capability_mismatch | capability mask ≠ 0x1F |
 | 4 | fingerprint_mismatch | snapshot_abi_id differs |
