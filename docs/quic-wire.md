@@ -1,6 +1,9 @@
 # zmosh QUIC wire protocol (ZMQ1)
 
-Status: frozen at Q3 (2026-08-19). This document is the authoritative
+Status: authoritative ZMQ1 v1, amended (Q3, 2026-08-19). The FINAL
+flag and the DETACH/terminal-FIN rules below postdate the original v1
+freeze; with no released v1 consumer the version number is unchanged.
+This document is the authoritative
 wire specification for the zmosh application protocol carried over QUIC.
 Implementation: `src/quic_wire.zig` (framing), `src/quic_session.zig`
 (gateway side), `src/quic_client.zig` (client side). QUIC provides
@@ -50,13 +53,13 @@ QUIC does not order bytes across streams, only within one:
   Non-control data before HELLO is a terminal `protocol_violation`.
 - After the gateway validates HELLO (and the client receives
   HELLO_ACK), input on stream 2 may legitimately arrive before the
-  client's RESIZE is processed. The gateway parks it — without
-  consuming and without granting flow-control credit — until the first
-  RESIZE queues the daemon session-initialization message; parked input
-  then flows strictly after initialization.
+  client's RESIZE is processed. The gateway MUST NOT deliver any
+  stream-2 input to the daemon session before the first RESIZE has
+  queued the session-initialization message; early-arriving input is
+  buffered, and its delivery follows strictly after initialization.
 - Symmetrically, the server's output header may arrive at the client
-  before the HELLO_ACK packet; the client parks stream-3 bytes until
-  HELLO_ACK validates.
+  before the HELLO_ACK packet; the client MUST NOT process stream-3
+  bytes before HELLO_ACK validates.
 - The client's first control frame after HELLO_ACK MUST be RESIZE. The
   gateway maps that first RESIZE to the daemon `.Init` (session
   initialization with the client's size); subsequent RESIZEs forward as
@@ -176,28 +179,28 @@ ERROR(unimplemented): no FIN, the session continues serving.
 
 ### DETACH sequencing (normative)
 
-DETACH is a client-only frame carrying no payload. On acceptance —
-the frame was sent whole OR parked whole under flow control; ownership
-of the encoded copy has transferred — the client enters its
-end-of-write state: no further application frame (RESIZE, DETACH,
-SNAPSHOT_REQUEST) and no further input bytes may be sent. The server
-flushes the corresponding daemon-side `.Detach` and then closes the
-control stream with a bare FIN: no final frame accompanies a clean
-detach. That bare FIN is valid ONLY after the client's DETACH bytes
-actually reached the wire — a FIN observed while the client's copy is
-still parked locally (it has not reached QUIC) is a
-`protocol_violation` ("FIN before DETACH flush"), because the FIN
-cannot legitimately precede bytes the client never sent. A peer
-connection close before the promised control FIN during this window
-is likewise a `protocol_violation`. A terminal frame received during
-the window still ends the session through the normal draining
-sequence.
+DETACH is a client-only frame carrying no payload. A client MUST NOT
+send any further application frame (RESIZE, DETACH,
+SNAPSHOT_REQUEST) or any further input-stream bytes after DETACH.
+The server, on receiving a complete DETACH, MUST flush the
+corresponding daemon-side `.Detach` and then close the control
+stream with a bare FIN — no final frame accompanies a clean detach.
 
-The input stream imposes one ordering rule on DETACH: while the
-client's input-preface send is still staged (blocked under flow
-control), DETACH is refused without side effects — the caller retries
-after the preface flushes. The wire never sees a DETACH interleaved
-with an abandoned input-stream opening.
+Framing is atomic: a sender MUST NOT interleave the bytes of
+distinct control frames and MUST NOT abandon a partially sent frame
+— a control frame reaches the stream whole or not at all.
+
+The server's bare FIN is valid ONLY after the client's DETACH bytes
+reached the wire in full. A client that observes the control-stream
+FIN (or a peer connection close) while its own DETACH has not been
+sent in full MUST treat it as a `protocol_violation` ("FIN before
+DETACH flush") — the FIN cannot legitimately precede bytes the peer
+never sent. A terminal frame received during this window still ends
+the session through the normal draining sequence.
+
+A client MUST NOT send DETACH until its input-stream preface has
+been sent in full: the wire never sees a DETACH interleaved with an
+abandoned input-stream opening.
 
 ### Terminal FIN classes (normative)
 

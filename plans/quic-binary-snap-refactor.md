@@ -1331,7 +1331,57 @@ invariant error when the failing event had already been staged —
 the release now delivers the staged failure meta (matched code and
 reason).
 
+### Q3 r8.6.1 record (same-pump precedence + documentation accuracy)
 
+Review of the r8.6 chain (approve-after-fixes) found one P1: after
+`deferTerminal` copies a protocol failure into `.draining{.err}` the
+session slot is empty, and `latchSocketFailure` checked the failed
+session first — so a receive failure later in the SAME pump fell
+into the "failed session missing terminal event" invariant and
+clobbered the original code and reason; the deferred-ERROR
+preservation arm was unreachable, and no test covered the
+combined path (`.post_failure_socket` armed the fixture only after
+delivery). Documentation findings: the ADR grouped quinn and quiche
+as requiring their own async runtime, called quicz a "crate", and
+carried a now-hollow reconsideration trigger; `docs/quic-wire.md`
+still said "frozen at Q3" against its amended-v1 body and stated
+the DETACH rules with runtime-mechanism language (parked copies,
+ownership transfer, staged preface, caller retry); and "sole
+event-return path" was imprecise wherever it appeared.
+
+Landed from `e418c59`: `1b4e282` (appended frozen r8.6.1 amendment —
+historical wording superseded, not edited), `566717c`
+(`latchSocketFailure` five-step precedence: preserve an owned
+`.event_ready`, stage a still-pending session failure, promote the
+driver-owned deferred FINAL ERROR unchanged, invariant for a failed
+session with no representation, socket `internal_error` last;
+`recv_fail_n` became an Nth-call countdown; the terminal-coherence
+test gained a fourth, same-pump phase — quiesced through normal
+pumps until POLLIN is absent, one 16-byte illegal RESIZE in one
+stream write, gateway egress until readable, countdown 2, one
+public pump — proving the original `protocol_violation("frame
+after terminal marker")` is returned exactly once with `io_failed`
+latched), and the documentation commit (ADR corrected to
+distinguish quinn's Tokio-oriented high-level API from quiche's
+caller-driven model and existing C API, with the decision rebased
+on the ABI/toolchain boundary and primary references; wire status
+authoritative amended v1 with DETACH and cross-stream rules
+rewritten normatively as MUST statements, all parking/retry
+mechanism language now living only in `docs/quic-client-runtime.md`,
+whose precedence list mirrors the five-step latch; "sole
+terminal-event return path" in living code comments and runtime
+documentation).
+
+The new proof also caught a latent crash on the previously
+unreachable arm: assigning `.{ .event_ready = self.dstate.draining }`
+stamped the new union tag into the result location before the
+payload read — the promote now copies the meta to a local first.
+
+Gates rerun after every commit: 247/247 Debug AND ReleaseSafe,
+`zig build check`, `zig build release` plus Debug rebuild,
+`zig fmt --check build.zig build.zig.zon src`, `git diff --check`,
+adapter SLOC 467, Bats 58 ok / 0 failed / 4 Q5 skips. Q4 remains
+locked; the q2-2 pin and quicz refs are untouched.
 
 
 ## Phase Q4: Ghostty binary snapshot export

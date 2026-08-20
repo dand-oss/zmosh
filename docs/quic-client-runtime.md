@@ -66,17 +66,23 @@ Deferred reason bytes live in a stable driver buffer (never inside
 pump. Terminal events are staged (`stageTerminal`) and delivered
 (`deliverTerminal`) — the driver never returns an event whose reason
 points into session storage, and `deliverTerminal()` is the only
-event-return path. Frozen failure precedence:
+terminal-event return path (nonterminal events still return normally
+through the pump). Frozen failure precedence, applied by the
+socket-failure latch in this order:
 
-1. An existing stored session/protocol failure wins with its
+1. An already-staged terminal (`.event_ready`) is preserved — never
+   polled, never replaced.
+2. An existing stored session/protocol failure wins with its
    matching code and reason.
-2. An already-deferred FINAL ERROR wins over a later socket failure.
-3. A socket failure while draining a clean SESSION_END — or with no
-   prior failure — becomes `internal_error`: output completeness is
-   no longer provable.
-4. A failed session with no stored event is an invariant failure
-   (`internal_error("failed session missing terminal event")`);
+3. An already-deferred FINAL ERROR wins over a later socket failure;
+   the session's event slot is empty in that case, because the
+   deferral consumed it when copying the failure.
+4. A failed session with neither representation is an invariant
+   failure (`internal_error("failed session missing terminal event")`);
    stale deferred metadata is never released.
+5. Otherwise the socket failure itself becomes `internal_error`:
+   while draining a clean SESSION_END, output completeness is no
+   longer provable.
 
 After terminal delivery, later settling-socket errors only disable
 I/O and close — no second, undeliverable event is created. The socket

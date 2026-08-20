@@ -14,28 +14,42 @@ validation, stream flow control with all-or-nothing sends,
 connection-level close semantics distinguishable from stream resets,
 and a recovery timer drivable from a single-threaded loop.
 
-We chose **Zig plus the pinned `quicz` crate** over wrapping a Rust
-QUIC implementation (quinn/quiche) behind a C ABI.
+We chose **Zig plus the pinned `quicz` Zig package** over wrapping a
+Rust QUIC implementation (quinn/quiche) behind a C ABI.
 
-Why:
+The Rust alternatives differ from each other, and neither cost is
+zero. quinn's high-level API is built on Tokio — embedding it would
+add a second scheduler to a deliberately scheduler-free binary.
+quiche is caller-driven: it leaves sockets, event-loop integration,
+and timers to the application and already exposes a C API, so it
+needs no async runtime — but consuming it from Zig still crosses a
+C ABI, flattens errors and ownership into C shapes, and builds its
+own native/C (BoringSSL-derived) cryptography into the toolchain.
+
+Why Zig plus quicz won:
 
 1. **No FFI boundary.** A Rust wrapper would impose a C ABI over
    ownership-sensitive operations (datagram buffers, stream reads,
    timers). Every buffer would cross the boundary twice and every
    error would flatten to an integer, defeating Zig's error unions
    and allocator tracking. quicz is consumed as a Zig module with
-   native types (`UdpTuple`, `TaggedDatagram`, `Error!` sets).
-2. **Single-threaded integration.** quicz exposes exactly the
-   primitives a `poll()` loop needs — `handleDatagram`,
+   native types (`UdpTuple`, `TaggedDatagram`, `Error!` sets) and
+   no translation layer for lifetimes, errors, or allocators.
+2. **Single-threaded, scheduler-free integration.** quicz exposes
+   exactly the primitives a `poll()` loop needs — `handleDatagram`,
    `pollOutboundPath`, `serviceDueDeadline`, `nextDeadlineNanos` —
-   with no internal threads or io_uring entanglement. Rust QUIC
-   stacks assume their own async runtime; embedding one would add a
-   second scheduler to a deliberately scheduler-free binary.
+   with no internal threads or io_uring entanglement and no runtime
+   of its own to embed.
 3. **Auditability at the pin.** The dependency is a content-hashed
    pin (`zmosh-quic-q2-2`) with immutable tags; the compatibility
    adapter (`src/quic_transport.zig`) is frozen below 500 production
    SLOC, giving a bounded, reviewable surface between zmosh and the
    QUIC implementation.
+
+References: quiche's application-owned I/O model and C API are
+documented in its README (https://github.com/cloudflare/quiche);
+quinn's Tokio-based high-level API in its introduction
+(https://quinn-rs.github.io/quinn/quinn.html).
 
 ## Consequences and current costs
 
@@ -58,7 +72,9 @@ Revisit this decision if any of the following holds:
 - quicz cannot provide a needed QUIC feature (datagrams, migration
   at scale, ACK frequency tuning) without forking it;
 - the adapter outgrows its 500-SLOC bound more than transiently;
-- a maintained Rust QUIC implementation ships a C ABI that preserves
-  buffer ownership and single-threaded polling semantics;
+- a maintained Rust QUIC implementation ships a C ABI whose error,
+  buffer-ownership, and polling semantics map onto Zig without a
+  compensation layer (quiche already ships a C API; the open
+  question is ergonomics, not existence);
 - QUIC qualification (Phase Q8) exposes correctness gaps whose fixes
   upstream will not take.
