@@ -491,3 +491,59 @@ r8.6 contract; earlier sections stand except where amended.
    triggers; `AGENTS.md` acknowledges Ghostty and quicz as the two
    pinned dependencies and links the documents. Evidence is appended
    only after every claimed proof passes.
+
+## r8.6.1 amendment (frozen before execution)
+
+Review of the r8.6 chain found one P1 plus documentation accuracy
+defects. This amendment supersedes the affected r8.6 statements; the
+frozen r8.6 text above is preserved unchanged, and where it says
+`deliverTerminal()` is the "SOLE event-return path" the meaning was
+and is the sole **terminal**-event return path — nonterminal events
+still return normally through the pump.
+
+1. **`latchSocketFailure` precedence order (corrected).** After its
+   existing idempotence latch, pending-egress ownership, and
+   post-delivery guard, the order is exactly:
+   (1) an already-owned `.event_ready` terminal is preserved — no
+   polling, no replacement; (2) a `.failed` session with a
+   still-pending event stages that event; (3) a driver-owned
+   `.draining` with `kind == .err` (the deferred FINAL ERROR copied
+   there by `deferTerminal`, whose consumption leaves the session
+   slot empty) is promoted UNCHANGED to `.event_ready`; (4) a
+   `.failed` session with neither representation is the
+   missing-event invariant; (5) otherwise the socket failure itself
+   stages `internal_error`. The r8.6 order checked the failed session
+   first, so case (3) — a protocol failure deferred earlier in the
+   same pump followed by a failed receive — fell into the invariant
+   arm and clobbered the original code and reason.
+2. **Regression proof (deterministic).** `recv_fail_n` becomes an
+   Nth-call countdown (decrement, fail only at zero; 1 fails the next
+   receive, 2 permits one call then fails). A fourth terminal-
+   coherence phase exercises the same-pump path through the public
+   driver: enter no-FIN terminal draining; quiesce stale traffic
+   through NORMAL `Client.pump()` calls until `driver.sock` shows no
+   POLLIN (never raw-discard authenticated datagrams) and verify
+   not-readable BEFORE queuing; send ONE combined 16-byte illegal
+   RESIZE via one server stream write; service gateway egress until
+   POLLIN appears; arm countdown 2 and call ONE public
+   `Client.pump()`. Receive one processes the illegal frame and
+   defers `protocol_violation("frame after terminal marker")`;
+   receive two fails; the ORIGINAL failure is returned exactly once
+   with its own code and reason, `io_failed` is set, and the next
+   pump returns null. The existing drain-failure, post-delivery
+   socket, and clean-SESSION_END socket cases are retained unchanged.
+3. **Documentation accuracy.** ADR 0001 calls quicz a Zig
+   package/library, distinguishes quinn's Tokio-oriented high-level
+   API from quiche's caller-driven I/O/timer model and existing C
+   API, bases the decision on avoiding the Rust/C ABI and native
+   build dependencies plus explicit lifetime/error/allocator
+   translation, and corrects the reconsideration trigger with
+   primary-document references. The wire specification is marked
+   authoritative amended v1 and its DETACH and cross-stream rules are
+   rewritten normatively (what a client or server MUST send or
+   reject), removing runtime-mechanism language — parked copies,
+   ownership transfer, WouldBlock, caller retry — which remains in
+   `docs/quic-client-runtime.md`. Living code comments and the
+   runtime document say "sole terminal-event return path"; frozen
+   historical plan text is not edited in place.
+
