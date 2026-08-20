@@ -176,10 +176,22 @@ daemon is never initialized for a rejected peer.
 `ghostty_commit_ascii` is the lowercase 40-hex commit of the Ghostty
 dependency pin; `zig_package_hash_utf8` is the exact `.hash` string of
 that dependency in `build.zig.zon`; both enter the binary as build
-options and the id is computed at comptime. `adapter_version` is 1 and
-increments for any zmosh-side snapshot adapter or wire change. The id
-deliberately changes when the pin advances (Q4): mixed-version peers
-fail the fingerprint check.
+options and the id is computed at comptime. `adapter_version` is 2
+since Q4 and increments for any zmosh-side snapshot adapter or wire
+change. The id deliberately changes when the pin advances (Q4):
+mixed-version peers fail the fingerprint check.
+
+Frozen Q4 value of the exact production inputs — Ghostty commit
+`6361b2eac73e8243a7042f517ea95ab87165f105`, package hash
+`ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD`
+(62 bytes, u16 big-endian length prefix), adapter_version 2:
+
+    7698150409ab3681797355e5ba819898a422283b3f3ce8eee7cb15f6fb18d9ad
+
+This literal is pinned by the "snapshot abi id: frozen Q4 golden
+literal" test in `src/quic_wire.zig`: any pin advance or construction
+drift fails the suite until this record and the test are re-frozen
+together.
 
 ## Error codes
 
@@ -302,8 +314,10 @@ during an active transaction is a terminal interleave, and outside one
 is counted and ignored. Daemon EOF produces SESSION_END and closes
 with `session_ended`. Daemon frames are bounded (header + 64 KiB); an
 oversized declared frame is rejected before payload accumulation. The
-daemon read gate is header-aware: once an IPC header is buffered, a
-frame the session cannot accept (its bounded relay storage is
-occupied) has its payload withheld — but discard-only and
-terminal-error frames are always consumable, so withheld snapshot
-credit can never delay fail-closed handling or starve SnapshotBegin.
+daemon read gate is header-aware: each read is capped to the pending
+frame's unread header bytes until the header is inspectable, and once
+a buffered header declares a frame the session cannot accept (its
+bounded relay storage is occupied) no further bytes of that frame are
+read — but discard-only and terminal-error frames are always
+consumable, so withheld snapshot credit can never delay fail-closed
+handling or starve SnapshotBegin.

@@ -1154,7 +1154,9 @@ test "snapshot abi id: frozen Q4 golden literal" {
     // ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD,
     // adapter_version 2). Deliberately NOT derived through
     // computeSnapshotAbiId: any input or construction drift must fail
-    // here against the frozen bytes.
+    // here against the frozen bytes. This literal is the documentation
+    // pin — docs/quic-wire.md records it verbatim as the frozen Q4
+    // snapshot_abi_id, and the two must be re-frozen together.
     const frozen_q4 = [_]u8{
         0x76, 0x98, 0x15, 0x04, 0x09, 0xab, 0x36, 0x81,
         0x79, 0x73, 0x55, 0xe5, 0xba, 0x81, 0x98, 0x98,

@@ -1961,6 +1961,66 @@ the final Q4 gate. No quicz change, no Q5 scope change, and no
 quic_transport.zig change of any kind; the landed Stage 4.1 proofs
 are not reopened.
 
+### Q4 Stage 4.1.1 completion evidence (2026-08-20, appended after gates)
+
+Landed per the frozen order above: commit 1 was the contract itself
+(9afd7ac); commit 2 is `243f2bf` (runtime fix plus proofs); commit 3
+is this documentation and evidence.
+
+Commit 2 (`243f2bf`): `SocketBuffer.readAtMost(fd, max_bytes)` with
+an asserted 1..4096 range factors the existing compaction, append,
+and bounded-frame walk; `read(fd)` delegates at 4096 with every
+existing caller unchanged. `daemonReadCap(budget_left)` is the single
+authoritative read-cap calculation (header remainder while the
+header is unreadable; zero for terminal sessions, unacceptable
+declared frames, and complete buffered units; otherwise
+min(frame remaining, 4096, budget)); `daemonReadEligible` is its
+boolean wrapper and `relayDaemon` reads exactly that cap inside the
+64 KiB turn budget with its EOF/error/pump arms untouched. The
+coalesced proof ran RED first against the pre-fix tree: 279/280,
+`expected 8, found 1032` — the full coalesced frame buffered behind
+an exhausted output window (RED log retained outside the repository
+at /tmp/zmosh-4.1.1-red-coalesced.log). After the fix: exactly the
+eight-byte header buffered, gate closed, counter unchanged, session
+nonterminal; with credit restored and no second daemon write the
+queued 1024 'C' bytes relay exactly once behind the complete backlog
+and `daemon_output_frames` increments exactly once. A pipe-level
+unit test covers `readAtMost` directly (header-only cap, one-byte
+cap, lossless remainder); the separate-write proof and bounded
+reader tests are unchanged.
+
+Notes recorded during the proofs: the exhaust loop's frozen window
+is the 2048-byte initial uni credit, of which the 16-byte epoch-1
+output header plus 2032 backlog bytes drain before
+send_max_data == send_offset — the proof records the drained count
+and accounts for every byte in its final totals (the backlog is
+refilled to capacity, so the client ultimately receives
+64 KiB + 2032 'F' bytes and then exactly 1024 'C').
+
+Commit 3 (documentation): docs/quic-wire.md now states
+`adapter_version` is 2 (matching `src/quic_wire.zig` and its test
+pin) and records the literal frozen digest
+`7698150409ab3681797355e5ba819898a422283b3f3ce8eee7cb15f6fb18d9ad`
+with its exact inputs (Ghostty commit
+`6361b2eac73e8243a7042f517ea95ab87165f105`, 62-byte package hash
+`ghostty-1.3.2-dev-5UdBC5L2RQWfmtJwTX8gKITqL4rOJteCksb42xxDS9bD`,
+adapter_version 2) and the construction formula. The digest was
+independently recomputed (SHA-256 over domain‖commit‖u16_be(len)‖
+hash‖u32_be(2)) and matches both the existing "snapshot abi id:
+frozen Q4 golden literal" test and this record; that test's comment
+now identifies its literal as the documentation pin, so a pin
+advance fails the suite until both are re-frozen together. The
+overstrong "never reads the payload" / "payload withheld" wording in
+the wire document and the serve.zig module description is replaced
+with the exact capped-header-remainder mechanism.
+
+Gates: Debug 281/281 and ReleaseSafe 281/281 (279 at stage 4.1 plus
+the coalesced proof and the readAtMost unit test); `zig build
+check`, `zig build release` then Debug rebuild, `zig fmt --check`,
+`git diff --check` all clean; the frozen awk SLOC command reports
+467 on an untouched quic_transport.zig. Q5 scope, the quicz pin,
+and Stage 5 remain untouched and locked pending review.
+
 ## Phase Q5: reliable output epochs and remote attach
 
 Input uses one client unidirectional reliable stream. Raw terminal input is

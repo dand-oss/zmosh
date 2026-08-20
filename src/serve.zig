@@ -17,12 +17,13 @@
 //! last client size, and daemon EOF sends SESSION_END then settles
 //! both streams before closing (code 9). All daemon I/O is bounded
 //! and header-aware: the reader caps one frame (header + 64 KiB,
-//! oversized declarations rejected before accumulation) and never
-//! reads the payload of a frame the session cannot accept — while
-//! discard-only and terminal-error frames stay always-consumable so
-//! withheld snapshot credit can neither starve SnapshotBegin nor
-//! delay fail-closed handling; the writer is a 64 KiB buffer flushed
-//! on a dynamic POLL.OUT arm.
+//! oversized declarations rejected before accumulation) and caps
+//! every read to the pending frame's unread header bytes until the
+//! header is inspectable, so an unacceptable frame's payload cannot
+//! ride in behind its header — while discard-only and terminal-error
+//! frames stay always-consumable so withheld snapshot credit can
+//! neither starve SnapshotBegin nor delay fail-closed handling; the
+//! writer is a 64 KiB buffer flushed on a dynamic POLL.OUT arm.
 //!
 //! Bootstrap ordering is contract: EVERY fallible initialization
 //! completes before the success line prints; pre-success failures emit
