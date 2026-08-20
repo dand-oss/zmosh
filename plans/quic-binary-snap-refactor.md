@@ -1236,7 +1236,7 @@ SNAPSHOT_INSTALLED payload untested; client validation incomplete;
 none of the blocked-write/truncation/parking/bounded-queue/close/
 terminal-race proofs existed).
 
-The r8 correction round (this history: `330d51d` → `01a4c84` →
+The r8 correction round (this history: `330d51d` → `249d01c` →
 `649ad98`, plus the r8.4 addendum commit) replaces the flag-oriented
 client/driver logic with the hierarchical protocol FSM frozen in
 `plans/add-fsm.md`: ZMQ1 FINAL=0x01 (ERROR-only; fatal ERROR FINAL+FIN;
@@ -1260,6 +1260,35 @@ code review rather than a wired test (no fixture reaches the discard
 window with parked entries); the gate-skip scan is proven on the pure
 `firstReadyIdx` helper rather than a live reordered handshake; and the
 r7 limitation on client-originated PTO drop recovery still stands.
+### r8.5 addendum (SHA correction and restored proofs)
+
+The chain SHA above originally recorded `01a4c84` for r8.2; that
+commit was message-amended before the push and the ANCESTOR is
+`249d01c` — corrected in place above (git history itself was never
+affected).
+
+The r8 review additionally found the round not sign-off ready: an
+egress-retry double free, DETACH still a boolean inside `.active`,
+`dst.local` dropped from the pending-egress path binding, every peek
+failure passed to the adapter, `.event_ready` never assigned while
+`io_failed`/`returned_event` encoded lifecycle independently, and the
+three "disclosed limitations" below were frozen proof obligations,
+not limitations. The r8.5 correction round (frozen contract:
+`plans/add-fsm.md` r8.5 amendment) landed `dce1e63` (single-owner
+idempotent latch; typed `.detaching` retaining `control_tx` with
+`PendingKind.detach`, preface-pending `sendDetach` → `error.WouldBlock`,
+FIN clean only at `control_tx == .idle`, peer-close-during-detach
+violation; full `UdpTuple` retention; Retry-only peek passthrough;
+driver FSM authority through `.event_ready`/`deliverTerminal`) and
+`842c5c9` (the proofs: permanent-send retry ownership via the
+`egress_fail_n` fixture; the DETACH matrix; feed-OOM through the
+public `pump()` counter-proven inside feed; handshake-space pruning;
+the live gate-skip replay on an in-file `QuicGateway` peer with a
+synthetic short-form entry parked ahead of the real Handshake). The
+matrix also caught and fixed `controlRx()` never exposing
+`.detaching`. With r8.5, the earlier disclosed items are TESTS, not
+limitations; the r7 client-PTO drop-recovery limitation still stands.
+
 
 
 ## Phase Q4: Ghostty binary snapshot export
