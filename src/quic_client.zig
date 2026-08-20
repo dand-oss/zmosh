@@ -255,6 +255,42 @@ pub const ClientSession = struct {
         };
     }
 
+    /// Records a peer close observed by the socket-owning driver (the
+    /// FSM preserves draining evidence; see `recordPeerClose`).
+    pub fn notePeerClose(self: *ClientSession) void {
+        self.recordPeerCloseFromTransport();
+    }
+
+    /// The draining terminal evidence, if the session is draining.
+    pub fn drainingTerminal(self: *const ClientSession) ?TerminalMeta {
+        return switch (self.state) {
+            .draining => |d| d.terminal,
+            else => null,
+        };
+    }
+
+    /// The control stream reached its clean FIN (only possible after a
+    /// terminal marker, or the detach arm).
+    pub fn controlFinished(self: *const ClientSession) bool {
+        return switch (self.state) {
+            .draining => |d| d.control_rx == .finished,
+            else => false,
+        };
+    }
+
+    /// The output side will never yield more bytes: a clean FIN was
+    /// consumed, or a peer close made the FIN unreachable after the
+    /// readable bytes were drained.
+    pub fn outputSettled(self: *const ClientSession) bool {
+        return switch (self.state) {
+            .draining => |d| switch (d.output_rx) {
+                .finished, .unavailable_after_close => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
     // -- the five transition helpers (nothing else assigns state) ----------
 
     /// Valid HELLO_ACK: awaiting_ack → awaiting_first_resize; output
@@ -920,7 +956,6 @@ pub const client_stash_cap = 4096;
 
 const lib_posix = @import("posix.zig");
 const udp = @import("udp.zig");
-const quic_gateway = @import("quic_gateway.zig");
 
 /// Application versus transport peer close, distinctly surfaced.
 pub const PeerCloseInfo = struct {
@@ -935,10 +970,48 @@ pub const pump_max_outbound = 64;
 /// The bounded terminal/output accumulation: receiving STOPS while it
 /// is full; `pollOutput` drains it.
 pub const client_output_cap = 64 * 1024;
-/// Parked handshake datagrams bound; beyond it a drop is recovered by
-/// QUIC retransmission.
+/// Parked datagrams bound; beyond it a drop is recovered by QUIC
+/// retransmission.
 pub const parked_max = 16;
 pub const handshake_deadline_ns: i64 = 10 * std.time.ns_per_s;
+
+/// One parked inbound datagram: owned bytes, the ACTUAL arrival tuple
+/// (path identity survives the park), and the key gate that must open
+/// before replay.
+const quicz = @import("quicz");
+
+const ParkedDatagram = struct {
+    len: usize,
+    arrival: quicz.endpoint.UdpTuple,
+    gate: enum { handshake_keys, one_rtt_keys },
+    bytes: [quic_transport.max_udp_payload]u8,
+};
+
+/// The socket-owning driver's lifecycle. It does NOT duplicate the
+/// application protocol phases — it owns transport timing, socket
+/// failure, output accumulation, and terminal-event delivery only.
+/// `event_ready` and `draining` payloads carry terminal METADATA
+/// alone; the deferred reason bytes live in Client's fixed buffer so
+/// a pump that rewrites the union cannot invalidate the slice it
+/// returns.
+pub const DriverState = union(enum) {
+    handshaking: struct { deadline_ns: i64 },
+    running,
+    draining: TerminalMeta,
+    event_ready: TerminalMeta,
+    terminal_delivered,
+    closed,
+};
+
+/// Which parked gate has opened. Short-form packets gate on the
+/// EXISTENCE of 1-RTT protection keys — never on handshake
+/// confirmation, because HANDSHAKE_DONE itself arrives short-form.
+fn gateOpen(transport: *quic_transport.Transport, gate: @TypeOf(@as(ParkedDatagram, undefined).gate)) bool {
+    return switch (gate) {
+        .handshake_keys => transport.conn.hasHandshakeProtectionKeys(),
+        .one_rtt_keys => transport.connection().hasOneRttProtectionKeys(),
+    };
+}
 
 pub const Client = struct {
     alloc: std.mem.Allocator,
@@ -946,36 +1019,47 @@ pub const Client = struct {
     sock: udp.UdpSocket,
     transport: *quic_transport.Transport,
     session: ClientSession,
-    /// The stable remote the connection was opened to (v1: fixed).
-    remote: lib_posix.Address,
+    dstate: DriverState,
+
+    /// The configured remote — used ONLY for the initial route
+    /// registration. Every egress datagram carries its own
+    /// TaggedDatagram.dst.remote destination.
     remote_udp: quicz.endpoint.UdpAddress,
     local_udp: quicz.endpoint.UdpAddress,
     challenge: [8]u8,
-    handshake_deadline_ns: i64,
+
+    /// The one owned pending-egress datagram retained across a
+    /// WouldBlock send, retried before any new QUIC output is polled.
+    pending_egress: ?struct {
+        dg: []u8,
+        dst: quicz.endpoint.UdpAddress,
+        emitted_ping: bool,
+    } = null,
 
     /// Bounded output accumulation (linear buffer with compaction).
     out_buf: [client_output_cap]u8 = undefined,
     out_len: usize = 0,
     out_head: usize = 0,
 
-    /// Handshake-space datagrams that raced key installation: parked
-    /// (bounded; QUIC retransmission recovers an overflow drop) and
-    /// replayed once the keys exist — the same recovery the fixtures
-    /// perform.
-    parked: std.ArrayList([]u8) = .empty,
-    /// Whether parked[i] is a short-form (1-RTT) datagram gated on
-    /// handshake CONFIRMATION (long-form entries gate on keys).
-    parked_short: [parked_max]bool = [_]bool{false} ** parked_max,
+    /// Bounded FIFO of parked datagrams (fixed storage: parking never
+    /// allocates).
+    parked: [parked_max]ParkedDatagram = undefined,
+    parked_len: usize = 0,
+
+    /// Deferred terminal-event reason storage — a STABLE member, not
+    /// part of DriverState: the slice stays valid until the next pump.
+    deferred_reason: [quic_wire.error_reason_max]u8 = undefined,
+    deferred_reason_len: usize = 0,
+
     /// Malformed inbound datagrams discarded at the driver boundary.
     junk_received: usize = 0,
-    /// An allocation failure observed inside feed (surfaced by pump).
-    oom: bool = false,
+    /// Latched after the first permanent socket failure: no further
+    /// socket I/O is attempted.
+    io_failed: bool = false,
+    /// A terminal event produced by a mid-turn local failure, delivered
+    /// by this pump's epilogue or the next pump call.
+    returned_event: ?ControlEvent = null,
 
-    const quicz = @import("quicz");
-
-    /// One client turn. Returns and CONSUMES the one-event slot; the
-    /// event's reason stays valid in the session's fixed storage until
-    /// the next pump.
     pub fn connect(alloc: std.mem.Allocator, io: std.Io, psk: *const [32]u8, remote: lib_posix.Address, now: i64) !Client {
         const family: u32 = switch (remote.any.family) {
             lib_posix.AF.INET => lib_posix.AF.INET,
@@ -996,34 +1080,29 @@ pub const Client = struct {
             .original_dcid = odcid,
         });
         errdefer transport.destroy();
-        const remote_udp = quic_gateway.sockaddrToUdpAddress(remote) orelse return error.UnsupportedAddressFamily;
+        const remote_udp = udp.sockaddrToUdpAddress(remote) orelse return error.UnsupportedAddressFamily;
         var bound: lib_posix.Address = std.mem.zeroes(lib_posix.Address);
         var bound_len: lib_posix.socklen_t = @sizeOf(lib_posix.Address);
         try lib_posix.getsockname(sock.getFd(), &bound.any, &bound_len);
-        const local_udp = quic_gateway.sockaddrToUdpAddress(bound) orelse return error.UnsupportedAddressFamily;
+        const local_udp = udp.sockaddrToUdpAddress(bound) orelse return error.UnsupportedAddressFamily;
         try transport.registerRoute(local_udp, remote_udp);
         var session = try ClientSession.init(alloc, transport);
         errdefer session.deinit();
-        var c = Client{
+        return .{
             .alloc = alloc,
             .io = io,
             .sock = sock,
             .transport = transport,
             .session = session,
-            .remote = remote,
+            .dstate = .{ .handshaking = .{ .deadline_ns = now + handshake_deadline_ns } },
             .remote_udp = remote_udp,
             .local_udp = local_udp,
             .challenge = challenge,
-            .handshake_deadline_ns = now + handshake_deadline_ns,
         };
-        errdefer c.parked.deinit(alloc);
-        try c.parked.ensureTotalCapacity(alloc, parked_max);
-        return c;
     }
 
     pub fn deinit(self: *Client) void {
-        for (self.parked.items) |dg| self.alloc.free(dg);
-        self.parked.deinit(self.alloc);
+        if (self.pending_egress) |p| self.alloc.free(p.dg);
         self.session.deinit();
         self.transport.destroy();
         self.sock.close();
@@ -1033,21 +1112,30 @@ pub const Client = struct {
         return self.transport.handshakeConfirmed();
     }
 
-    /// The composed deadline: the 10 s handshake anchor until the
-    /// handshake confirms, then the transport's own deadlines. Always
-    /// in the future so a poll timeout of zero never busy-loops.
+    /// The driver-state-frozen deadline composition: while handshaking,
+    /// the minimum of the handshake anchor and the transport deadline;
+    /// running or draining, the transport deadline alone; terminal or
+    /// closed, none (an expired anchor can never busy-loop). Always in
+    /// the future when present.
     pub fn nextDeadline(self: *const Client, now: i64) ?i64 {
         const transport_deadline = self.transport.nextDeadlineNanos();
         var d: i64 = undefined;
-        if (!self.transport.handshakeConfirmed()) {
-            d = self.handshake_deadline_ns;
-            if (transport_deadline) |td| d = @min(td, d);
-        } else if (transport_deadline) |td| {
-            d = td;
-        } else {
-            return null;
+        switch (self.dstate) {
+            .handshaking => |h| {
+                d = h.deadline_ns;
+                if (transport_deadline) |td| d = @min(td, d);
+            },
+            .running, .draining => {
+                d = transport_deadline orelse return null;
+            },
+            .event_ready, .terminal_delivered, .closed => return null,
         }
         return @max(d, now + 1);
+    }
+
+    /// The driver's lifecycle tag (transition assertions).
+    pub fn driverState(self: *const Client) DriverState {
+        return self.dstate;
     }
 
     /// The peer's close, distinctly application versus transport.
@@ -1098,115 +1186,394 @@ pub const Client = struct {
         }
     }
 
-    /// One bounded turn. Enforces the 10 s handshake timeout (a bare
-    /// nextDeadline would busy-loop after expiry), retries parked
-    /// atomic writes, sends ≤ 64 outbound datagrams (including PTO
-    /// output), drains existing state, then receives ≤ 64 inbound
-    /// datagrams — draining control/output after EACH, and stopping
-    /// when the event slot is occupied or the output queue is full.
-    pub fn pump(self: *Client, now: i64) !?ControlEvent {
-        if (!self.transport.handshakeConfirmed() and now >= self.handshake_deadline_ns) {
-            return self.failLocal(.session_ended, "handshake timeout");
-        }
-        if (!self.transport.handshakeConfirmed()) {
-            try self.transport.driveCrypto(.initial, now);
-            try self.transport.driveCrypto(.handshake, now);
-        }
-        try self.session.retryPendingSends();
+    // -- egress: one send-or-park path for every datagram -------------------
 
-        var outbound: usize = 0;
-        while (outbound < pump_max_outbound) : (outbound += 1) {
-            const dg = (try self.transport.pollOutbound(now)) orelse break;
-            defer self.alloc.free(dg);
-            self.sock.sendTo(dg, self.remote) catch |e| switch (e) {
-                error.WouldBlock => break,
-                else => return e,
-            };
+    const Egress = enum { sent, parked };
+
+    /// Sends one tagged datagram to its OWN destination
+    /// (TaggedDatagram.dst.remote — never the configured peer). A
+    /// WouldBlock send retains the complete datagram, its destination,
+    /// path binding, and ping metadata in the pending-egress slot; a
+    /// permanent failure latches the no-more-I/O state.
+    fn sendOrPark(self: *Client, tagged: quic_transport.Transport.TaggedDatagram) !Egress {
+        const sent = if (self.sock.sendTo(tagged.dg, udp.udpAddressToSockaddr(tagged.dst.remote))) true else |e| switch (e) {
+            error.WouldBlock => false,
+            else => return self.failSocket(tagged.dg, "socket send failed"),
+        };
+        if (sent) {
+            self.alloc.free(tagged.dg);
+            return .sent;
         }
-        if (outbound < pump_max_outbound) {
+        self.pending_egress = .{ .dg = tagged.dg, .dst = tagged.dst.remote, .emitted_ping = tagged.emitted_ping };
+        return .parked;
+    }
+
+    /// Retries the retained datagram BEFORE any new QUIC output is
+    /// polled.
+    fn retryPendingEgress(self: *Client) !bool {
+        const p = self.pending_egress orelse return true;
+        const sent = if (self.sock.sendTo(p.dg, udp.udpAddressToSockaddr(p.dst))) true else |e| switch (e) {
+            error.WouldBlock => false,
+            else => return self.failSocket(p.dg, "socket send failed"),
+        };
+        if (sent) {
+            self.alloc.free(p.dg);
+            self.pending_egress = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// One bounded egress turn: pending retry first, then freshly
+    /// polled output and deadline output through the same path, all
+    /// under the shared outbound budget.
+    fn pumpEgress(self: *Client, now: i64) !void {
+        if (self.io_failed) return;
+        _ = try self.retryPendingEgress();
+        var outbound: usize = 0;
+        while (outbound < pump_max_outbound and self.pending_egress == null) : (outbound += 1) {
+            const tagged = (try self.transport.pollOutboundPath(now)) orelse break;
+            if (try self.sendOrPark(tagged) == .parked) break;
+        }
+        if (outbound < pump_max_outbound and self.pending_egress == null) {
             switch (try self.transport.serviceDueDeadline(now)) {
                 .datagram => |tagged| {
-                    defer self.alloc.free(tagged.dg);
-                    self.sock.sendTo(tagged.dg, quic_gateway.udpAddressToSockaddr(tagged.dst.remote)) catch {};
+                    _ = try self.sendOrPark(tagged);
                 },
-                else => {},
+                .idle_retired, .close_retired, .no_output => {},
             }
         }
+    }
 
-        // Drain existing state BEFORE receiving.
+    // -- inbound: classify before parsing, park on key gates ---------------
+
+    /// Offers one received datagram to the adapter with its ACTUAL
+    /// source tuple; a consumed migration challenge rotates like the
+    /// gateway's. Malformed network junk is discarded and counted;
+    /// only allocation failure aborts the pump.
+    fn feed(self: *Client, arrival: quicz.endpoint.UdpTuple, now: i64, data: []const u8) !void {
+        const consumed = if (self.transport.handleDatagram(arrival, now, data, &self.challenge)) |c| c else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                self.junk_received += 1;
+                return;
+            },
+        };
+        if (consumed) self.io.random(&self.challenge);
+    }
+
+    fn parkDatagram(self: *Client, len: usize, arrival: quicz.endpoint.UdpTuple, gate: @TypeOf(@as(ParkedDatagram, undefined).gate), buf: []const u8) void {
+        if (self.parked_len >= parked_max) return; // bounded; QUIC retransmission recovers
+        self.parked[self.parked_len] = .{ .len = len, .arrival = arrival, .gate = gate, .bytes = undefined };
+        @memcpy(self.parked[self.parked_len].bytes[0..len], buf[0..len]);
+        self.parked_len += 1;
+    }
+
+    fn removeParked(self: *Client, i: usize) void {
+        std.mem.copyForwards(ParkedDatagram, self.parked[i .. self.parked_len - 1], self.parked[i + 1 .. self.parked_len]);
+        self.parked_len -= 1;
+    }
+
+    /// Classifies BEFORE the long-header parser: empty datagrams are
+    /// counted and dropped; short-form datagrams park only while the
+    /// 1-RTT protection keys are absent; Handshake long packets park
+    /// only while Handshake keys are absent; anything the protected
+    /// peek rejects (Retry, malformed long headers) passes once to the
+    /// adapter, whose route layer performs Retry validation and
+    /// discard-and-count. Returns false when the datagram was parked.
+    fn classifyAndFeed(self: *Client, r_addr: lib_posix.Address, now: i64, buf: []const u8) !bool {
+        const remote = udp.sockaddrToUdpAddress(r_addr) orelse {
+            self.junk_received += 1;
+            return true;
+        };
+        const arrival = quicz.endpoint.UdpTuple{ .local = self.local_udp, .remote = remote };
+        if (buf.len == 0) {
+            self.junk_received += 1;
+            return true;
+        }
+        const is_short = (buf[0] & 0x80) == 0;
+        if (is_short) {
+            if (!self.transport.connection().hasOneRttProtectionKeys()) {
+                self.parkDatagram(buf.len, arrival, .one_rtt_keys, buf);
+                return false;
+            }
+            try self.feed(arrival, now, buf);
+            return true;
+        }
+        const info = quicz.protection.peekProtectedLongPacketInfo(buf) catch {
+            // Retry validation and junk counting happen inside the
+            // adapter's route layer.
+            try self.feed(arrival, now, buf);
+            return true;
+        };
+        if (info.packet_type == .handshake and !self.transport.conn.hasHandshakeProtectionKeys()) {
+            self.parkDatagram(buf.len, arrival, .handshake_keys, buf);
+            return false;
+        }
+        try self.feed(arrival, now, buf);
+        return true;
+    }
+
+    /// Replays ready parked datagrams. NEVER stalls behind an unopened
+    /// gate — packet-number spaces advance independently, so an early
+    /// 1-RTT datagram must not block a later Handshake datagram that
+    /// installs the very keys needed to unblock it. Scan in arrival
+    /// order, skip unready entries, feed the first ready one, remove
+    /// WITHOUT advancing the index, then restart from index 0 (feeding
+    /// may open another gate). Obsolete handshake-space entries are
+    /// dropped once that space is discarded. Each replayed datagram
+    /// consumes the shared inbound budget.
+    fn replayParked(self: *Client, now: i64, budget: *usize) !void {
+        if (self.transport.connection().packetNumberSpaceDiscarded(.handshake)) {
+            var i: usize = 0;
+            while (i < self.parked_len) {
+                if (self.parked[i].gate == .handshake_keys) {
+                    self.removeParked(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        while (budget.* < pump_max_inbound) {
+            var idx: usize = 0;
+            var processed = false;
+            while (idx < self.parked_len) {
+                if (!gateOpen(self.transport, self.parked[idx].gate)) {
+                    idx += 1;
+                    continue;
+                }
+                const entry = &self.parked[idx];
+                try self.feed(entry.arrival, now, entry.bytes[0..entry.len]);
+                self.removeParked(idx);
+                budget.* += 1;
+                processed = true;
+                break;
+            }
+            if (!processed) return;
+        }
+    }
+
+    // -- terminal-event deferral -------------------------------------------
+
+    fn isTerminalEvent(e: ControlEvent) bool {
+        return switch (e) {
+            .session_end => true,
+            .err => |er| er.terminal,
+            .hello_ack => false,
+        };
+    }
+
+    /// Copies the terminal event's metadata (and reason bytes into the
+    /// STABLE buffer) and holds it while output drains.
+    fn deferTerminal(self: *Client, e: ControlEvent) void {
+        switch (e) {
+            .session_end => {
+                self.deferred_reason_len = 0;
+                self.dstate = .{ .draining = .{ .kind = .session_end, .code = 0 } };
+            },
+            .err => |er| {
+                const rlen = @min(er.reason.len, self.deferred_reason.len);
+                @memcpy(self.deferred_reason[0..rlen], er.reason[0..rlen]);
+                self.deferred_reason_len = rlen;
+                self.dstate = .{ .draining = .{ .kind = .err, .code = er.code } };
+            },
+            .hello_ack => {},
+        }
+    }
+
+    /// Rebuilds the deferred event from stable storage. The
+    /// detach-fin completion carries no event (the connection close
+    /// that follows is the caller's signal).
+    fn deferredEvent(self: *Client, meta: TerminalMeta) ?ControlEvent {
+        return switch (meta.kind) {
+            .session_end => ControlEvent.session_end,
+            .err => .{ .err = .{
+                .code = meta.code,
+                .reason = self.deferred_reason[0..self.deferred_reason_len],
+                .terminal = true,
+            } },
+            .detach_fin => null,
+        };
+    }
+
+    /// The first permanent socket failure: one internal_error terminal
+    /// event, best-effort session shutdown, pending egress freed, and
+    /// socket I/O disabled for good.
+    fn failSocket(self: *Client, dg: []u8, context: []const u8) error{SocketFailed} {
+        self.alloc.free(dg);
+        self.io_failed = true;
+        if (self.pending_egress) |p| {
+            self.alloc.free(p.dg);
+            self.pending_egress = null;
+        }
+        const ev = self.session.failLocal(.internal_error, context);
+        self.dstate = .terminal_delivered;
+        self.returned_event = ev;
+        return error.SocketFailed;
+    }
+
+    /// One bounded turn. Retries the pending egress datagram first,
+    /// then polls new output and deadline output through the same
+    /// send-or-park path; drains OUTPUT BEFORE control (before
+    /// receiving and after every processed datagram); receives up to
+    /// the shared inbound budget, classifying before parsing; replays
+    /// ready parked datagrams. Terminal events are DEFERRED until the
+    /// output side is safely accumulated (both clean FINs observed or
+    /// the peer closed after draining everything readable); a failure
+    /// event surfaces immediately. `event_ready` → `terminal_delivered`
+    /// happens atomically with the return.
+    pub fn pump(self: *Client, now: i64) !?ControlEvent {
+        switch (self.dstate) {
+            .event_ready => |meta| {
+                self.dstate = .terminal_delivered;
+                return self.deferredEvent(meta);
+            },
+            // Terminal delivered, peer still settling: keep ACK/PTO
+            // egress and socket receives alive so the peer's close
+            // becomes observable, then stop for good.
+            .terminal_delivered => {
+                try self.drainPostTerminal(now);
+                return null;
+            },
+            .closed => return null,
+            .handshaking, .running, .draining => {},
+        }
+        if (self.returned_event) |e| {
+            self.returned_event = null;
+            return e;
+        }
+
+        if (self.dstate == .handshaking) {
+            if (now >= self.dstate.handshaking.deadline_ns) {
+                // Fires once: the state leaves .handshaking with the
+                // event, and nextDeadline() returns null from here on.
+                const ev = self.session.failLocal(.session_ended, "handshake timeout");
+                self.dstate = .terminal_delivered;
+                return ev;
+            }
+            try self.transport.driveCrypto(.initial, now);
+            try self.transport.driveCrypto(.handshake, now);
+            if (self.transport.handshakeConfirmed()) self.dstate = .running;
+        }
+        try self.session.retryPendingSends();
+        try self.pumpEgress(now);
+
+        // Drain output BEFORE control, before receiving.
         var ev: ?ControlEvent = null;
-        if (try self.session.pollControl()) |e| ev = e;
         try self.drainOutput();
+        if (try self.session.pollControl()) |e| {
+            if (isTerminalEvent(e)) {
+                self.deferTerminal(e);
+            } else {
+                ev = e;
+            }
+        }
 
         var inbound: usize = 0;
         var buf: [quic_transport.max_udp_payload]u8 = undefined;
-        while (inbound < pump_max_inbound and ev == null and !self.outputFull()) : (inbound += 1) {
-            const r = self.sock.recvFrom(&buf) catch break;
-            const arrival = quicz.endpoint.UdpTuple{ .local = self.local_udp, .remote = self.remote_udp };
-            // Park Handshake-space datagrams that race key
-            // installation; replay them once the keys exist.
-            const info = quicz.protection.peekProtectedLongPacketInfo(buf[0..r.len]) catch {
-                self.feed(arrival, now, buf[0..r.len]);
-                if (try self.session.pollControl()) |e| ev = e;
-                try self.drainOutput();
-                continue;
+        while (!self.io_failed and inbound < pump_max_inbound and ev == null and
+            !self.sessionDrainComplete()) : (inbound += 1)
+        {
+            // A full output queue blocks receiving ONLY while the
+            // output side is unfinished — with FIN consumed and all
+            // output queued (even exactly 64 KiB) the release stands.
+            if (self.outputFull() and !self.session.outputSettled()) break;
+            const r = self.sock.recvFrom(&buf) catch |e| switch (e) {
+                error.WouldBlock => break,
+                else => {
+                    self.failSocketNoDatagram("socket receive failed") catch {};
+                    return self.takeReturnedEvent();
+                },
             };
-            const is_short = (buf[0] & 0x80) == 0;
-            const gate_on_keys = info.packet_type == .handshake and !self.transport.conn.hasHandshakeProtectionKeys();
-            // A short-form (1-RTT) datagram that races handshake
-            // CONFIRMATION would be silently discarded by the keyless
-            // path — park it too; replay order preserves arrival.
-            const gate_on_confirm = is_short and !self.transport.handshakeConfirmed();
-            if (gate_on_keys or gate_on_confirm) {
-                if (self.parked.items.len < parked_max) {
-                    const dg = self.alloc.dupe(u8, buf[0..r.len]) catch return error.OutOfMemory;
-                    self.parked.appendAssumeCapacity(dg);
-                    self.parked_short[self.parked.items.len - 1] = gate_on_confirm;
+            _ = try self.classifyAndFeed(r.addr, now, buf[0..r.len]);
+            try self.drainOutput();
+            if (try self.session.pollControl()) |e| {
+                if (isTerminalEvent(e)) {
+                    self.deferTerminal(e);
+                } else {
+                    ev = e;
                 }
-                continue;
             }
-            self.feed(arrival, now, buf[0..r.len]);
-            if (try self.session.pollControl()) |e| ev = e;
-            try self.drainOutput();
         }
-        // Replay parked datagrams whose gate has opened (handshake
-        // keys for long-form entries, confirmation for short-form).
-        var gate_i: usize = 0;
-        while (gate_i < self.parked.items.len) : (gate_i += 1) {
-            const ready = if (self.parked_short[gate_i])
-                self.transport.handshakeConfirmed()
-            else
-                self.transport.conn.hasHandshakeProtectionKeys();
-            if (!ready) continue;
-            const dg = self.parked.items[gate_i];
-            const arrival = quicz.endpoint.UdpTuple{ .local = self.local_udp, .remote = self.remote_udp };
-            _ = try self.transport.handleDatagram(arrival, now, dg, &self.challenge);
-            self.feed(arrival, now, dg);
-            if (try self.session.pollControl()) |e| ev = e;
-            try self.drainOutput();
-            self.alloc.free(dg);
-            _ = self.parked.orderedRemove(gate_i);
-            // Compact the short flags with the list.
-            var s_i = gate_i;
-            while (s_i < self.parked.items.len) : (s_i += 1) {
-                self.parked_short[s_i] = self.parked_short[s_i + 1];
+        if (!self.io_failed) try self.replayParked(now, &inbound);
+
+        // A peer close observed now: the session records it (draining
+        // evidence is preserved; a missing control FIN becomes a
+        // protocol failure).
+        if (self.transport.connection().peerClose() != null) {
+            self.session.notePeerClose();
+        }
+
+        // Release the deferred terminal once the output side is safely
+        // accumulated — or immediately when the session failed.
+        if (self.dstate == .draining) {
+            const failed = self.session.stateTag() == .failed;
+            if (failed or (self.session.controlFinished() and self.session.outputSettled())) {
+                const meta = self.dstate.draining;
+                self.dstate = .terminal_delivered;
+                if (failed) {
+                    // A protocol failure REPLACED the deferred event:
+                    // surface the session's own failure event.
+                    if (try self.session.pollControl()) |e| return e;
+                }
+                return self.deferredEvent(meta);
             }
-            if (ev != null) break;
         }
         return ev;
     }
 
-    /// Feeds one datagram; malformed network junk is discarded and
-    /// counted (the adapter's own discard-and-count discipline for the
-    /// paths its route layer covers), only allocation failure aborts.
-    fn feed(self: *Client, arrival: quicz.endpoint.UdpTuple, now: i64, data: []const u8) void {
-        _ = self.transport.handleDatagram(arrival, now, data, &self.challenge) catch |e| switch (e) {
-            error.OutOfMemory => {
-                self.oom = true;
-                return;
-            },
-            else => self.junk_received += 1,
-        };
+    /// Post-terminal drain: ACK/PTO egress and bounded receives so the
+    /// peer's settle-close race resolves and `peerClose()` becomes
+    /// observable; the driver stops for good once the close is seen.
+    /// No events are delivered here.
+    fn drainPostTerminal(self: *Client, now: i64) !void {
+        if (self.io_failed) {
+            self.dstate = .closed;
+            return;
+        }
+        try self.pumpEgress(now);
+        var inbound: usize = 0;
+        var buf: [quic_transport.max_udp_payload]u8 = undefined;
+        while (inbound < pump_max_inbound) : (inbound += 1) {
+            const r = self.sock.recvFrom(&buf) catch |e| switch (e) {
+                error.WouldBlock => break,
+                else => {
+                    self.failSocketNoDatagram("socket receive failed") catch {};
+                    self.dstate = .closed;
+                    return;
+                },
+            };
+            _ = try self.classifyAndFeed(r.addr, now, buf[0..r.len]);
+        }
+        if (!self.io_failed) try self.replayParked(now, &inbound);
+        try self.drainOutput();
+        _ = try self.session.pollControl();
+        if (self.transport.connection().peerClose() != null) {
+            self.session.notePeerClose();
+            self.dstate = .closed;
+        }
+    }
+
+    fn sessionDrainComplete(self: *const Client) bool {
+        if (self.dstate != .draining) return false;
+        return self.session.controlFinished() and self.session.outputSettled();
+    }
+
+    fn takeReturnedEvent(self: *Client) ?ControlEvent {
+        const e = self.returned_event orelse return null;
+        self.returned_event = null;
+        return e;
+    }
+
+    fn failSocketNoDatagram(self: *Client, context: []const u8) error{SocketFailed} {
+        self.io_failed = true;
+        if (self.pending_egress) |p| {
+            self.alloc.free(p.dg);
+            self.pending_egress = null;
+        }
+        self.returned_event = self.session.failLocal(.internal_error, context);
+        self.dstate = .terminal_delivered;
+        return error.SocketFailed;
     }
 
     /// A local failure surfaced exactly like a wire one.

@@ -3536,3 +3536,107 @@ test "zmq1 r8: failed state — one failure, no resurrection, sends rejected" {
     try testing.expect((try client.pollControl()) == null);
     try testing.expectEqual(quic_client.StateTag.failed, client.stateTag());
 }
+
+test "client driver r8: deadline composition frozen by driver state" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    const anchor: i64 = 1_000_000;
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, loop.gw_addr, anchor);
+    defer driver.deinit();
+
+    // handshaking: the anchor composes with (is never later than) the
+    // transport deadline, and never sits in the past.
+    const td = driver.transport.nextDeadlineNanos();
+    const d0 = driver.nextDeadline(anchor + 100).?;
+    try testing.expect(d0 > anchor + 100);
+    if (td) |t| try testing.expect(d0 <= @max(t, anchor + 101));
+    // A passed anchor clamps to now+1 — never zero, never in the past.
+    try testing.expectEqual(@as(i64, anchor + quic_client.handshake_deadline_ns + 6), driver.nextDeadline(anchor + quic_client.handshake_deadline_ns + 5).?);
+
+    // Terminal states return null — an expired anchor can never
+    // busy-loop the poll timeout.
+    driver.dstate = .terminal_delivered;
+    try testing.expect(driver.nextDeadline(anchor + 10_000_000) == null);
+    driver.dstate = .closed;
+    try testing.expect(driver.nextDeadline(anchor + 10_000_000) == null);
+    driver.dstate = .{ .event_ready = .{ .kind = .session_end, .code = 0 } };
+    try testing.expect(driver.nextDeadline(anchor + 10_000_000) == null);
+
+    // running: the transport deadline alone.
+    driver.dstate = .running;
+    if (td) |t| {
+        try testing.expectEqual(@as(i64, @max(t, anchor + 101)), driver.nextDeadline(anchor + 100).?);
+    } else {
+        try testing.expect(driver.nextDeadline(anchor + 100) == null);
+    }
+    // draining: the transport deadline alone.
+    driver.dstate = .{ .draining = .{ .kind = .session_end, .code = 0 } };
+    if (td) |t| {
+        try testing.expectEqual(@as(i64, @max(t, anchor + 101)), driver.nextDeadline(anchor + 100).?);
+    } else {
+        try testing.expect(driver.nextDeadline(anchor + 100) == null);
+    }
+}
+
+test "client driver r8: terminal deferral holds output, releases after both FINs" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var loop = try quic_test.Loop.init(alloc, &psk, false);
+    defer loop.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+
+    var driver = try quic_client.Client.connect(alloc, testing.io, &psk, loop.gw_addr, lib_posix.nowNs());
+    defer driver.deinit();
+
+    var ack: ?quic_client.ControlEvent = null;
+    for (0..80) |i| {
+        ack = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+        if (ack != null) break;
+    }
+    try testing.expect(ack != null and ack.? == .hello_ack);
+    try driver.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    _ = (try dr.next(loop.daemon_fd)) orelse return error.NoInit;
+
+    // Daemon output, THEN EOF: the SESSION_END terminal is deferred
+    // until "deferred" is fully accumulated — output bytes surface
+    // through the queue BEFORE (or with) the event, never after it.
+    try ipc.send(loop.daemon_fd, .Output, "deferred-output");
+    lib_posix.close(loop.daemon_fd);
+    loop.daemon_fd = -1;
+
+    var got_bytes: []const u8 = "";
+    var end_seen = false;
+    for (0..24) |i| {
+        if (try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)))) |e| {
+            if (e == .session_end) end_seen = true;
+        }
+        var obuf: [64]u8 = undefined;
+        if (try driver.pollOutput(&obuf)) |n| {
+            if (got_bytes.len == 0) got_bytes = try alloc.dupe(u8, obuf[0..n]);
+        }
+        if (end_seen and got_bytes.len > 0) break;
+    }
+    try testing.expect(end_seen);
+    try testing.expectEqualStrings("deferred-output", got_bytes);
+    try testing.expect(driver.driverState() == .terminal_delivered or driver.driverState() == .closed);
+    // Once terminal-delivered, the event never repeats.
+    try testing.expect((try driver.pump(lib_posix.nowNs())) == null);
+    alloc.free(got_bytes);
+}

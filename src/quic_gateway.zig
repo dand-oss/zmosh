@@ -72,30 +72,10 @@ pub fn deriveTokenSecret(out: *[32]u8, bootstrap_secret: *const [32]u8) void {
     HkdfSha256.expand(out, "zmosh-address-validation-v1", prk);
 }
 
-/// Convert one kernel sockaddr into the quicz address form. Returns
-/// null for non-INET families.
-pub fn sockaddrToUdpAddress(addr: lib_posix.Address) ?quicz.endpoint.UdpAddress {
-    return switch (addr.any.family) {
-        lib_posix.AF.INET => quicz.endpoint.UdpAddress.init4(
-            @bitCast(addr.in.addr),
-            std.mem.bigToNative(u16, addr.in.port),
-        ),
-        lib_posix.AF.INET6 => quicz.endpoint.UdpAddress.init6Scoped(
-            addr.in6.addr,
-            std.mem.bigToNative(u16, addr.in6.port),
-            addr.in6.scope_id,
-        ),
-        else => null,
-    };
-}
-
-/// Convert one quicz address back into a kernel sockaddr for sendto.
-pub fn udpAddressToSockaddr(a: quicz.endpoint.UdpAddress) lib_posix.Address {
-    if (a.family == .ipv4) {
-        return lib_posix.Address.initIp4(a.v4, a.port);
-    }
-    return lib_posix.Address.initIp6(a.v6, a.port, 0, a.scope_id);
-}
+/// Address conversion lives in udp.zig (the network layer's single
+/// source of truth); re-exported here for the existing call sites.
+pub const sockaddrToUdpAddress = udp.sockaddrToUdpAddress;
+pub const udpAddressToSockaddr = udp.udpAddressToSockaddr;
 
 const GatewayRecord = struct {
     transport: *Transport,

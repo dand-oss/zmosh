@@ -1,8 +1,35 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
 const crypto = @import("crypto.zig");
+const quicz = @import("quicz");
 
 const log = std.log.scoped(.udp);
+
+/// Convert one kernel sockaddr into the quicz address form. The single
+/// source of truth for both gateway and client. Returns null for
+/// non-INET families.
+pub fn sockaddrToUdpAddress(addr: lib_posix.Address) ?quicz.endpoint.UdpAddress {
+    return switch (addr.any.family) {
+        lib_posix.AF.INET => quicz.endpoint.UdpAddress.init4(
+            @bitCast(addr.in.addr),
+            std.mem.bigToNative(u16, addr.in.port),
+        ),
+        lib_posix.AF.INET6 => quicz.endpoint.UdpAddress.init6Scoped(
+            addr.in6.addr,
+            std.mem.bigToNative(u16, addr.in6.port),
+            addr.in6.scope_id,
+        ),
+        else => null,
+    };
+}
+
+/// Convert one quicz address back into a kernel sockaddr for sendto.
+pub fn udpAddressToSockaddr(a: quicz.endpoint.UdpAddress) lib_posix.Address {
+    if (a.family == .ipv4) {
+        return lib_posix.Address.initIp4(a.v4, a.port);
+    }
+    return lib_posix.Address.initIp6(a.v6, a.port, 0, a.scope_id);
+}
 
 /// Monotonic nanoseconds (see lib_posix.nowNs).
 fn nanoNow() i64 {
