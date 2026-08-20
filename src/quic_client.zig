@@ -1502,11 +1502,44 @@ pub const Client = struct {
     /// The first permanent socket failure: one internal_error terminal
     /// event, best-effort session shutdown, pending egress freed, and
     /// socket I/O disabled for good.
-    /// The ONE permanent-failure latch — idempotent: a second call
-    /// neither replaces the first event nor frees anything again. It
-    /// still routes the failure through ClientSession.failLocal so the
-    /// session's shutdown and state stay consistent, then parks the
-    /// terminal metadata in `.event_ready` for deliverTerminal().
+    /// THE stager: copies a terminal event's metadata and reason into
+    /// the stable driver storage and assigns `.event_ready`. Accepts
+    /// only terminal SESSION_END/ERROR and never returns the event —
+    /// deliverTerminal() is the sole event-return path.
+    fn stageTerminal(self: *Client, e: ControlEvent) void {
+        switch (e) {
+            .session_end => {
+                self.deferred_reason_len = 0;
+                self.dstate = .{ .event_ready = .{ .kind = .session_end, .code = 0 } };
+            },
+            .err => |er| {
+                const rlen = @min(er.reason.len, self.deferred_reason.len);
+                @memcpy(self.deferred_reason[0..rlen], er.reason[0..rlen]);
+                self.deferred_reason_len = rlen;
+                self.dstate = .{ .event_ready = .{ .kind = .err, .code = er.code } };
+            },
+            .hello_ack => {},
+        }
+    }
+
+    /// Synthesize the driver's own internal_error terminal (the socket
+    /// failure created the failure — no prior terminal exists).
+    fn stageInternalError(self: *Client, context: []const u8) void {
+        _ = self.session.failLocal(.internal_error, context);
+        const rlen = @min(context.len, self.deferred_reason.len);
+        @memcpy(self.deferred_reason[0..rlen], context[0..rlen]);
+        self.deferred_reason_len = rlen;
+        self.dstate = .{ .event_ready = .{ .kind = .err, .code = quic_wire.ErrCode.internal_error.code() } };
+    }
+
+    /// The ONE permanent-failure latch — idempotent and single-owner:
+    /// disables I/O and frees the pending egress exactly once. The
+    /// terminal it stages follows the frozen precedence: an existing
+    /// stored session/protocol failure wins; an already-deferred FINAL
+    /// ERROR wins over the socket; otherwise the socket failure itself
+    /// creates internal_error (a clean deferred SESSION_END can no
+    /// longer prove output completeness); a failed session with no
+    /// stored event is an invariant failure, also internal_error.
     fn latchSocketFailure(self: *Client, context: []const u8) void {
         if (self.io_failed) return;
         self.io_failed = true;
@@ -1514,17 +1547,24 @@ pub const Client = struct {
             self.alloc.free(p.dg);
             self.pending_egress = null;
         }
-        if (self.session.failLocal(.internal_error, context)) |ev| {
-            switch (ev) {
-                .err => |er| {
-                    const rlen = @min(er.reason.len, self.deferred_reason.len);
-                    @memcpy(self.deferred_reason[0..rlen], er.reason[0..rlen]);
-                    self.deferred_reason_len = rlen;
-                },
-                else => {},
+        // 1. An existing session failure wins with its own code+reason.
+        if (self.session.stateTag() == .failed) {
+            if (self.session.pollControl() catch null) |e| {
+                self.stageTerminal(e);
+                return;
             }
+            // 4. Failed session, no stored event: invariant failure.
+            self.stageInternalError("failed session missing terminal event");
+            return;
         }
-        self.dstate = .{ .event_ready = .{ .kind = .err, .code = quic_wire.ErrCode.internal_error.code() } };
+        // 2. An already-deferred FINAL ERROR wins over the socket.
+        if (self.dstate == .draining and self.dstate.draining.kind == .err) {
+            self.dstate = .{ .event_ready = self.dstate.draining };
+            return;
+        }
+        // 3. Clean SESSION_END drain or no prior failure: the socket
+        //    failure itself creates the terminal.
+        self.stageInternalError(context);
     }
 
     /// One bounded turn. Retries the pending egress datagram first,
@@ -1563,13 +1603,10 @@ pub const Client = struct {
                 // Fires once: the state leaves .handshaking with the
                 // event, and nextDeadline() returns null from here on.
                 if (self.session.failLocal(.session_ended, "handshake timeout")) |ev| {
-                    if (ev == .err) {
-                        const rlen = @min(ev.err.reason.len, self.deferred_reason.len);
-                        @memcpy(self.deferred_reason[0..rlen], ev.err.reason[0..rlen]);
-                        self.deferred_reason_len = rlen;
-                    }
+                    self.stageTerminal(ev);
+                    return self.deliverTerminal(self.dstate.event_ready);
                 }
-                self.dstate = .{ .event_ready = .{ .kind = .err, .code = quic_wire.ErrCode.session_ended.code() } };
+                self.stageInternalError("handshake timeout");
                 return self.deliverTerminal(self.dstate.event_ready);
             }
             try self.transport.driveCrypto(.initial, now);
@@ -1638,10 +1675,13 @@ pub const Client = struct {
                 self.dstate = .{ .event_ready = meta };
                 if (failed) {
                     // A protocol failure REPLACED the deferred event:
-                    // surface the session's own failure event.
+                    // stage the session's own failure (matched code and
+                    // reason, stable copy). A failed session with no
+                    // stored event is an invariant failure.
                     if (try self.session.pollControl()) |e| {
-                        self.dstate = .terminal_delivered;
-                        return e;
+                        self.stageTerminal(e);
+                    } else {
+                        self.stageInternalError("failed session missing terminal event");
                     }
                 }
                 return self.deliverTerminal(self.dstate.event_ready);
