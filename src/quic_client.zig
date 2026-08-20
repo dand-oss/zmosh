@@ -1101,6 +1101,10 @@ pub const Client = struct {
     /// egress sends fail permanently through the SAME catch/latch
     /// branch a real kernel error takes.
     egress_fail_n: usize = 0,
+    /// TEST-ONLY receive-failure fixture: when nonzero, that many
+    /// receives fail permanently through the same latch — no socket
+    /// fd manipulation.
+    recv_fail_n: usize = 0,
 
     pub fn connect(alloc: std.mem.Allocator, io: std.Io, psk: *const [32]u8, remote: lib_posix.Address, now: i64) !Client {
         const family: u32 = switch (remote.any.family) {
@@ -1369,6 +1373,18 @@ pub const Client = struct {
     /// peek rejects (Retry, malformed long headers) passes once to the
     /// adapter, whose route layer performs Retry validation and
     /// discard-and-count. Returns false when the datagram was parked.
+    /// The one kernel-receive path (the `recv_fail_n` fixture routes
+    /// through the same permanent-error branch a real kernel error
+    /// takes).
+    fn sockReceive(self: *Client, buf: []u8) !struct { len: usize, addr: lib_posix.Address } {
+        if (self.recv_fail_n > 0) {
+            self.recv_fail_n -= 1;
+            return error.SocketFailed;
+        }
+        const r = try self.sock.recvFrom(buf);
+        return .{ .len = r.len, .addr = r.addr };
+    }
+
     fn classifyAndFeed(self: *Client, r_addr: lib_posix.Address, now: i64, buf: []const u8) !bool {
         const remote = udp.sockaddrToUdpAddress(r_addr) orelse {
             self.junk_received += 1;
@@ -1547,6 +1563,9 @@ pub const Client = struct {
             self.alloc.free(p.dg);
             self.pending_egress = null;
         }
+        // Post-delivery socket errors only disable I/O: no second,
+        // undeliverable event is ever created.
+        if (self.dstate == .terminal_delivered or self.dstate == .closed) return;
         // 1. An existing session failure wins with its own code+reason.
         if (self.session.stateTag() == .failed) {
             if (self.session.pollControl() catch null) |e| {
@@ -1640,7 +1659,7 @@ pub const Client = struct {
             // adds nothing to the full queue (drainOutput refuses),
             // and quicz's flow control throttles any further output.
             if (self.outputFull() and !self.session.outputSettled() and self.dstate != .draining) break;
-            const r = self.sock.recvFrom(&buf) catch |e| switch (e) {
+            const r = self.sockReceive(&buf) catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => {
                     self.latchSocketFailure("socket receive failed");
@@ -1673,17 +1692,22 @@ pub const Client = struct {
             if (failed or (self.session.controlFinished() and self.session.outputSettled())) {
                 const meta = self.dstate.draining;
                 self.dstate = .{ .event_ready = meta };
-                if (failed) {
-                    // A protocol failure REPLACED the deferred event:
-                    // stage the session's own failure (matched code and
-                    // reason, stable copy). A failed session with no
-                    // stored event is an invariant failure.
+                if (failed and meta.kind != .err) {
+                    // A clean terminal was deferred and the session
+                    // then failed through its own machinery (reset,
+                    // peer close): the failure event — still held in
+                    // the slot — replaces the deferred one. A failed
+                    // session with no stored event is an invariant
+                    // failure.
                     if (try self.session.pollControl()) |e| {
                         self.stageTerminal(e);
                     } else {
                         self.stageInternalError("failed session missing terminal event");
                     }
                 }
+                // meta.kind == .err: the deferred metadata was staged
+                // from the failing event itself (deferTerminal) — it
+                // already carries the failure's own code and reason.
                 return self.deliverTerminal(self.dstate.event_ready);
             }
         }
@@ -1707,7 +1731,7 @@ pub const Client = struct {
         var inbound: usize = 0;
         var buf: [quic_transport.max_udp_payload]u8 = undefined;
         while (inbound < pump_max_inbound) : (inbound += 1) {
-            const r = self.sock.recvFrom(&buf) catch |e| switch (e) {
+            const r = self.sockReceive(&buf) catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => {
                     self.latchSocketFailure("socket receive failed");
@@ -2019,7 +2043,7 @@ const ToggleAllocator = struct {
     }
 };
 
-test "driver live: gate-skip replay — synthetic short parks ahead, Handshake never blocked" {
+test "driver live: gate-skip replay — one Handshake plus one synthetic short, exact accounting" {
     const alloc = std.testing.allocator;
     var psk: [32]u8 = undefined;
     try std.testing.io.randomSecure(&psk);
@@ -2030,74 +2054,87 @@ test "driver live: gate-skip replay — synthetic short parks ahead, Handshake n
     defer driver.deinit();
 
     var now: i64 = now_base;
-    var synth_parked = false;
-    var handshake_parked: usize = 0;
+    var flight: [8][]u8 = undefined;
+    var flight_len: [8]usize = undefined;
+    var flight_n: usize = 0;
 
-    // Round until the gateway's flight contains a Handshake-space
-    // datagram AND the synthetic short-form entry sits parked AHEAD of
-    // it (1-RTT keys absent — nothing has been processed yet).
+    // Drive (answering any Retry) until the gateway's emission holds
+    // a Handshake-space datagram, captured unprocessed; emissions
+    // without one feed normally and the loop continues.
     var attempts: usize = 0;
-    while (attempts < 24) : (attempts += 1) {
+    while (attempts < 24 and flight_n == 0) : (attempts += 1) {
         _ = try driver.pump(now);
         try peer.round(now);
         now += 1;
-        // Capture everything the gateway just sent to the DRIVER,
-        // unprocessed: drain the driver's own receive queue.
         var buf: [quic_transport.max_udp_payload]u8 = undefined;
-        var captured: [8][]u8 = undefined;
-        var captured_len: [8]usize = undefined;
         var n: usize = 0;
-        while (n < captured.len) {
+        var saw_handshake = false;
+        while (n < flight.len) {
             const r = driver.sock.recvFrom(&buf) catch break;
+            if (peekKind(buf[0..r.len]) == .handshake) saw_handshake = true;
             const dg = try alloc.dupe(u8, buf[0..r.len]);
-            captured[n] = dg;
-            captured_len[n] = r.len;
+            flight[n] = dg;
+            flight_len[n] = r.len;
             n += 1;
         }
-        defer for (captured[0..n]) |dg| alloc.free(dg);
-
-        // The synthetic short-form junk parks FIRST (one-RTT gate).
-        if (!synth_parked) {
-            const synth = [_]u8{0x40} ++ ([_]u8{0} ** 31);
-            try std.testing.expectEqual(false, try driver.classifyAndFeed(peer.gw_addr, now, &synth));
-            try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
-            try std.testing.expect(driver.parked[0].gate == .one_rtt_keys);
-            synth_parked = true;
+        if (saw_handshake) {
+            flight_n = n;
+        } else {
+            for (flight[0..n], flight_len[0..n]) |dg, len| {
+                _ = try driver.classifyAndFeed(peer.gw_addr, now, dg[0..len]);
+            }
+            for (flight[0..n]) |dg| alloc.free(dg);
         }
-        // Then the captured datagrams in arrival order: Retry and
-        // Initial packets feed directly; Handshake-space ones park.
-        for (captured[0..n], captured_len[0..n]) |dg, len| {
-            if (!try driver.classifyAndFeed(peer.gw_addr, now, dg[0..len])) handshake_parked += 1;
-        }
-        if (handshake_parked >= 1) break;
-        // A Retry-only first flight: the loop head's next pump emits
-        // the post-Retry Initial (the driver's socket is drained, so
-        // that pump receives nothing) and the next capture sees the
-        // real flight.
     }
-    try std.testing.expect(synth_parked);
-    try std.testing.expect(handshake_parked >= 1);
+    defer for (flight[0..flight_n]) |dg| alloc.free(dg);
+    try std.testing.expect(flight_n >= 1);
 
-    // The gate-skip: the Handshake entry must process NOW, despite
-    // the synthetic short sitting parked AHEAD of it. (The scan
-    // restarts once the Handshake feed opens one-RTT keys, so the
-    // synthetic may legitimately replay within the SAME pump.)
+    // Phase 2 — stage EXACTLY two entries and open the gates, with no
+    // pump in between: the synthetic short first (1-RTT gate), the
+    // flight's first Handshake packet second (handshake gate), then
+    // every sibling packet feeds directly — this stack's handshake
+    // keys ride in Handshake space, so a sibling installs the gates.
+    const synth = [_]u8{0x40} ++ ([_]u8{0} ** 31);
+    try std.testing.expectEqual(false, try driver.classifyAndFeed(peer.gw_addr, now, &synth));
+    var hs_idx: usize = 0;
+    for (flight[0..flight_n], flight_len[0..flight_n], 0..) |_, len, i| {
+        if (peekKind(flight[i][0..len]) == .handshake) {
+            hs_idx = i;
+            break;
+        }
+    }
+    try std.testing.expect(peekKind(flight[hs_idx][0..flight_len[hs_idx]]) == .handshake);
+    try std.testing.expectEqual(false, try driver.classifyAndFeed(peer.gw_addr, now, flight[hs_idx][0..flight_len[hs_idx]]));
+    try std.testing.expectEqual(@as(usize, 2), driver.parked_len);
+    try std.testing.expect(driver.parked[0].gate == .one_rtt_keys);
+    try std.testing.expect(driver.parked[1].gate == .handshake_keys);
+    for (flight[0..flight_n], flight_len[0..flight_n], 0..) |_, len, i| {
+        if (i != hs_idx) _ = try driver.classifyAndFeed(peer.gw_addr, now, flight[i][0..len]);
+    }
+
+    // Phase 3 — the exact accounting. The first pump runs WITHOUT a
+    // peer round: the Handshake entry replays (+1) and the synthetic
+    // short is SKIPPED — its one-RTT gate cannot open yet because the
+    // server Finished only exists after the gateway sees the client's
+    // flight, which that very pump emits. One peer round later the
+    // Finished arrives and the restart replays the synthetic (+1,
+    // junked exactly once). Total: +2 receives, +1 junk, empty queue.
     const junk_before = driver.junk_received;
+    const recv_before = driver.transport.counters.datagrams_received;
     _ = try driver.pump(now);
     now += 1;
     try std.testing.expect(driver.transport.conn.hasHandshakeProtectionKeys());
-
-    // Pump until both gates advance: every entry is fed exactly once —
-    // the synthetic short is junked EXACTLY once (a second feed would
-    // move the counter twice) and the queue empties.
-    attempts = 0;
-    while (attempts < 64 and driver.parked_len != 0) : (attempts += 1) {
-        _ = try driver.pump(now);
-        try peer.round(now);
-        now += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 0), driver.parked_len);
+    try std.testing.expectEqual(recv_before + 1, driver.transport.counters.datagrams_received);
+    // The skip: the synthetic entry was NOT fed by this pump.
+    try std.testing.expectEqual(junk_before, driver.junk_received);
+    try std.testing.expectEqual(@as(usize, 1), driver.parked_len);
+    try peer.round(now);
+    now += 1;
+    _ = try driver.pump(now);
+    now += 1;
+    try std.testing.expectEqual(recv_before + 2, driver.transport.counters.datagrams_received);
     try std.testing.expectEqual(junk_before + 1, driver.junk_received);
+    try std.testing.expectEqual(@as(usize, 0), driver.parked_len);
 
     // The handshake completes through normal rounds afterwards.
     var confirmed = false;
@@ -2109,6 +2146,16 @@ test "driver live: gate-skip replay — synthetic short parks ahead, Handshake n
         confirmed = driver.handshakeConfirmed();
     }
     try std.testing.expect(confirmed);
+}
+
+/// The captured datagram's coarse kind for the staging loop.
+fn peekKind(dg: []const u8) enum { initial, handshake, other } {
+    const info = quicz.protection.peekProtectedLongPacketInfo(dg) catch return .other;
+    return switch (info.packet_type) {
+        .initial => .initial,
+        .handshake => .handshake,
+        else => .other,
+    };
 }
 
 test "driver live: handshake-space parked entries are pruned after the space is discarded" {
