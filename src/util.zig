@@ -738,27 +738,27 @@ pub fn isUserInput(payload: []const u8) bool {
 /// The NUL is not cosmetic: a client that records what it receives (kitty
 /// writing its session file, for one) persists the NUL and then fails to parse
 /// its own state back. See https://github.com/neurosnap/zmx/issues/222.
-fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
+fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {
     const pwd = term.getPwd() orelse return;
     if (pwd.len == 0) return;
-    writer.print("\x1b]7;{s}\x1b\\", .{pwd}) catch |err| {
-        std.log.warn("failed to format pwd err={s}", .{@errorName(err)});
-    };
+    try writer.print("\x1b]7;{s}\x1b\\", .{pwd});
 }
 
-pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-
-    // Synchronized output (DECSET 2026) is a transient rendering handshake
-    // between a program and its current terminal client. Replaying it to a
-    // newly attached client can leave that client deferring renders until its
-    // local timeout fires, so temporarily exclude it from restored state and
-    // restore the original mode before returning.
+/// Strict writer-based terminal-state formatter: every internal writer
+/// failure propagates. Synchronized output (DECSET 2026) is a transient
+/// rendering handshake between a program and its current terminal
+/// client; replaying it to a newly attached client can leave that
+/// client deferring renders until its local timeout fires, so it is
+/// temporarily excluded from restored state and restored by a defer on
+/// EVERY exit.
+pub fn writeTerminalState(writer: *std.Io.Writer, term: *ghostty_vt.Terminal) !void {
     const had_synchronized_output = term.modes.get(.synchronized_output);
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+    defer if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, true);
+    };
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
@@ -792,15 +792,13 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
                 ),
             };
             scroll_fmt.extra = .none; // no modes, cursor, keyboard — just content
-            scroll_fmt.format(&builder.writer) catch |err| {
-                std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
-            };
+            try scroll_fmt.format(writer);
         }
 
         // Clear visible screen after scrollback. \x1b[2J clears only the visible
         // rows (not the scrollback buffer). \x1b[H homes the cursor. \x1b[0m resets
         // SGR style so phase 1 styles don't bleed into phase 2.
-        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+        try writer.writeAll("\x1b[2J\x1b[H\x1b[0m");
     }
 
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
@@ -836,30 +834,30 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         .screen = .all,
     };
 
-    vis_fmt.format(&builder.writer) catch |err| {
-        std.log.warn("failed to format terminal state err={s}", .{@errorName(err)});
-        return null;
-    };
+    try vis_fmt.format(writer);
 
-    writePwd(&builder.writer, term);
+    try writePwd(writer, term);
 
     // The formatter has no title extra and never emits OSC 0/1/2, so the title
     // has to be replayed separately or an attaching client shows whatever its
     // terminal defaults to, usually the client process name. OSC 2 does not
     // move the cursor, so this is safe to append after the content.
     if (term.getTitle()) |title| {
-        builder.writer.print("\x1b]2;{s}\x07", .{title}) catch |err| {
-            std.log.warn("failed to format title err={s}", .{@errorName(err)});
-        };
+        try writer.print("\x1b]2;{s}\x07", .{title});
     }
+}
+
+pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    writeTerminalState(&builder.writer, term) catch |err| {
+        std.log.warn("failed to format terminal state err={s}", .{@errorName(err)});
+        return null;
+    };
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
-
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
@@ -907,7 +905,12 @@ pub fn serializeTerminal(
         return null;
     };
 
-    if (format == .vt) writePwd(&builder.writer, term);
+    if (format == .vt) {
+        writePwd(&builder.writer, term) catch |err| {
+            std.log.warn("failed to format pwd err={s}", .{@errorName(err)});
+            return null;
+        };
+    }
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
