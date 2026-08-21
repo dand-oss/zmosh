@@ -880,6 +880,20 @@ const quic_test = struct {
         return sessionRoundWith(loop, client, now, null);
     }
 
+    /// The RAW round: identical exchange, but the real client's
+    /// snapshot pump NEVER runs — stream 7 stays unconsumed for the
+    /// test's raw observer. Only for intentionally-raw gateway tests.
+    fn sessionRoundRaw(loop: *Loop, client: *quic_client.ClientSession, now: i64) !?quic_client.ControlEvent {
+        var ev: ?quic_client.ControlEvent = null;
+        try loop.clientPump(now);
+        _ = try loop.gw.runOnce(0);
+        try clientDrainInterleaved(loop, client, now, &ev, null);
+        try loop.clientPump(now);
+        _ = try loop.gw.runOnce(0);
+        try clientDrainInterleaved(loop, client, now, &ev, null);
+        return ev;
+    }
+
     // ── Q4 snapshot-transaction fixtures (daemon + raw-transport) ──
 
     /// Daemon side of one EMPTY snapshot transaction: Begin(0)+End(0).
@@ -968,9 +982,17 @@ const quic_test = struct {
         var ev: ?quic_client.ControlEvent = null;
         try loop.clientPump(now);
         _ = try loop.gw.runOnce(0);
+        // Production driver ordering: the snapshot stream is serviced
+        // BEFORE output, inside the one shared installation budget.
+        client.install_budget_left = 64 * 1024;
+        client.install_ready_this_pump = false;
+        try client.pumpSnapshot();
         try clientDrainInterleaved(loop, client, now, &ev, out_acc);
         try loop.clientPump(now);
         _ = try loop.gw.runOnce(0);
+        client.install_budget_left = 64 * 1024;
+        client.install_ready_this_pump = false;
+        try client.pumpSnapshot();
         try clientDrainInterleaved(loop, client, now, &ev, out_acc);
         return ev;
     }
@@ -1566,7 +1588,7 @@ fn zmq1Setup(alloc: std.mem.Allocator, psk: *const [32]u8) !struct {
     try quic_test.driveHandshake(&loop);
     // One gateway turn attaches the gateway-owned session.
     _ = try loop.gw.runOnce(0);
-    const client = try quic_client.ClientSession.init(alloc, loop.client);
+    const client = try quic_client.ClientSession.init(alloc, std.testing.io, loop.client);
     return .{ .loop = loop, .client = client };
 }
 
@@ -1601,23 +1623,16 @@ fn zmq1Dance(z: anytype, dr: *quic_test.DaemonReader, base: i64) !void {
         try testing.expectEqual(@as(u16, 80), rz.cols);
     }
     try quic_test.daemonSendEmptySnapshot(z.loop.daemon_fd);
-    var observed: ?quic_wire.SnapshotHeader = null;
-    var snap_rx: quic_test.ClientSnapshotRx = .{};
-    for (0..16) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
-        observed = try quic_test.clientObserveSnapshot(z.client.transport, testing.allocator, &snap_rx, null);
-        if (observed != null) break;
-    }
-    try testing.expect(observed != null);
-    try testing.expectEqual(quic_wire.snapshot_epoch_v1, observed.?.epoch);
-    try testing.expect(!observed.?.present); // the empty transaction
-    try quic_test.sendSnapshotInstalledOn(z.client.transport);
+    // The REAL client installs: it consumes stream 7 itself, prepares
+    // its (empty) replay, and sends SNAPSHOT_INSTALLED through the
+    // atomic path — the gateway activates.
     const s = try z.session();
-    for (0..8) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
-        if (s.phase == .active) break;
+    for (0..40) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        if (s.phase == .active and z.client.stateTag() == .active) break;
     }
     try testing.expect(s.phase == .active);
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
 }
 
 test "zmq1 session: HELLO → ACK → RESIZE/.InitSnapshot → install → input relay → output epoch 1" {
@@ -1672,19 +1687,15 @@ test "zmq1 session: HELLO → ACK → RESIZE/.InitSnapshot → install → input
         try testing.expectEqual(@as(u16, 101), rz.cols);
     }
     try quic_test.daemonSendEmptySnapshot(z.loop.daemon_fd);
-    var observed: ?quic_wire.SnapshotHeader = null;
-    var snap_rx: quic_test.ClientSnapshotRx = .{};
-    for (0..16) |i| {
+    // The REAL client installs the empty snapshot: it consumes stream
+    // 7, completes installation, and SNAPSHOT_INSTALLED flows through
+    // the atomic path.
+    for (0..40) |i| {
         _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
-        observed = try quic_test.clientObserveSnapshot(z.client.transport, testing.allocator, &snap_rx, null);
-        if (observed != null) break;
+        if (sess.phase == .active and z.client.stateTag() == .active) break;
     }
-    try testing.expect(observed != null);
-    try testing.expectEqual(quic_wire.snapshot_epoch_v1, observed.?.epoch);
-    try testing.expect(!observed.?.present);
-    try quic_test.sendSnapshotInstalledOn(z.client.transport);
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
     try testing.expect(sess.phase == .active);
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
 
     // Input bytes → daemon `.Input` frames.
     try z.client.sendInput("hello-zmq1");
@@ -1760,12 +1771,14 @@ test "zmq1 q4: populated stream-7 transaction with exact header, body, FIN, and 
     for (&body, 0..) |*b, i| b.* = @intCast((i * 7 + 3) % 251);
     try quic_test.daemonSendSnapshotBytes(z.loop.daemon_fd, &body);
 
+    // Intentionally RAW: the real client's installer never pumps, so
+    // the raw observer sees the whole stream-7 transaction.
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
     var observed: ?quic_wire.SnapshotHeader = null;
     var snap_rx: quic_test.ClientSnapshotRx = .{};
     for (0..24) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
         observed = try quic_test.clientObserveSnapshot(z.client.transport, alloc, &snap_rx, &acc);
         if (observed != null) break;
     }
@@ -1779,22 +1792,16 @@ test "zmq1 q4: populated stream-7 transaction with exact header, body, FIN, and 
     try testing.expect(sess.snapshot_fin_sent);
     try testing.expect(sess.phase == .awaiting_snapshot_installed);
 
-    // Post-End output relays as epoch-1 output even before INSTALLED.
+    // Post-End output relays as epoch-1 output even before INSTALLED —
+    // asserted on the GATEWAY side: the bytes leave on stream 3 (a
+    // real installing client applies them to its temporary stream and
+    // never exposes them separately).
     try ipc.send(z.loop.daemon_fd, .Output, "post-cut");
-    var got: []const u8 = "";
-    for (0..8) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
-        var obuf: [64]u8 = undefined;
-        if (try z.client.pollOutput(&obuf, null)) |n| {
-            got = try alloc.dupe(u8, obuf[0..n]);
-            break;
-        }
-    }
-    try testing.expectEqualStrings("post-cut", got);
-    alloc.free(got);
+    for (0..8) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+    try testing.expectEqual(quic_wire.output_header_len + "post-cut".len, sess.counters.output_bytes);
 
     try quic_test.sendSnapshotInstalledOn(z.client.transport);
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
     try testing.expect(sess.phase == .active);
     try testing.expect(!sess.closedOrEnding());
 }
@@ -2094,7 +2101,7 @@ test "zmq1 q4: installation control matrix — premature/nonempty INSTALLED, DET
                 try daemonSendRaw(z.loop.daemon_fd, .SnapshotBegin, &.{0});
                 try daemonSendRaw(z.loop.daemon_fd, .SnapshotEnd, &endp);
                 for (0..12) |i| {
-                    _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+                    _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
                     if (sess.phase == .awaiting_snapshot_installed) break;
                 }
                 try testing.expect(sess.phase == .awaiting_snapshot_installed);
@@ -2103,10 +2110,21 @@ test "zmq1 q4: installation control matrix — premature/nonempty INSTALLED, DET
                 _ = try z.client.transport.connection().sendOnStream(quic_client.control_stream_id, &hdr, false);
                 _ = try z.client.transport.connection().sendOnStream(quic_client.control_stream_id, "bad", false);
             },
-            .mid_detach => try z.client.sendDetach(),
-            .mid_request => try z.client.sendSnapshotRequest(),
+            .mid_detach => {
+                // The real client correctly refuses these in
+                // installing_snapshot — the gateway matrix crafts
+                // them raw.
+                var hdr: [quic_wire.control_header_len]u8 = undefined;
+                quic_wire.writeControlHeader(&hdr, .detach, 0, 0);
+                _ = try z.client.transport.connection().sendOnStream(quic_client.control_stream_id, &hdr, false);
+            },
+            .mid_request => {
+                var hdr: [quic_wire.control_header_len]u8 = undefined;
+                quic_wire.writeControlHeader(&hdr, .snapshot_request, 0, 0);
+                _ = try z.client.transport.connection().sendOnStream(quic_client.control_stream_id, &hdr, false);
+            },
         }
-        for (0..12) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        for (0..12) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
         try testing.expect(sess.closedOrEnding());
         try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), sess.end_code.code());
     }
@@ -2138,18 +2156,15 @@ test "zmq1 q4: RESIZEs coalesce to the latest value until installation completes
 
     // Complete the transaction; on activation the LATEST value alone
     // forwards as `.Resize`.
+    // The REAL client installs; its coalesced latest RESIZE alone
+    // forwards after activation through the normal atomic path.
     try quic_test.daemonSendEmptySnapshot(z.loop.daemon_fd);
-    var observed: ?quic_wire.SnapshotHeader = null;
-    var snap_rx: quic_test.ClientSnapshotRx = .{};
-    for (0..16) |i| {
+    for (0..40) |i| {
         _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
-        observed = try quic_test.clientObserveSnapshot(z.client.transport, testing.allocator, &snap_rx, null);
-        if (observed != null) break;
+        if (sess.phase == .active and z.client.stateTag() == .active) break;
     }
-    try testing.expect(observed != null);
-    try quic_test.sendSnapshotInstalledOn(z.client.transport);
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
     try testing.expect(sess.phase == .active);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
     {
         const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoCoalescedResize;
         try testing.expectEqual(ipc.Tag.Resize, f.tag);
@@ -2197,13 +2212,13 @@ test "zmq1 q4: zero output credit cannot starve SnapshotBegin or stream 7" {
     var observed: ?quic_wire.SnapshotHeader = null;
     var snap_rx: quic_test.ClientSnapshotRx = .{};
     for (0..16) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
         observed = try quic_test.clientObserveSnapshot(z.client.transport, testing.allocator, &snap_rx, null);
         if (observed != null) break;
     }
     try testing.expect(observed != null);
     try quic_test.sendSnapshotInstalledOn(z.client.transport);
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
     try testing.expect(sess.phase == .active);
 }
 
@@ -2236,7 +2251,7 @@ test "zmq1 q4: snapshot credit exhaustion parks one unit, buffers the next, reco
     var endp: [8]u8 = undefined;
     std.mem.writeInt(u64, &endp, body.len, .big);
     try daemonSendRaw(z.loop.daemon_fd, .SnapshotEnd, &endp);
-    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+    for (0..4) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
 
     // ONE snapshot unit is parked (the first chunk's unsent tail), the
     // second chunk AND the End sit buffered behind it, and reads stop.
@@ -2263,7 +2278,7 @@ test "zmq1 q4: snapshot credit exhaustion parks one unit, buffers the next, reco
     var drain_rx: quic_test.ClientSnapshotRx = .{};
     var observed: ?quic_wire.SnapshotHeader = null;
     for (0..80) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
         observed = try quic_test.clientObserveSnapshot(z.client.transport, alloc, &drain_rx, &drain);
         if (observed != null) break;
     }
@@ -2272,7 +2287,7 @@ test "zmq1 q4: snapshot credit exhaustion parks one unit, buffers the next, reco
     try testing.expect(sess.snapshot_fin_sent);
     try testing.expect(sess.pending_snapshot.items.len == 0);
     try quic_test.sendSnapshotInstalledOn(z.client.transport);
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 500 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 500 + @as(i64, @intCast(i)));
     try testing.expect(sess.phase == .active);
 }
 
@@ -2304,7 +2319,7 @@ test "zmq1 q4: buffered IPC advances without POLL.IN, including post-turn releas
     var endp: [8]u8 = undefined;
     std.mem.writeInt(u64, &endp, body.len, .big);
     try daemonSendRaw(z.loop.daemon_fd, .SnapshotEnd, &endp);
-    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+    for (0..4) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
     try testing.expect(sess.pending_snapshot.items.len > 0);
     try testing.expect(!sess.snapshot_end_validated);
 
@@ -2316,7 +2331,7 @@ test "zmq1 q4: buffered IPC advances without POLL.IN, including post-turn releas
     var drain_rx: quic_test.ClientSnapshotRx = .{};
     var observed: ?quic_wire.SnapshotHeader = null;
     for (0..80) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
         observed = try quic_test.clientObserveSnapshot(z.client.transport, alloc, &drain_rx, &drain);
         if (observed != null) break;
     }
@@ -2350,7 +2365,7 @@ test "zmq1 q4: negotiated snapshot limit from HELLO is enforced" {
     const sess = if (loop.gw.session) |*x| x else return error.NoSession;
     var dr = try quic_test.DaemonReader.init(alloc);
     defer dr.deinit();
-    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
     defer client.deinit();
     const base: i64 = lib_posix.nowNs();
 
@@ -2418,7 +2433,7 @@ test "zmq1 q4: post-End output relays while the snapshot FIN is still pending" {
     var endp: [8]u8 = undefined;
     std.mem.writeInt(u64, &endp, body.len, .big);
     try daemonSendRaw(z.loop.daemon_fd, .SnapshotEnd, &endp);
-    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    for (0..4) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
 
     // BEFORE any client read: End validated, FIN pending, and the
     // post-cut Output must be CONSUMED from IPC (counted), not
@@ -2427,7 +2442,7 @@ test "zmq1 q4: post-End output relays while the snapshot FIN is still pending" {
     try testing.expect(!sess.snapshot_fin_sent);
     try testing.expect(sess.pending_snapshot.items.len > 0);
     try ipc.send(z.loop.daemon_fd, .Output, "post-end-pre-fin");
-    for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+    for (0..4) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
     try testing.expect(!sess.closedOrEnding());
     try testing.expectEqual(@as(usize, 1), sess.counters.daemon_output_frames);
 
@@ -2437,23 +2452,20 @@ test "zmq1 q4: post-End output relays while the snapshot FIN is still pending" {
     defer drain.deinit(alloc);
     var drain_rx: quic_test.ClientSnapshotRx = .{};
     var observed: ?quic_wire.SnapshotHeader = null;
-    var got: []const u8 = "";
-    var obuf: [64]u8 = undefined;
     for (0..80) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
         observed = try quic_test.clientObserveSnapshot(z.client.transport, alloc, &drain_rx, &drain);
-        if (got.len == 0) {
-            if (try z.client.pollOutput(&obuf, null)) |n| got = try alloc.dupe(u8, obuf[0..n]);
-        }
-        if (observed != null and got.len > 0) break;
+        if (observed != null) break;
     }
     try testing.expect(observed != null);
     try testing.expectEqualSlices(u8, &body, drain.items);
     try testing.expect(sess.snapshot_fin_sent);
-    try testing.expectEqualStrings("post-end-pre-fin", got);
-    alloc.free(got);
+    // The post-cut Output left on stream 3 before INSTALLED — gateway
+    // side (an installing client applies it to its temporary stream
+    // and never exposes it separately).
+    try testing.expectEqual(quic_wire.output_header_len + "post-end-pre-fin".len, sess.counters.output_bytes);
     try quic_test.sendSnapshotInstalledOn(z.client.transport);
-    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 500 + @as(i64, @intCast(i)));
+    for (0..8) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 500 + @as(i64, @intCast(i)));
     try testing.expect(sess.phase == .active);
 }
 
@@ -2479,7 +2491,7 @@ test "zmq1 q4: malformed chunks fail immediately behind a parked legal unit" {
             try quic_test.driveHandshake(&loop);
             _ = try loop.gw.runOnce(0);
             const sess = if (loop.gw.session) |*x| x else return error.NoSession;
-            var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+            var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
             defer client.deinit();
             const lbase: i64 = lib_posix.nowNs();
             {
@@ -2498,19 +2510,19 @@ test "zmq1 q4: malformed chunks fail immediately behind a parked legal unit" {
                 _ = try cconn.sendOnStream(quic_client.control_stream_id, &payload, false);
             }
             for (0..8) |i| {
-                _ = try quic_test.sessionRound(&loop, &client, lbase + @as(i64, @intCast(i)));
+                _ = try quic_test.sessionRoundRaw(&loop, &client, lbase + @as(i64, @intCast(i)));
                 if ((try client.pollControl()) != null) break;
             }
             try testing.expectEqual(@as(u64, 4096), sess.snapshot_limit);
             try client.sendResize(24, 80, 0, 0);
-            for (0..8) |i| _ = try quic_test.sessionRound(&loop, &client, lbase + 100 + @as(i64, @intCast(i)));
+            for (0..8) |i| _ = try quic_test.sessionRoundRaw(&loop, &client, lbase + 100 + @as(i64, @intCast(i)));
 
             // Park a legal 2 KiB chunk (under the limit), no reads.
             try daemonSendRaw(loop.daemon_fd, .SnapshotBegin, &.{1});
             var legal: [2 * 1024]u8 = undefined;
             @memset(&legal, 'P');
             try daemonSendRaw(loop.daemon_fd, .SnapshotChunk, &legal);
-            for (0..4) |i| _ = try quic_test.sessionRound(&loop, &client, lbase + 150 + @as(i64, @intCast(i)));
+            for (0..4) |i| _ = try quic_test.sessionRoundRaw(&loop, &client, lbase + 150 + @as(i64, @intCast(i)));
             try testing.expect(sess.pending_snapshot.items.len > 0);
 
             // The violating chunk exceeds the negotiated limit. NO
@@ -2518,7 +2530,7 @@ test "zmq1 q4: malformed chunks fail immediately behind a parked legal unit" {
             var big: [8 * 1024]u8 = undefined;
             @memset(&big, 'V');
             try daemonSendRaw(loop.daemon_fd, .SnapshotChunk, &big);
-            for (0..8) |i| _ = try quic_test.sessionRound(&loop, &client, lbase + 200 + @as(i64, @intCast(i)));
+            for (0..8) |i| _ = try quic_test.sessionRoundRaw(&loop, &client, lbase + 200 + @as(i64, @intCast(i)));
             try testing.expect(sess.closedOrEnding());
             try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), sess.end_code.code());
             try testing.expect(!sess.snapshot_fin_sent);
@@ -2541,7 +2553,7 @@ test "zmq1 q4: malformed chunks fail immediately behind a parked legal unit" {
         var legal: [8 * 1024]u8 = undefined;
         @memset(&legal, 'P');
         try daemonSendRaw(z.loop.daemon_fd, .SnapshotChunk, &legal);
-        for (0..4) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+        for (0..4) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
         try testing.expect(sess.pending_snapshot.items.len > 0);
 
         switch (kind) {
@@ -2555,7 +2567,7 @@ test "zmq1 q4: malformed chunks fail immediately behind a parked legal unit" {
         }
         // NO client reads anywhere: flow control cannot delay the
         // fail-closed handling.
-        for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        for (0..8) |i| _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
         try testing.expect(sess.closedOrEnding());
         try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), sess.end_code.code());
         try testing.expect(!sess.snapshot_fin_sent);
@@ -2620,7 +2632,7 @@ test "zmq1 q4: reads stop at an unacceptable frame header and resume losslessly"
     var drained: usize = 0;
     var obuf: [16 * 1024]u8 = undefined;
     for (0..80) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 200 + @as(i64, @intCast(i)));
         while (try z.client.pollOutput(&obuf, null)) |n| drained += n;
         if (sess.pending_output.items.len == 0 and z.loop.gw.daemonReadEligible()) break;
     }
@@ -2635,7 +2647,7 @@ test "zmq1 q4: reads stop at an unacceptable frame header and resume losslessly"
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
     for (0..80) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
         while (try z.client.pollOutput(&obuf, null)) |n| {
             try acc.appendSlice(alloc, obuf[0..n]);
         }
@@ -2689,7 +2701,7 @@ test "zmq1 q4: a coalesced header+payload write never over-reads an unacceptable
     {
         var exhausted = false;
         for (0..100) |i| {
-            _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+            _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
             const st = (try sess.transport.connection().streamState(quic_session.output_stream_id)) orelse
                 return error.NoStream3State;
             const max = st.send_max_data orelse return error.NoSendMaxData;
@@ -2709,7 +2721,7 @@ test "zmq1 q4: a coalesced header+payload write never over-reads an unacceptable
         const room = quic_session.pending_output_cap - sess.pending_output.items.len;
         try sess.pending_output.appendSlice(alloc, filler[0..@min(room, filler.len)]);
     }
-    _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300);
+    _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 300);
     try testing.expectEqual(quic_session.pending_output_cap, sess.pending_output.items.len);
 
     // 4. ONE contiguous write: the Output header declaring 1024 bytes
@@ -2742,7 +2754,7 @@ test "zmq1 q4: a coalesced header+payload write never over-reads an unacceptable
     defer acc.deinit(alloc);
     var obuf: [16 * 1024]u8 = undefined;
     for (0..160) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
+        _ = try quic_test.sessionRoundRaw(&z.loop, &z.client, base + 400 + @as(i64, @intCast(i)));
         while (try z.client.pollOutput(&obuf, null)) |n| {
             try acc.appendSlice(alloc, obuf[0..n]);
         }
@@ -2780,7 +2792,7 @@ test "zmq1 session: HELLO mismatches reject with the frozen codes and never init
         const sess = if (loop.gw.session) |*x| x else return error.NoSession;
         var dr = try quic_test.DaemonReader.init(alloc);
         defer dr.deinit();
-        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
         defer client.deinit();
 
         // Craft the BAD HELLO as the client's first and only frame —
@@ -2913,7 +2925,18 @@ test "zmq1 session: network-reordered input is parked, then flows strictly after
     // delivery is then reordered — the resize datagram is withheld
     // while the input datagram reaches the gateway first.
     try z.client.sendResize(30, 90, 0, 0);
-    try z.client.sendInput("early-input");
+    // The installing client correctly refuses input (NotActive); the
+    // reordering under proof is a WIRE property, so the early input
+    // is crafted raw on stream 2 exactly as a misordered client
+    // would emit it.
+    {
+        const id = try z.client.transport.connection().openUniStream();
+        try testing.expectEqual(quic_client.input_stream_id, id);
+        var pre: [quic_wire.preface_len]u8 = undefined;
+        quic_wire.writePreface(&pre, .input);
+        _ = try z.client.transport.connection().sendOnStream(id, &pre, false);
+        _ = try z.client.transport.connection().sendOnStream(id, "early-input", false);
+    }
 
     const held = (try z.loop.client.pollOutbound(base + 100)) orelse return error.NoResizeDatagram;
     defer alloc.free(held);
@@ -3349,17 +3372,15 @@ fn driverRound(loop: *quic_test.Loop, driver: *quic_client.Client, now: i64) !?q
 /// through the driver's own transport, then the crafted
 /// SNAPSHOT_INSTALLED. The gateway session reaches active.
 fn driverInstall(loop: *quic_test.Loop, driver: *quic_client.Client) !void {
+    // The DRIVER's own pump performs the real install: stream 7
+    // consumed, empty replay prepared, SNAPSHOT_INSTALLED sent through
+    // the atomic path, session active.
     try quic_test.daemonSendEmptySnapshot(loop.daemon_fd);
-    var observed: ?quic_wire.SnapshotHeader = null;
-    var snap_rx: quic_test.ClientSnapshotRx = .{};
-    for (0..16) |i| {
+    for (0..40) |i| {
         _ = try driverRound(loop, driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
-        observed = try quic_test.clientObserveSnapshot(driver.transport, testing.allocator, &snap_rx, null);
-        if (observed != null) break;
+        if (driver.session.stateTag() == .active) break;
     }
-    try testing.expect(observed != null);
-    try quic_test.sendSnapshotInstalledOn(driver.transport);
-    for (0..8) |i| _ = try driverRound(loop, driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    try testing.expectEqual(quic_client.StateTag.active, driver.session.stateTag());
 }
 
 test "client driver: IPv4 connect, full round trip, peer close visible" {
@@ -3396,16 +3417,13 @@ test "client driver: IPv4 connect, full round trip, peer close visible" {
     const init_frame = (try dr.next(loop.daemon_fd)) orelse return error.NoInitSnapshot;
     try testing.expectEqual(ipc.Tag.InitSnapshot, init_frame.tag);
     try quic_test.daemonSendEmptySnapshot(loop.daemon_fd);
-    var observed: ?quic_wire.SnapshotHeader = null;
-    var snap_rx: quic_test.ClientSnapshotRx = .{};
-    for (0..16) |i| {
+    // The DRIVER's own pump installs: stream 7 consumed, empty replay,
+    // SNAPSHOT_INSTALLED through the atomic path.
+    for (0..40) |i| {
         _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
-        observed = try quic_test.clientObserveSnapshot(driver.transport, testing.allocator, &snap_rx, null);
-        if (observed != null) break;
+        if (driver.session.stateTag() == .active) break;
     }
-    try testing.expect(observed != null);
-    try quic_test.sendSnapshotInstalledOn(driver.transport);
-    for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
+    try testing.expectEqual(quic_client.StateTag.active, driver.session.stateTag());
 
     try driver.sendInput("driver-input");
     for (0..8) |i| _ = try driverRound(&loop, &driver, lib_posix.nowNs() + @as(i64, @intCast(i)));
@@ -3874,7 +3892,7 @@ test "zmq1 r7: pre-HELLO input violation with stream 0 present takes the ERROR+F
     // the client (not a bare close), and no `.Init` was ever written.
     try testing.expect(sess.closedOrEnding());
     try testing.expect((try dr.next(loop.daemon_fd)) == null);
-    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
     defer client.deinit();
     var err_seen = false;
     for (0..10) |i| {
@@ -4146,7 +4164,7 @@ test "zmq1 r7: replayed FIRST Initial is discarded with the session intact" {
     var dr = try quic_test.DaemonReader.init(alloc);
     defer dr.deinit();
 
-    var client = try quic_client.ClientSession.init(alloc, loop.client);
+    var client = try quic_client.ClientSession.init(alloc, std.testing.io, loop.client);
     defer client.deinit();
     var ev: ?quic_client.ControlEvent = null;
     for (0..16) |i| {
@@ -4161,6 +4179,14 @@ test "zmq1 r7: replayed FIRST Initial is discarded with the session intact" {
     try client.sendResize(24, 80, 0, 0);
     for (0..8) |i| _ = try quic_test.sessionRound(&loop, &client, t0 + 200 + @as(i64, @intCast(i)));
     _ = (try dr.next(loop.daemon_fd)) orelse return error.NoInit;
+
+    // Complete the REAL install so the session is active.
+    try quic_test.daemonSendEmptySnapshot(loop.daemon_fd);
+    for (0..40) |i| {
+        _ = try quic_test.sessionRound(&loop, &client, t0 + 250 + @as(i64, @intCast(i)));
+        if (sess.phase == .active and client.stateTag() == .active) break;
+    }
+    try testing.expect(client.stateTag() == .active);
 
     // Replay the captured FIRST Initial: discarded at the committed
     // slot, the established session is untouched.
@@ -4199,7 +4225,7 @@ test "zmq1 r7: HELLO mode 2 is unimplemented and mode 3 is a protocol violation"
         try quic_test.driveHandshake(&loop);
         _ = try loop.gw.runOnce(0);
 
-        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
         defer client.deinit();
         const cconn = client.transport.connection();
         _ = try cconn.openStream();
@@ -4295,7 +4321,7 @@ test "zmq1 r7: split header first, tail and body together next delivery" {
     const base: i64 = lib_posix.nowNs();
 
     // HELLO first (manual, silent client), then the SPLIT RESIZE.
-    var client = try quic_client.ClientSession.initSilent(alloc, z.loop.client);
+    var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, z.loop.client);
     defer client.deinit();
     var ev: ?quic_client.ControlEvent = null;
     for (0..16) |i| {
@@ -4371,7 +4397,7 @@ test "zmq1 r7: allocation failure cannot lose consumed input" {
     _ = try loop.gw.runOnce(0);
     fail_alloc.fail_index = 0;
 
-    var client = try quic_client.ClientSession.init(alloc, loop.client);
+    var client = try quic_client.ClientSession.init(alloc, std.testing.io, loop.client);
     defer client.deinit();
     var dr = try quic_test.DaemonReader.init(alloc);
     defer dr.deinit();
@@ -4394,6 +4420,21 @@ test "zmq1 r7: allocation failure cannot lose consumed input" {
         try loop.clientDrain(now);
     }
     _ = (try dr.next(loop.daemon_fd)) orelse return error.NoInit;
+
+    // Complete the REAL install (manual rounds mirror the production
+    // driver ordering: snapshot pump before output drain).
+    try quic_test.daemonSendEmptySnapshot(loop.daemon_fd);
+    for (0..40) |i| {
+        const now = base + 150 + @as(i64, @intCast(i));
+        try loop.clientPump(now);
+        _ = try loop.gw.runOnce(0);
+        client.install_budget_left = 64 * 1024;
+        client.install_ready_this_pump = false;
+        try client.pumpSnapshot();
+        try loop.clientDrain(now);
+        if (loop.gw.session != null and loop.gw.session.?.phase == .active and client.stateTag() == .active) break;
+    }
+    try testing.expect(client.stateTag() == .active);
 
     try client.sendInput("no-alloc-loss");
     for (0..8) |i| {
@@ -4493,7 +4534,7 @@ test "zmq1 r7: client HELLO_ACK matrix — version, capability, fingerprint, mod
 
         // The client's HELLO is silent-crafted; the server's ACK is
         // CRAFTED with one bad field.
-        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
         defer client.deinit();
         const cconn = client.transport.connection();
         _ = try cconn.openStream();
@@ -4553,7 +4594,7 @@ test "zmq1 r7: client rejects duplicate HELLO_ACK, oversized ERROR reason, illeg
     defer loop.deinit();
     try quic_test.driveHandshake(&loop);
 
-    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
     defer client.deinit();
     const cconn = client.transport.connection();
     _ = try cconn.openStream();
@@ -4634,23 +4675,19 @@ test "zmq1 r8: protocol-state transition matrix — legal and illegal operations
     try testing.expect((try z.client.pollOutput(&obuf, &epoch)) == null);
     try testing.expectEqual(@as(u64, 1), epoch);
 
-    // ── first RESIZE accepted → (client FSM) active; the GATEWAY now
-    //    runs the Q4 installation before it reaches its own active ──
+    // ── first RESIZE accepted → installing_snapshot; the REAL client
+    //    installs the empty snapshot and only then reaches active ──
     try z.client.sendResize(24, 80, 0, 0);
-    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+    try testing.expectEqual(quic_client.StateTag.installing_snapshot, z.client.stateTag());
     for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
     _ = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
     try quic_test.daemonSendEmptySnapshot(z.loop.daemon_fd);
-    var observed: ?quic_wire.SnapshotHeader = null;
-    var snap_rx: quic_test.ClientSnapshotRx = .{};
-    for (0..16) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
-        observed = try quic_test.clientObserveSnapshot(z.client.transport, testing.allocator, &snap_rx, null);
-        if (observed != null) break;
-    }
-    try testing.expect(observed != null);
-    try quic_test.sendSnapshotInstalledOn(z.client.transport);
     const gw = try z.session();
+    for (0..40) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+        if (gw.phase == .active and z.client.stateTag() == .active) break;
+    }
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
     for (0..8) |i| {
         _ = try quic_test.sessionRound(&z.loop, &z.client, base + 180 + @as(i64, @intCast(i)));
         if (gw.phase == .active) break;
@@ -4721,7 +4758,7 @@ test "zmq1 r8: failed state — one failure, no resurrection, sends rejected" {
     defer loop.deinit();
     try quic_test.driveHandshake(&loop);
 
-    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
     defer client.deinit();
     const cconn = client.transport.connection();
     _ = try cconn.openStream();
@@ -4901,7 +4938,7 @@ test "zmq1 r8: wrong-role prefaces on the control stream reject with unknown_rol
         defer loop.deinit();
         try quic_test.driveHandshake(&loop);
 
-        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
         defer client.deinit();
         const cconn = client.transport.connection();
         _ = try cconn.openStream();
@@ -4947,7 +4984,7 @@ test "zmq1 r8: FINAL ERROR after authorization drains; delayed FIN keeps drainin
     defer loop.deinit();
     try quic_test.driveHandshake(&loop);
 
-    var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+    var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
     defer client.deinit();
     const cconn = client.transport.connection();
     _ = try cconn.openStream();
@@ -5025,7 +5062,7 @@ test "zmq1 r8: truncated control frame FIN and post-terminal frames are violatio
         defer loop.deinit();
         try quic_test.driveHandshake(&loop);
 
-        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
         defer client.deinit();
         const cconn = client.transport.connection();
         _ = try cconn.openStream();
@@ -5140,7 +5177,7 @@ test "zmq1 r8: truncated output header FIN and output reset are violations" {
         defer loop.deinit();
         try quic_test.driveHandshake(&loop);
 
-        var client = try quic_client.ClientSession.initSilent(alloc, loop.client);
+        var client = try quic_client.ClientSession.initSilent(alloc, std.testing.io, loop.client);
         defer client.deinit();
         const cconn = client.transport.connection();
         _ = try cconn.openStream();
@@ -5401,13 +5438,23 @@ test "zmq1 r8: blocked-write contract under controlled peer transport parameters
         try z.client.retryPendingSends();
         _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
     }
-    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+    try testing.expectEqual(quic_client.StateTag.installing_snapshot, z.client.stateTag());
     {
         const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
         try testing.expectEqual(ipc.Tag.InitSnapshot, f.tag);
         const rz = std.mem.bytesToValue(ipc.Resize, f.payload[0..@sizeOf(ipc.Resize)]);
         try testing.expectEqual(@as(u16, 24), rz.rows);
     }
+    // Complete the REAL install before the active-session phase.
+    try quic_test.daemonSendEmptySnapshot(z.loop.daemon_fd);
+    {
+        const gws = try z.session();
+        for (0..40) |i| {
+            _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+            if (gws.phase == .active and z.client.stateTag() == .active) break;
+        }
+    }
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
 
     // Second injection, ACTIVE session: the input PREFACE alone
     // blocks — the body stays caller-owned and unsent.
@@ -5581,7 +5628,7 @@ test "r8: partially-failed construction leaks nothing (ClientSession, QuicSessio
         var fail_index: usize = 0;
         while (fail_index < 16) : (fail_index += 1) {
             var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-            if (quic_client.ClientSession.init(failing.allocator(), transport)) |s| {
+            if (quic_client.ClientSession.init(failing.allocator(), std.testing.io, transport)) |s| {
                 var sess = s;
                 sess.deinit();
                 break;
@@ -5868,28 +5915,23 @@ test "zmq1 r8.6 fixture A: DETACH parks under genuine flow control, retries once
     // many installation rounds would consume any pre-set window).
     const conn = z.client.transport.connection();
     try z.client.sendResize(24, 80, 0, 0);
-    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+    try testing.expectEqual(quic_client.StateTag.installing_snapshot, z.client.stateTag());
     for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
     {
         const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
         try testing.expectEqual(ipc.Tag.InitSnapshot, f.tag);
     }
+    // The REAL client installs (its INSTALLED still totals the same
+    // control-offset 88 the clamp below relies on: HELLO 64 + RESIZE
+    // 16 + INSTALLED 8).
     try quic_test.daemonSendEmptySnapshot(z.loop.daemon_fd);
-    var observed: ?quic_wire.SnapshotHeader = null;
-    var snap_rx: quic_test.ClientSnapshotRx = .{};
-    for (0..16) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
-        observed = try quic_test.clientObserveSnapshot(z.client.transport, testing.allocator, &snap_rx, null);
-        if (observed != null) break;
-    }
-    try testing.expect(observed != null);
-    try quic_test.sendSnapshotInstalledOn(z.client.transport);
     const gw = try z.session();
-    for (0..8) |i| {
-        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 180 + @as(i64, @intCast(i)));
-        if (gw.phase == .active) break;
+    for (0..40) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+        if (gw.phase == .active and z.client.stateTag() == .active) break;
     }
     try testing.expect(gw.phase == .active);
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
 
     // NOW clamp the peer's control credit to exactly the current
     // offset (HELLO 64 + RESIZE 16 + INSTALLED 8 = 88): the 8-byte
@@ -5959,22 +6001,46 @@ test "zmq1 r8.6 fixture B: parked DETACH plus server FIN before flush is a proto
     var z = try zmq1Setup(alloc, &psk);
     defer z.loop.deinit();
     defer z.client.deinit();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
     const base: i64 = lib_posix.nowNs();
     try zmq1ToActive0(&z);
 
     const conn = z.client.transport.connection();
-    var cap80 = quicz.transport_parameters.TransportParameters{};
-    cap80.initial_source_connection_id = conn.peerInitialSourceConnectionId();
-    cap80.original_destination_connection_id = conn.originalDestinationConnectionId();
-    cap80.retry_source_connection_id = conn.retrySourceConnectionId();
-    cap80.initial_max_data = 80;
-    cap80.initial_max_stream_data_bidi_remote = 80;
-    cap80.initial_max_stream_data_bidi_local = 64 * 1024;
-    cap80.initial_max_stream_data_uni = 64 * 1024;
-    cap80.initial_max_streams_bidi = 100;
-    cap80.initial_max_streams_uni = 100;
-    try conn.applyPeerTransportParameters(cap80);
+    // The REAL client installs first — a DETACH can no longer exist
+    // mid-installation (NotActive); the parked-DETACH proof runs from
+    // the representable ACTIVE state instead.
     try z.client.sendResize(24, 80, 0, 0);
+    try testing.expectEqual(quic_client.StateTag.installing_snapshot, z.client.stateTag());
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+    {
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
+        try testing.expectEqual(ipc.Tag.InitSnapshot, f.tag);
+    }
+    try quic_test.daemonSendEmptySnapshot(z.loop.daemon_fd);
+    {
+        const gws = try z.session();
+        for (0..40) |i| {
+            _ = try quic_test.sessionRound(&z.loop, &z.client, base + 150 + @as(i64, @intCast(i)));
+            if (gws.phase == .active and z.client.stateTag() == .active) break;
+        }
+    }
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+
+    // Clamp the peer's control credit to exactly the current offset
+    // (HELLO 64 + RESIZE 16 + INSTALLED 8 = 88): the 8-byte DETACH
+    // that follows parks NATURALLY through FlowControlBlocked.
+    var cap88 = quicz.transport_parameters.TransportParameters{};
+    cap88.initial_source_connection_id = conn.peerInitialSourceConnectionId();
+    cap88.original_destination_connection_id = conn.originalDestinationConnectionId();
+    cap88.retry_source_connection_id = conn.retrySourceConnectionId();
+    cap88.initial_max_data = 88;
+    cap88.initial_max_stream_data_bidi_remote = 88;
+    cap88.initial_max_stream_data_bidi_local = 64 * 1024;
+    cap88.initial_max_stream_data_uni = 64 * 1024;
+    cap88.initial_max_streams_bidi = 100;
+    cap88.initial_max_streams_uni = 100;
+    try conn.applyPeerTransportParameters(cap88);
     try z.client.sendDetach();
     try testing.expectEqual(quic_client.StateTag.detaching, z.client.stateTag());
 

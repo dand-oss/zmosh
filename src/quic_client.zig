@@ -28,11 +28,15 @@
 const std = @import("std");
 const quic_wire = @import("quic_wire.zig");
 const quic_transport = @import("quic_transport.zig");
+const quic_installer = @import("quic_installer.zig");
 
 pub const control_stream_id: u64 = 0;
 pub const input_stream_id: u64 = 2;
 /// The server's first unidirectional stream is the output epoch stream.
 pub const output_stream_id: u64 = 3;
+/// The server's second unidirectional stream carries the Q4 initial
+/// snapshot (epoch 1).
+pub const snapshot_stream_id: u64 = 7;
 
 /// The largest client control emission: preface 8 + header 8 + the
 /// 48-byte HELLO payload.
@@ -62,7 +66,7 @@ pub const ControlTx = union(enum) {
     closed,
 };
 
-pub const PendingKind = enum { hello, first_resize, detach, ordinary };
+pub const PendingKind = enum { hello, first_resize, snapshot_installed, detach, ordinary };
 
 /// The client's input-send side. `preface_pending` holds the staged
 /// preface; the body bytes remain caller-owned.
@@ -96,6 +100,21 @@ pub const OutputRx = union(enum) {
     unavailable_after_close,
 };
 
+/// The typed snapshot-installation substate carried through the live
+/// and draining variants: the owned heap-stable installer, whether
+/// its replay has been fully copied to the driver, a stream-7 reset
+/// awaiting its matching terminal ERROR, and the abort marker for an
+/// installation abandoned by a FINAL ERROR before replay preparation.
+pub const InstallState = struct {
+    installer: ?*quic_installer.Installer = null,
+    replay_done: bool = false,
+    installed_sent: bool = false,
+    /// A stream-7 reset carrying internal_error was observed; the
+    /// server's matching terminal ERROR must follow.
+    reset_pending: bool = false,
+    aborted: bool = false,
+};
+
 /// Which terminal frame began the drain (evidence for the deferred
 /// event and the FIN contract). `detach_fin` is the clean-detach arm:
 /// the server's bare FIN (no final frame) completes a client DETACH.
@@ -115,18 +134,33 @@ pub const ProtocolState = union(enum) {
         control_rx: ControlRx = .preface,
     },
     /// HELLO_ACK validated; the first RESIZE is idle or parked;
-    /// output authorized; input still rejected.
+    /// output authorized; input still rejected. The installer is
+    /// PREPARED here (HELLO_ACK carried the negotiated limit).
     awaiting_first_resize: struct {
         control_tx: ControlTx,
         control_rx: ControlRx,
         output_rx: OutputRx,
+        install: InstallState = .{},
     },
-    /// The first RESIZE was accepted in full; input may flow.
+    /// The first RESIZE was accepted in full; the initial snapshot
+    /// transaction is in flight. Later RESIZEs coalesce to one latest
+    /// value; input, DETACH, and SNAPSHOT_REQUEST are NotActive.
+    installing_snapshot: struct {
+        control_tx: ControlTx,
+        control_rx: ControlRx,
+        output_rx: OutputRx,
+        install: InstallState,
+        pending_resize: ?quic_wire.ResizeWire = null,
+    },
+    /// Installation completed (SNAPSHOT_INSTALLED accepted) and the
+    /// first RESIZE's terminal initialized the session; input may
+    /// flow. The installer survives until its replay is fully copied.
     active: struct {
         control_tx: ControlTx,
         control_rx: ControlRx,
         input_tx: InputTx = .unopened,
         output_rx: OutputRx,
+        install: InstallState = .{},
     },
     /// A DETACH was accepted (sent whole or parked whole — ownership
     /// transferred). No further application writes; the server's bare
@@ -136,6 +170,7 @@ pub const ProtocolState = union(enum) {
         control_tx: ControlTx,
         control_rx: ControlRx,
         output_rx: OutputRx,
+        install: InstallState = .{},
     },
     /// A terminal marker was received after authorization: no new
     /// sends; control FIN validation and output draining continue.
@@ -145,6 +180,7 @@ pub const ProtocolState = union(enum) {
         peer: enum { open, closed } = .open,
         control_rx: ControlRx,
         output_rx: OutputRx,
+        install: InstallState = .{},
         terminal: TerminalMeta,
     },
     /// One local/protocol failure recorded; application close
@@ -158,6 +194,7 @@ pub const ProtocolState = union(enum) {
 pub const StateTag = enum {
     awaiting_ack,
     awaiting_first_resize,
+    installing_snapshot,
     active,
     detaching,
     draining,
@@ -167,8 +204,22 @@ pub const StateTag = enum {
 
 pub const ClientSession = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     transport: *quic_transport.Transport,
     state: ProtocolState = .{ .awaiting_ack = .{} },
+    /// The HELLO_ACK-negotiated snapshot limit, validated ≤ v1.
+    negotiated_snapshot_limit: usize = quic_wire.snapshot_limit_v1,
+    /// The LIFETIME owner of the heap-stable installer — the variants
+    /// carry its pointer semantically; this field alone destroys it.
+    install_owner: ?*quic_installer.Installer = null,
+    /// Remaining bytes of this public pump's ONE shared 64 KiB
+    /// installation budget (stream-7 reads plus pre-replay stream-3
+    /// application, snapshot serviced first). Reset by the driver at
+    /// every pump entry.
+    install_budget_left: usize = 0,
+    /// READY happened during THIS public pump; history may advance
+    /// only from the next one.
+    install_ready_this_pump: bool = false,
 
     // Stable parser/storage members — variants carry only semantic
     // state and owned fixed-size pending data.
@@ -191,8 +242,8 @@ pub const ClientSession = struct {
     /// Constructs and sends preface + HELLO as ONE atomic frame
     /// (parked whole if credit is withheld — nothing else is ever
     /// sent first).
-    pub fn init(alloc: std.mem.Allocator, transport: *quic_transport.Transport) !ClientSession {
-        var s = try ClientSession.initSilentPreallocated(alloc, transport);
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, transport: *quic_transport.Transport) !ClientSession {
+        var s = try ClientSession.initSilentPreallocated(alloc, io, transport);
         errdefer s.deinit();
         const id = try transport.connection().openStream();
         if (id != control_stream_id) return error.UnexpectedControlStreamId;
@@ -214,16 +265,17 @@ pub const ClientSession = struct {
 
     /// Constructs WITHOUT opening or sending anything: for harnesses
     /// that craft the client's first frames themselves.
-    pub fn initSilent(alloc: std.mem.Allocator, transport: *quic_transport.Transport) !ClientSession {
-        return ClientSession.initSilentPreallocated(alloc, transport);
+    pub fn initSilent(alloc: std.mem.Allocator, io: std.Io, transport: *quic_transport.Transport) !ClientSession {
+        return ClientSession.initSilentPreallocated(alloc, io, transport);
     }
 
-    fn initSilentPreallocated(alloc: std.mem.Allocator, transport: *quic_transport.Transport) !ClientSession {
+    fn initSilentPreallocated(alloc: std.mem.Allocator, io: std.Io, transport: *quic_transport.Transport) !ClientSession {
         var stash: std.ArrayList(u8) = .empty;
         errdefer stash.deinit(alloc);
         try stash.ensureTotalCapacity(alloc, client_stash_cap);
         return .{
             .alloc = alloc,
+            .io = io,
             .transport = transport,
             .control = quic_wire.ControlParser.init(alloc),
             .control_stash = stash,
@@ -231,6 +283,8 @@ pub const ClientSession = struct {
     }
 
     pub fn deinit(self: *ClientSession) void {
+        if (self.install_owner) |i| i.destroy();
+        self.install_owner = null;
         self.control.deinit();
         self.control_stash.deinit(self.alloc);
     }
@@ -255,6 +309,7 @@ pub const ClientSession = struct {
         return switch (self.state) {
             .awaiting_ack => .awaiting_ack,
             .awaiting_first_resize => .awaiting_first_resize,
+            .installing_snapshot => .installing_snapshot,
             .active => .active,
             .detaching => .detaching,
             .draining => .draining,
@@ -290,6 +345,21 @@ pub const ClientSession = struct {
     /// consumed, or a peer close made the FIN unreachable after the
     /// readable bytes were drained.
     pub fn outputSettled(self: *const ClientSession) bool {
+        const inst_st: ?*const InstallState = switch (self.state) {
+            .awaiting_first_resize => |*a| &a.install,
+            .installing_snapshot => |*a| &a.install,
+            .active => |*a| &a.install,
+            .detaching => |*d| &d.install,
+            .draining => |*d| &d.install,
+            else => null,
+        };
+        if (inst_st) |ist| {
+            if (ist.installer) |inst| {
+                // A terminal event cannot overtake replay bytes still
+                // owned by the installer.
+                if (!ist.aborted and inst.replayRemaining() > 0) return false;
+            }
+        }
         return switch (self.state) {
             .draining => |d| switch (d.output_rx) {
                 .finished, .unavailable_after_close => true,
@@ -308,29 +378,65 @@ pub const ClientSession = struct {
             .awaiting_ack => |a| a,
             else => return,
         };
+        // PREPARE the heap-stable installer before any first RESIZE
+        // can be sent; preparation failure fails closed.
+        const inst = quic_installer.Installer.create(self.alloc, self.io, self.negotiated_snapshot_limit) catch {
+            self.failProtocol(.internal_error, "installer preparation failed");
+            return;
+        };
+        self.install_owner = inst;
         self.state = .{
             .awaiting_first_resize = .{
                 .control_tx = a.control_tx,
                 // The control preface is necessarily validated by now.
                 .control_rx = .frames,
                 .output_rx = .header,
+                .install = .{ .installer = inst },
             },
         };
     }
 
     /// The first RESIZE was accepted in full (immediately or by
-    /// retry): awaiting_first_resize → active, exactly once.
+    /// retry): awaiting_first_resize → installing_snapshot, exactly
+    /// once. The prepared installer transfers with it.
     fn acceptFirstResize(self: *ClientSession) void {
         const a = switch (self.state) {
             .awaiting_first_resize => |a| a,
             else => return,
         };
+        self.state = .{ .installing_snapshot = .{
+            .control_tx = .idle,
+            .control_rx = a.control_rx,
+            .output_rx = a.output_rx,
+            .install = a.install,
+        } };
+    }
+
+    /// SNAPSHOT_INSTALLED was accepted in full (immediately or by
+    /// retry): installing_snapshot → active, exactly once. The
+    /// installer SURVIVES activation — it is destroyed only once its
+    /// replay has been fully copied to the driver queue. The latest
+    /// coalesced RESIZE (if any) leaves through the normal atomic
+    /// path on the next send.
+    fn finishInstallation(self: *ClientSession) void {
+        const a = switch (self.state) {
+            .installing_snapshot => |a| a,
+            else => return,
+        };
+        const pending = a.pending_resize;
         self.state = .{ .active = .{
             .control_tx = .idle,
             .control_rx = a.control_rx,
             .input_tx = .unopened,
             .output_rx = a.output_rx,
+            .install = a.install,
         } };
+        if (pending) |rz| {
+            var frame: [quic_wire.control_header_len + 8]u8 = undefined;
+            quic_wire.writeControlHeader(frame[0..quic_wire.control_header_len], .resize, 8, 0);
+            quic_wire.writeResizePayload(frame[quic_wire.control_header_len..][0..8], rz.rows, rz.cols, rz.xpixel, rz.ypixel);
+            self.sendFrameAtomic(.ordinary, frame[0..]) catch {};
+        }
     }
 
     /// A DETACH frame was accepted with ownership transferred (sent
@@ -345,6 +451,7 @@ pub const ClientSession = struct {
             .control_tx = a.control_tx,
             .control_rx = a.control_rx,
             .output_rx = a.output_rx,
+            .install = a.install,
         } };
     }
 
@@ -352,15 +459,31 @@ pub const ClientSession = struct {
     /// live state enters draining, keeps its output evidence, and
     /// stops all new sends.
     fn beginDrain(self: *ClientSession, meta: TerminalMeta) void {
-        const output_rx = switch (self.state) {
-            .awaiting_first_resize => |a| a.output_rx,
-            .active => |a| a.output_rx,
-            .detaching => |d| d.output_rx,
+        var output_rx: OutputRx = undefined;
+        var install: InstallState = undefined;
+        switch (self.state) {
+            .awaiting_first_resize => |a| {
+                output_rx = a.output_rx;
+                install = a.install;
+            },
+            .installing_snapshot => |a| {
+                output_rx = a.output_rx;
+                install = a.install;
+            },
+            .active => |a| {
+                output_rx = a.output_rx;
+                install = a.install;
+            },
+            .detaching => |d| {
+                output_rx = d.output_rx;
+                install = d.install;
+            },
             else => return,
-        };
+        }
         self.state = .{ .draining = .{
             .control_rx = .terminal_wait_fin,
             .output_rx = output_rx,
+            .install = install,
             .terminal = meta,
         } };
     }
@@ -471,6 +594,7 @@ pub const ClientSession = struct {
         return switch (self.state) {
             .awaiting_ack => |*a| &a.control_tx,
             .awaiting_first_resize => |*a| &a.control_tx,
+            .installing_snapshot => |*a| &a.control_tx,
             .active => |*a| &a.control_tx,
             .detaching => |*d| &d.control_tx,
             else => null,
@@ -488,6 +612,7 @@ pub const ClientSession = struct {
         return switch (self.state) {
             .awaiting_ack => |*a| &a.control_rx,
             .awaiting_first_resize => |*a| &a.control_rx,
+            .installing_snapshot => |*a| &a.control_rx,
             .active => |*a| &a.control_rx,
             .detaching => |*d| &d.control_rx,
             .draining => |*d| &d.control_rx,
@@ -498,11 +623,30 @@ pub const ClientSession = struct {
     fn outputRx(self: *ClientSession) ?*OutputRx {
         return switch (self.state) {
             .awaiting_first_resize => |*a| &a.output_rx,
+            .installing_snapshot => |*a| &a.output_rx,
             .active => |*a| &a.output_rx,
             .detaching => |*d| &d.output_rx,
             .draining => |*d| &d.output_rx,
             else => null,
         };
+    }
+
+    /// The typed snapshot-installation substate of every variant that
+    /// can carry one.
+    fn installState(self: *ClientSession) ?*InstallState {
+        return switch (self.state) {
+            .awaiting_first_resize => |*a| &a.install,
+            .installing_snapshot => |*a| &a.install,
+            .active => |*a| &a.install,
+            .detaching => |*d| &d.install,
+            .draining => |*d| &d.install,
+            else => null,
+        };
+    }
+
+    pub fn installer(self: *ClientSession) ?*quic_installer.Installer {
+        const inst = self.installState() orelse return null;
+        return inst.installer;
     }
 
     // -- atomic control writes ---------------------------------------------
@@ -523,6 +667,7 @@ pub const ClientSession = struct {
         if (self.transport.connection().sendOnStream(control_stream_id, frame, false)) {
             tx.* = .idle;
             if (kind == .first_resize) self.acceptFirstResize();
+            if (kind == .snapshot_installed) self.finishInstallation();
         } else |e| switch (e) {
             error.FlowControlBlocked => {
                 var bytes: [client_max_frame]u8 = undefined;
@@ -551,6 +696,7 @@ pub const ClientSession = struct {
                 if (self.transport.connection().sendOnStream(control_stream_id, p.bytes[0..p.len], false)) {
                     tx.* = .idle;
                     if (p.kind == .first_resize) self.acceptFirstResize();
+                    if (p.kind == .snapshot_installed) self.finishInstallation();
                 } else |e| switch (e) {
                     error.FlowControlBlocked => return, // stays parked, whole
                     error.StreamClosed => {
@@ -589,7 +735,7 @@ pub const ClientSession = struct {
         if (self.takeEvent()) |e| return e;
 
         switch (self.state) {
-            .awaiting_ack, .awaiting_first_resize, .active, .detaching, .draining => {},
+            .awaiting_ack, .awaiting_first_resize, .installing_snapshot, .active, .detaching, .draining => {},
             .failed, .closed => return null,
         }
 
@@ -732,6 +878,7 @@ pub const ClientSession = struct {
                 {
                     return self.failProtocol(.protocol_violation, "bad negotiated limits");
                 }
+                self.negotiated_snapshot_limit = ack.snapshot_limit;
                 self.acceptHelloAck();
                 self.pending_event = .{ .hello_ack = ack };
             },
@@ -741,7 +888,7 @@ pub const ClientSession = struct {
                 }
                 switch (self.state) {
                     .awaiting_ack => return self.failBeforeAuthorization(quic_wire.ErrCode.session_ended.code(), "session ended"),
-                    .awaiting_first_resize, .active, .detaching => {
+                    .awaiting_first_resize, .installing_snapshot, .active, .detaching => {
                         self.beginDrain(.{ .kind = .session_end, .code = 0 });
                         self.pending_event = .session_end;
                     },
@@ -765,7 +912,17 @@ pub const ClientSession = struct {
                 if (h.isFinal()) {
                     switch (self.state) {
                         .awaiting_ack => return self.failBeforeAuthorization(parsed.code, parsed.reason),
-                        .awaiting_first_resize, .active, .detaching => {
+                        .awaiting_first_resize, .installing_snapshot, .active, .detaching => {
+                            // A FINAL ERROR aborts an installation that
+                            // has not prepared its replay; one whose
+                            // replay is prepared keeps it draining.
+                            if (self.state == .installing_snapshot) {
+                                if (self.installState()) |inst| {
+                                    if (inst.installer) |i| {
+                                        if (!i.readyToInstall()) inst.aborted = true;
+                                    }
+                                }
+                            }
                             self.beginDrain(.{ .kind = .err, .code = parsed.code });
                         },
                         else => return self.failProtocol(.protocol_violation, "frame after terminal marker"),
@@ -792,6 +949,15 @@ pub const ClientSession = struct {
     /// advances to active only once the frame was ACCEPTED in full
     /// (immediately or by `retryPendingSends`), exactly once.
     pub fn sendResize(self: *ClientSession, rows: u16, cols: u16, xpixel: u16, ypixel: u16) !void {
+        switch (self.state) {
+            // During installation the RESIZE coalesces to one latest
+            // value and the call SUCCEEDS without sending.
+            .installing_snapshot => |*a| {
+                a.pending_resize = .{ .rows = rows, .cols = cols, .xpixel = xpixel, .ypixel = ypixel };
+                return;
+            },
+            else => {},
+        }
         const first = switch (self.state) {
             .awaiting_first_resize => true,
             .active => false,
@@ -891,6 +1057,144 @@ pub const ClientSession = struct {
         }
     }
 
+    // -- snapshot stream (server → client, stream 7) -----------------------
+
+    fn failInstaller(self: *ClientSession, f: quic_installer.Failure) void {
+        if (self.installState()) |inst| inst.aborted = true;
+        self.failProtocol(f.code, f.reason);
+    }
+
+    /// Sends SNAPSHOT_INSTALLED (type 6, empty payload) through the
+    /// atomic path: a flow-control block parks the complete frame and
+    /// the retry acceptance activates the session exactly once.
+    fn sendSnapshotInstalled(self: *ClientSession) !void {
+        var frame: [quic_wire.control_header_len]u8 = undefined;
+        quic_wire.writeControlHeader(&frame, .snapshot_installed, 0, 0);
+        try self.sendFrameAtomic(.snapshot_installed, frame[0..]);
+    }
+
+    /// One bounded stream-7 step inside the shared installation
+    /// budget. Reads EXACTLY the missing header bytes, then at most
+    /// the body allowance; observes FIN; on READY-drain applies
+    /// currently readable post-cut output to the temporary stream
+    /// BEFORE this pump's single history page; sends
+    /// SNAPSHOT_INSTALLED once replay preparation completes (never
+    /// once draining began). A stream-7 reset is provisional until a
+    /// matching terminal ERROR follows.
+    pub fn pumpSnapshot(self: *ClientSession) !void {
+        switch (self.state) {
+            .installing_snapshot => {},
+            // A valid installation still completes under a deferred
+            // SESSION_END — but INSTALLED is never sent from draining.
+            .draining => {},
+            else => return,
+        }
+        const inst_st = self.installState() orelse return;
+        const inst = inst_st.installer orelse return;
+        if (inst_st.aborted) return;
+
+        const conn = self.transport.connection();
+        var rbuf: [16 * 1024]u8 = undefined;
+
+        // Stream 7 is serviced FIRST within the shared budget.
+        while (self.install_budget_left > 0) {
+            if (inst.phase == .header) {
+                const want = @min(inst.headerRemaining(), self.install_budget_left);
+                if (want == 0) break;
+                const got = conn.recvOnStream(snapshot_stream_id, rbuf[0..want]) catch |e| switch (e) {
+                    error.StreamClosed => {
+                        self.snapshotReset(inst_st, inst);
+                        return;
+                    },
+                    error.ConnectionClosed => {
+                        self.recordPeerCloseFromTransport();
+                        return;
+                    },
+                    else => return e,
+                };
+                const n = got orelse 0;
+                if (n == 0) break;
+                self.install_budget_left -= n;
+                if (inst.feedHeader(rbuf[0..n])) |f| return self.failInstaller(f);
+            } else if (inst.phase == .body) {
+                const allow = @min(@min(inst.bodyAllowance(), self.install_budget_left), rbuf.len);
+                if (allow == 0) break;
+                const got = conn.recvOnStream(snapshot_stream_id, rbuf[0..allow]) catch |e| switch (e) {
+                    error.StreamClosed => {
+                        self.snapshotReset(inst_st, inst);
+                        return;
+                    },
+                    error.ConnectionClosed => {
+                        self.recordPeerCloseFromTransport();
+                        return;
+                    },
+                    else => return e,
+                };
+                const n = got orelse 0;
+                if (n == 0) break;
+                self.install_budget_left -= n;
+                if (inst.feedBody(rbuf[0..n])) |f| return self.failInstaller(f);
+            } else break;
+        }
+
+        // A clean stream-7 FIN (checked only while body is expected).
+        if (inst.phase == .body or inst.phase == .header) {
+            const finished = conn.recvStreamFinished(snapshot_stream_id) catch false;
+            if (finished) {
+                if (inst.fin()) |f| return self.failInstaller(f);
+                self.install_ready_this_pump = true;
+            }
+        }
+
+        // Post-cut output drains into the temporary stream BEFORE the
+        // pump's single history page, sharing the installation budget.
+        if (inst.phase == .history) {
+            while (self.install_budget_left > 0) {
+                const allow = @min(@min(rbuf.len, 4096), self.install_budget_left);
+                const got = conn.recvOnStream(output_stream_id, rbuf[0..allow]) catch |e| switch (e) {
+                    error.StreamClosed => {
+                        if (self.outputRx()) |orx| orx.* = .reset;
+                        break;
+                    },
+                    error.ConnectionClosed => {
+                        self.recordPeerCloseFromTransport();
+                        break;
+                    },
+                    else => return e,
+                };
+                const n = got orelse 0;
+                if (n == 0) break;
+                self.install_budget_left -= n;
+                if (inst.applyLive(rbuf[0..n])) |f| return self.failInstaller(f);
+            }
+            // One page per public pump, never the READY pump itself.
+            if (!self.install_ready_this_pump) {
+                if (inst.nextPage()) |f| return self.failInstaller(f);
+            }
+        }
+
+        // INSTALLED only after replay preparation, never once a
+        // terminal drain has begun.
+        if (inst.readyToInstall() and !inst_st.installed_sent and self.state == .installing_snapshot) {
+            inst_st.installed_sent = true;
+            try self.sendSnapshotInstalled();
+        }
+    }
+
+    /// A stream-7 reset during installation. With the replay already
+    /// prepared the valid replay still drains; otherwise the reset is
+    /// provisional — a matching terminal ERROR must follow, and a
+    /// SESSION_END or peer close without it is a violation.
+    fn snapshotReset(self: *ClientSession, inst_st: *InstallState, inst: *quic_installer.Installer) void {
+        if (inst.readyToInstall()) {
+            inst_st.reset_pending = true;
+            return;
+        }
+        inst_st.aborted = true;
+        inst_st.reset_pending = true;
+        self.failProtocol(.protocol_violation, "snapshot stream reset before installation completed");
+    }
+
     // -- output stream (server → client), parked until authorized ---------
 
     /// Reads output bytes ONLY once HELLO_ACK validated the session;
@@ -904,6 +1208,28 @@ pub const ClientSession = struct {
     pub fn pollOutput(self: *ClientSession, buf: []u8, epoch_out: ?*u64) !?usize {
         const orx = self.outputRx() orelse return null;
         const conn = self.transport.connection();
+
+        // Replay bytes come FIRST: until the installer's replay has
+        // been fully copied, live stream-3 bytes are never returned.
+        if (self.installState()) |inst_st| {
+            if (inst_st.installer) |inst| {
+                if (!inst_st.aborted and inst.phase == .replay and inst.replayRemaining() > 0) {
+                    const n = @min(buf.len, inst.replayRemaining());
+                    @memcpy(buf[0..n], inst.replaySlice(n));
+                    inst.replayConsumed(n);
+                    if (inst.replayRemaining() == 0) inst_st.replay_done = true;
+                    if (epoch_out) |o| o.* = 1;
+                    return n;
+                }
+            }
+        }
+        // Before replay preparation the output side is consumed only
+        // after READY and applied to the temporary stream — pumpSnapshot
+        // owns that; pollOutput never exposes mid-installation bytes.
+        switch (self.state) {
+            .installing_snapshot => return null,
+            else => {},
+        }
         if (orx.* == .header) {
             const want = self.output_hdr.remaining();
             var header_done = false;
@@ -1132,7 +1458,7 @@ pub const Client = struct {
         try lib_posix.getsockname(sock.getFd(), &bound.any, &bound_len);
         const local_udp = udp.sockaddrToUdpAddress(bound) orelse return error.UnsupportedAddressFamily;
         try transport.registerRoute(local_udp, remote_udp);
-        var session = try ClientSession.init(alloc, transport);
+        var session = try ClientSession.init(alloc, io, transport);
         errdefer session.deinit();
         return .{
             .alloc = alloc,
@@ -1654,6 +1980,12 @@ pub const Client = struct {
         try self.session.retryPendingSends();
         try self.pumpEgress(now);
         if (self.dstate == .event_ready) return self.deliverTerminal(self.dstate.event_ready);
+
+        // ONE shared 64 KiB installation budget per public pump; the
+        // snapshot stream is serviced BEFORE output.
+        self.session.install_budget_left = 64 * 1024;
+        self.session.install_ready_this_pump = false;
+        try self.session.pumpSnapshot();
 
         // Drain output BEFORE control, before receiving.
         var ev: ?ControlEvent = null;
