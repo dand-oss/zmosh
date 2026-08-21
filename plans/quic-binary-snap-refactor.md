@@ -2188,6 +2188,69 @@ updated factually; local/origin equality verified; stop for review.
 Stage 6 owns cross-layer qualification and performance measurement;
 full Bats stays deferred to final Q4 qualification.
 
+### Q4 Stage 5 completion evidence (2026-08-20, appended after gates)
+
+Landed per the frozen five-commit order above: (1) the contract
+itself, 79d09b2; (2) fd73b4a, the strict-writer serializer refactor
+plus src/quic_installer.zig with its unit suite; (3) 0ad5fe6, the
+complete ClientSession/driver integration together with every
+required existing-test and helper adaptation, full suite green;
+(4) 94833ae, the regression matrix; (5) this documentation and
+evidence.
+
+RED-first: the three initial real-client scenarios ran against
+205e839 before any code — 281/284 (gateway stuck in
+awaiting_snapshot_installed because the real client never sent
+SNAPSHOT_INSTALLED; sendInput returning void where NotActive was
+required). Logs retained outside the repository
+(/tmp/zmosh-stage5-red.log, scenarios /tmp/zmosh-stage5-red-tests.zig).
+
+Commit 2 notes: replay-through-a-same-size-terminal is inherently
+lossy — the serializer's phase-1 clear (\x1b[2J) erases visible rows
+without scrolling them — so the provable replay invariant is SERIALIZE
+equality (replay == serializeTerminalState(source), the same
+invariant the daemon roundtrip test pins), asserted in the unit
+suite; feed-through equality is deliberately not claimed.
+
+Commit 3 notes: the installer's pre-replay drain originally applied
+stream 3's 16-byte epoch header to the temporary terminal as content
+(the ZMQ1 preface painted into the restored screen); the drain now
+parses the header first, and the exact-replay regression pins it.
+Existing raw gateway proofs (populated transaction, installation
+control matrix, credit exhaustion, buffered IPC, post-End output,
+malformed chunks) run intentionally raw through sessionRoundRaw with
+crafted frames — the raw client never consumes stream 7; the
+reordered-input proof crafts its early input raw on stream 2; the
+r8.6 DETACH-parking proofs run from the now-representable ACTIVE
+state under the 88-byte clamp (a DETACH mid-installation is
+unrepresentable by design — NotActive). ClientSession.init/initSilent
+gained the internal std.Io parameter; public Client, C ABI, pump,
+and pollOutput signatures are unchanged.
+
+Commit 4 notes: the exact 64 KiB budget equality is proven at the
+installer unit level (feedHeader/feedBody caps); through the live
+transport the provable form is the bound (≤ budget per public pump),
+progress, and completion — the three interacting flow-control layers
+(quicz stream credit, the gateway's pending_snapshot cap, the 4.1.1
+daemon-read gate) make a deterministic whole-budget-in-one-pump
+construction unavailable without fighting the mechanisms under test.
+Server-uni streams 11..31 (stream_cardinality): quicz exposes no
+client-side stream enumeration (only receive_reset_error_code on
+known ids), so a client-driven rejection proof for arbitrary future
+stream ids cannot be constructed without new transport API; the
+gateway-side duplicate/future-stream rejection remains the wire
+contract's enforcement point and the ordering rule (stream 7 before
+installation → protocol_violation) is proven. The existing
+SNAPSHOT_REQUEST nonterminal Q5 deferral and legacy .Init
+byte-identity proofs remain green in the suite.
+
+Gates: Debug 296/296 and ReleaseSafe 296/296 (292 at commit 3 plus
+the four commit-4 proofs); `zig build check`, `zig build release`
+then Debug rebuild, `zig fmt --check`, `git diff --check` all clean
+at every checkpoint; the frozen awk SLOC command reports 467 on an
+untouched quic_transport.zig. Stage 6, Q5, full Bats, quicz, and the
+public C ABI remain untouched and locked pending review.
+
 ## Phase Q5: reliable output epochs and remote attach
 
 Input uses one client unidirectional reliable stream. Raw terminal input is

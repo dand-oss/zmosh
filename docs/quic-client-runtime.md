@@ -10,14 +10,54 @@ the Zig/quicz stack lives in `docs/decisions/0001-zig-quicz-network-stack.md`.
 
 - **`ClientSession`** owns the application protocol. Its top-level
   state is the lifecycle — `awaiting_ack` → `awaiting_first_resize` →
-  `active` → (`detaching` | `draining`) → terminal — and each live
-  variant embeds only the stream substates possible there
-  (`ControlTx`, `InputTx`, `ControlRx`, `OutputRx`). Invalid
-  combinations (output readable before authorization, input before
-  the first RESIZE, a parked first RESIZE without its transition
-  metadata) are unrepresentable. Top-level transitions go through
-  named helpers only (`acceptHelloAck`, `acceptFirstResize`,
-  `beginDetach`, `beginDrain`, `failProtocol`, `recordPeerClose`).
+  `installing_snapshot` → `active` → (`detaching` | `draining`) →
+  terminal — and each live variant embeds only the stream substates
+  possible there (`ControlTx`, `InputTx`, `ControlRx`, `OutputRx`).
+  Invalid combinations (output readable before authorization, input
+  before the first RESIZE, a parked first RESIZE without its
+  transition metadata) are unrepresentable. Top-level transitions go
+  through named helpers only (`acceptHelloAck`, `acceptFirstResize`,
+  `finishInstallation`, `beginDetach`, `beginDrain`, `failProtocol`,
+  `recordPeerClose`).
+
+### installing_snapshot (Q4 stage 5)
+
+HELLO_ACK validation stores the negotiated snapshot limit and
+PREPARES the heap-stable installer (src/quic_installer.zig) before
+any first RESIZE can be sent; the first accepted RESIZE transfers it
+into `installing_snapshot`. A typed `InstallState` (owned installer,
+replay done, installed sent, provisional stream-7 reset, aborted)
+rides through every live and draining variant — the installer
+SURVIVES activation and is destroyed only once its replay is fully
+copied to the driver queue. During installation a RESIZE coalesces to
+one latest `ResizeWire` (sent on activation through the normal atomic
+path) and input, DETACH, and SNAPSHOT_REQUEST return `error.NotActive`.
+
+The driver services stream 7 BEFORE output inside ONE shared 64 KiB
+installation budget per public pump: header-exact reads, body capped
+at `negotiated_limit − received + 1` (one excess byte detectable
+without allocating), decoding only after a clean FIN, at most one
+history page per pump starting the pump after READY, and post-cut
+output applied to the temporary stream (its 16-byte epoch header
+parsed first — framing, never content) before that pump's page and
+never returned separately. `pollOutput` serves replay bytes first;
+live stream-3 bytes flow only after replay exhaustion;
+`outputSettled` includes replay exhaustion, so a terminal event can
+never overtake replay still owned by the installer.
+
+Terminal behavior: a clean SESSION_END during a valid installation
+still COMPLETES it through the existing `deferTerminal` deferral;
+installer failure surfaces through ORDINARY `failProtocol` (the
+driver already consumed the deferred SESSION_END, so the existing
+failure-replacement path carries the installer's code and reason —
+no special exception exists). A FINAL ERROR BEFORE replay preparation
+aborts the installation (never sends SNAPSHOT_INSTALLED, never
+exposes orphaned stream-3 bytes); AFTER replay preparation the valid
+replay is retained and drained before the terminal event is
+delivered. A stream-7 reset with a prepared replay is provisional
+until the matching terminal ERROR arrives — a SESSION_END or peer
+close without it is a protocol_violation. Once terminal draining
+begins, a newly prepared SNAPSHOT_INSTALLED is never sent.
 - **`Client`** (the socket-owning driver) owns transport timing,
   socket failure, output accumulation, and terminal-event delivery.
   Its `DriverState` (`handshaking` → `running` → `draining` →
