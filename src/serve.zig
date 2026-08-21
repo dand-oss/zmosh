@@ -34,6 +34,9 @@
 //! so tests drive the processing helper with synthetic timestamps.
 
 const std = @import("std");
+const ghostty_vt = @import("ghostty-vt");
+const util = @import("util.zig");
+const quic_installer = @import("quic_installer.zig");
 const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
 const ipc = @import("ipc.zig");
@@ -2766,6 +2769,268 @@ test "zmq1 q4: a coalesced header+payload write never over-reads an unacceptable
     for (acc.items[0..total_f]) |b| try testing.expectEqual(@as(u8, 'F'), b);
     for (acc.items[total_f..]) |b| try testing.expectEqual(@as(u8, 'C'), b);
     try testing.expect(!sess.closedOrEnding());
+}
+
+test "zmq1 stage5: populated snapshot replays exactly, then live output flows" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    var ref_term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer ref_term.deinit(alloc);
+    var ref_vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = ref_term.vtHandler(),
+        .continuation_max_bytes = quic_installer.continuation_max,
+    });
+    defer ref_vts.deinit();
+    var li: usize = 0;
+    while (li < 12) : (li += 1) ref_vts.nextSlice("history line\r\n");
+    const want = util.serializeTerminalState(alloc, &ref_term) orelse return error.TestUnexpectedResult;
+    defer alloc.free(want);
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try ghostty_vt.snapshot.encode(alloc, &aw.writer, &ref_term, .{ .continuation = .ground });
+    const encoded = try alloc.dupe(u8, aw.written());
+    defer alloc.free(encoded);
+
+    try zmq1HelloAck(&z, base);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)));
+    {
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
+        try testing.expectEqual(ipc.Tag.InitSnapshot, f.tag);
+    }
+    try quic_test.daemonSendSnapshotBytes(z.loop.daemon_fd, encoded);
+    for (0..60) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)));
+        if (sess.phase == .active and z.client.stateTag() == .active) break;
+    }
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
+
+    // The replay arrives FIRST and is EXACTLY the reference terminal's
+    // serialization.
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(alloc);
+    var obuf: [16 * 1024]u8 = undefined;
+    for (0..80) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 300 + @as(i64, @intCast(i)));
+        while (try z.client.pollOutput(&obuf, null)) |n| {
+            try acc.appendSlice(alloc, obuf[0..n]);
+        }
+        if (acc.items.len >= want.len) break;
+    }
+    if (acc.items.len != want.len) {
+        std.debug.print("\nDBG want({d}): {any}\ngot ({d}): {any}\n", .{ want.len, want, acc.items.len, acc.items });
+    }
+    try testing.expectEqual(@as(usize, want.len), acc.items.len);
+    try testing.expectEqualSlices(u8, want, acc.items);
+
+    // Only after replay exhaustion do LIVE bytes flow.
+    try ipc.send(z.loop.daemon_fd, .Output, "live-after");
+    var live: []const u8 = "";
+    for (0..40) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 500 + @as(i64, @intCast(i)));
+        if (try z.client.pollOutput(&obuf, null)) |n| {
+            live = try alloc.dupe(u8, obuf[0..n]);
+            break;
+        }
+    }
+    try testing.expectEqualStrings("live-after", live);
+    alloc.free(live);
+    try testing.expect(!sess.closedOrEnding());
+}
+
+test "zmq1 stage5: FINAL ERROR before READY aborts with no INSTALLED and no orphaned output" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    try zmq1HelloAck(&z, base);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)));
+    {
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
+        try testing.expectEqual(ipc.Tag.InitSnapshot, f.tag);
+    }
+    // The client is installing with NOTHING on stream 7 yet — a FINAL
+    // ERROR arrives before any READY.
+    const t = z.loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+    var epay: [4 + 16]u8 = undefined;
+    const en = try quic_wire.writeErrorPayload(&epay, .internal_error, "inject-final");
+    var eframe: [quic_wire.control_header_len + 20]u8 = undefined;
+    quic_wire.writeControlHeader(eframe[0..quic_wire.control_header_len], .err, en, quic_wire.control_flag_final);
+    @memcpy(eframe[quic_wire.control_header_len..][0..en], epay[0..en]);
+    _ = try t.connection().sendOnStream(quic_client.control_stream_id, eframe[0 .. quic_wire.control_header_len + en], false);
+
+    var err_ev: ?quic_client.ControlEvent = null;
+    for (0..40) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)))) |e| {
+            err_ev = e;
+            break;
+        }
+    }
+    try testing.expect(err_ev != null);
+    switch (err_ev.?) {
+        .err => |e| {
+            try testing.expect(e.terminal);
+            try testing.expectEqual(quic_wire.ErrCode.internal_error.code(), e.code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Aborted: never active, no SNAPSHOT_INSTALLED was sent (the
+    // gateway never reached active), and no output byte is exposed.
+    try testing.expect(z.client.stateTag() == .failed or z.client.stateTag() == .draining);
+    try testing.expect(sess.phase != .active);
+    var obuf: [64]u8 = undefined;
+    try testing.expect((try z.client.pollOutput(&obuf, null)) == null);
+}
+
+test "zmq1 stage5: stream 7 before installation is a violation" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const base: i64 = lib_posix.nowNs();
+    try zmq1HelloAck(&z, base);
+    try testing.expectEqual(quic_client.StateTag.awaiting_first_resize, z.client.stateTag());
+
+    // A misordered snapshot stream arrives BEFORE the first RESIZE.
+    const t = z.loop.gw.quic.establishedTransport() orelse return error.NotEstablished;
+    _ = try t.connection().openUniStream();
+    var hb: [quic_wire.snapshot_header_len]u8 = undefined;
+    quic_wire.writeSnapshotHeader(&hb, 1, false);
+    _ = try t.connection().sendOnStream(quic_session.snapshot_stream_id, &hb, true);
+
+    var viol: ?quic_client.ControlEvent = null;
+    for (0..40) |i| {
+        if (try quic_test.sessionRound(&z.loop, &z.client, base + 100 + @as(i64, @intCast(i)))) |e| {
+            viol = e;
+            break;
+        }
+    }
+    try testing.expect(viol != null);
+    switch (viol.?) {
+        .err => |e| try testing.expectEqual(quic_wire.ErrCode.protocol_violation.code(), e.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(quic_client.StateTag.failed, z.client.stateTag());
+}
+
+test "zmq1 stage5: the 64 KiB installation budget bounds every pump" {
+    const alloc = testing.allocator;
+    var bootstrap: [32]u8 = undefined;
+    var psk: [32]u8 = undefined;
+    try testing.io.randomSecure(&bootstrap);
+    quic_transport.derivePsk(&psk, &bootstrap);
+    defer std.crypto.secureZero(u8, &bootstrap);
+    defer std.crypto.secureZero(u8, &psk);
+
+    var z = try zmq1Setup(alloc, &psk);
+    defer z.loop.deinit();
+    defer z.client.deinit();
+    const sess = try z.session();
+    var dr = try quic_test.DaemonReader.init(alloc);
+    defer dr.deinit();
+    const base: i64 = lib_posix.nowNs();
+
+    // A body of several budgets (the exact-budget equality is proven
+    // at the installer unit level; through the live transport this
+    // proves the bound, progress, and completion).
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = null,
+    });
+    defer term.deinit(alloc);
+    var vts = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = quic_installer.continuation_max,
+    });
+    defer vts.deinit();
+    var li: usize = 0;
+    var lbuf: [64]u8 = undefined;
+    while (li < 3000) : (li += 1) {
+        const line = std.fmt.bufPrint(&lbuf, "budget fill line {d:0>5} of unique terminal text\r\n", .{li}) catch unreachable;
+        vts.nextSlice(line);
+    }
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try ghostty_vt.snapshot.encode(alloc, &aw.writer, &term, .{ .continuation = .ground });
+    const encoded = try alloc.dupe(u8, aw.written());
+    defer alloc.free(encoded);
+    try testing.expect(encoded.len > 64 * 1024);
+
+    try zmq1HelloAck(&z, base);
+    try z.client.sendResize(24, 80, 0, 0);
+    for (0..8) |i| _ = try quic_test.sessionRound(&z.loop, &z.client, base + @as(i64, @intCast(i)));
+    {
+        const f = (try dr.next(z.loop.daemon_fd)) orelse return error.NoInitSnapshot;
+        try testing.expectEqual(ipc.Tag.InitSnapshot, f.tag);
+    }
+    try quic_test.daemonSendSnapshotBytes(z.loop.daemon_fd, encoded);
+
+    // Every manual pump consumes at most its 64 KiB budget and makes
+    // progress while the body remains; the install then completes.
+    var prev: usize = 0;
+    var round: usize = 0;
+    while (round < 400) : (round += 1) {
+        const now = base + 100 + @as(i64, @intCast(round));
+        try z.loop.clientPump(now);
+        _ = try z.loop.gw.runOnce(0);
+        z.client.install_budget_left = 64 * 1024;
+        z.client.install_ready_this_pump = false;
+        try z.client.pumpSnapshot();
+        const inst = z.client.installer() orelse return error.NoInstaller;
+        if (inst.phase == .failed) return error.InstallFailed;
+        if (inst.readyToInstall()) break;
+        // Bounded: a pump consumes at most its budget (a zero-delta
+        // pump just means delivery had nothing readable yet — credit
+        // release needs the drain that follows).
+        try testing.expect(inst.spool.items.len >= prev);
+        try testing.expect(inst.spool.items.len - prev <= 64 * 1024);
+        prev = inst.spool.items.len;
+        try z.loop.clientDrain(now);
+    }
+    for (0..600) |i| {
+        _ = try quic_test.sessionRound(&z.loop, &z.client, base + 1000 + @as(i64, @intCast(i)));
+        if (sess.phase == .active and z.client.stateTag() == .active) break;
+    }
+    try testing.expectEqual(quic_client.StateTag.active, z.client.stateTag());
 }
 
 test "zmq1 session: HELLO mismatches reject with the frozen codes and never initialize the daemon" {

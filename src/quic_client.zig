@@ -1087,7 +1087,22 @@ pub const ClientSession = struct {
             // A valid installation still completes under a deferred
             // SESSION_END — but INSTALLED is never sent from draining.
             .draining => {},
-            else => return,
+            else => {
+                // Ordering: snapshot-stream data BEFORE installation
+                // is a violation. A one-byte probe in the post-ACK
+                // pre-install state — the byte is consumed by the
+                // failing path, so nothing is lost.
+                if (self.state == .awaiting_first_resize) {
+                    var probe: [1]u8 = undefined;
+                    const got = self.transport.connection().recvOnStream(snapshot_stream_id, &probe) catch return;
+                    if (got) |n| {
+                        if (n > 0) {
+                            self.failProtocol(.protocol_violation, "snapshot stream before installation");
+                        }
+                    }
+                }
+                return;
+            },
         }
         const inst_st = self.installState() orelse return;
         const inst = inst_st.installer orelse return;
@@ -1148,26 +1163,68 @@ pub const ClientSession = struct {
 
         // Post-cut output drains into the temporary stream BEFORE the
         // pump's single history page, sharing the installation budget.
+        // The stream-3 16-byte epoch header is parsed FIRST — it is
+        // framing, never terminal content.
         if (inst.phase == .history) {
-            while (self.install_budget_left > 0) {
-                const allow = @min(@min(rbuf.len, 4096), self.install_budget_left);
-                const got = conn.recvOnStream(output_stream_id, rbuf[0..allow]) catch |e| switch (e) {
-                    error.StreamClosed => {
-                        if (self.outputRx()) |orx| orx.* = .reset;
-                        break;
-                    },
-                    error.ConnectionClosed => {
-                        self.recordPeerCloseFromTransport();
-                        break;
-                    },
-                    else => return e,
-                };
-                const n = got orelse 0;
-                if (n == 0) break;
-                self.install_budget_left -= n;
-                if (inst.applyLive(rbuf[0..n])) |f| return self.failInstaller(f);
+            const orx = self.outputRx() orelse return;
+            if (orx.* == .header) {
+                const hwant = @min(self.output_hdr.remaining(), self.install_budget_left);
+                if (hwant > 0) {
+                    var hbuf: [quic_wire.output_header_len]u8 = undefined;
+                    const hgot = conn.recvOnStream(output_stream_id, hbuf[0..hwant]) catch |e| switch (e) {
+                        error.StreamClosed => {
+                            orx.* = .reset;
+                            return;
+                        },
+                        error.ConnectionClosed => {
+                            self.recordPeerCloseFromTransport();
+                            return;
+                        },
+                        else => return e,
+                    };
+                    const hn = hgot orelse 0;
+                    if (hn > 0) {
+                        self.install_budget_left -= hn;
+                        const r = self.output_hdr.feed(hbuf[0..hn]);
+                        switch (r.result) {
+                            .done => |epoch| {
+                                if (epoch != 1) {
+                                    return self.failProtocol(.protocol_violation, "invalid output epoch");
+                                }
+                                orx.* = .{ .body = .{ .epoch = epoch } };
+                            },
+                            .need => {},
+                            .invalid => |e| {
+                                return self.failProtocol(quic_wire.prefaceErrCode(e), "bad output header");
+                            },
+                        }
+                    }
+                }
             }
-            // One page per public pump, never the READY pump itself.
+            if (orx.* == .body) {
+                while (self.install_budget_left > 0) {
+                    const allow = @min(@min(rbuf.len, 4096), self.install_budget_left);
+                    const got = conn.recvOnStream(output_stream_id, rbuf[0..allow]) catch |e| switch (e) {
+                        error.StreamClosed => {
+                            orx.* = .reset;
+                            break;
+                        },
+                        error.ConnectionClosed => {
+                            self.recordPeerCloseFromTransport();
+                            break;
+                        },
+                        else => return e,
+                    };
+                    const n = got orelse 0;
+                    if (n == 0) break;
+                    self.install_budget_left -= n;
+                    if (inst.applyLive(rbuf[0..n])) |f| return self.failInstaller(f);
+                }
+            }
+        }
+
+        // One page per public pump, never the READY pump itself.
+        if (inst.phase == .history) {
             if (!self.install_ready_this_pump) {
                 if (inst.nextPage()) |f| return self.failInstaller(f);
             }
@@ -1175,9 +1232,16 @@ pub const ClientSession = struct {
 
         // INSTALLED only after replay preparation, never once a
         // terminal drain has begun.
-        if (inst.readyToInstall() and !inst_st.installed_sent and self.state == .installing_snapshot) {
-            inst_st.installed_sent = true;
-            try self.sendSnapshotInstalled();
+        if (inst.readyToInstall() and !inst_st.installed_sent) {
+            var sending = false;
+            switch (self.state) {
+                .installing_snapshot => sending = true,
+                else => {},
+            }
+            if (sending) {
+                inst_st.installed_sent = true;
+                try self.sendSnapshotInstalled();
+            }
         }
     }
 
