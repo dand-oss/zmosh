@@ -2021,6 +2021,173 @@ check`, `zig build release` then Debug rebuild, `zig fmt --check`,
 467 on an untouched quic_transport.zig. Q5 scope, the quicz pin,
 and Stage 5 remain untouched and locked pending review.
 
+### Q4 Stage 5 frozen execution contract (2026-08-20, approved before any stage-5 code)
+
+Stage 4.1.1 approved at 205e839; Stage 5 unlocks for the client
+installer only. History preserved; nothing rewritten. Stage 6, Q5,
+full Bats, daemon/IPC behavior, quicz, quic_transport.zig (frozen
+467 SLOC), and the public C ABI stay locked. Stop on material
+compatibility drift.
+
+Installer and serialization — NEW src/quic_installer.zig (imported
+from the test root):
+
+- `Installer.create(alloc, io, negotiated_snapshot_limit)`
+  heap-allocates the stable container (reader, Decoder, Terminal,
+  TerminalStream addresses never move). Body growth uses
+  `ensureTotalCapacityPrecise`; byte limit + 1 rejected BEFORE
+  allocation. Fixed limits: body = HELLO_ACK-negotiated value
+  (≤ 128 MiB); decoded/stream continuation 64 MiB; final replay
+  128 MiB.
+- Read phases header → body → history → replay; header and body
+  accepted incrementally; decoding starts ONLY after a clean
+  stream-7 FIN. PRESENT=0 permits no body and requires FIN
+  immediately; PRESENT=1 requires ≥1 byte.
+- On FIN for a present snapshot, exactly: fixed reader over the
+  completed spool; `Decoder.ready()` exactly once; the terminal
+  moves directly into its final field; TerminalStream is created
+  against that final address with continuation tracking enabled;
+  the decoded continuation is replayed once and verified against a
+  canonical re-export through a NONALLOCATING comparator writer;
+  the temporary Decoded value is deinit. BINDING:
+  `TerminalStream.handler.semantic_failure` is checked immediately
+  after replaying the decoded continuation and after EVERY post-cut
+  live feed.
+- `Decoder.next()` consumes at most one history page per PUBLIC
+  client pump, beginning with the pump AFTER READY.
+- `util.serializeTerminalState` is refactored around an internal
+  strict writer-based formatter: every internal writer failure
+  propagates; synchronized-output mode is restored with a defer on
+  every exit; existing successful `.Init` output stays
+  byte-identical. An OVERSIZED decoded continuation is
+  protocol_violation; a failure exporting the live stream's CURRENT
+  continuation is internal_error. Spool reuse means ONE
+  ArrayList-backed buffer with no independent full replay copy;
+  reallocating that same buffer when capacity is insufficient is
+  permitted.
+- After FINISH + explicit zero-trailing-byte check: clear the spool
+  retaining capacity; serialize terminal state into it through a
+  precise bounded writer; append
+  `TerminalStream.writeContinuation()` so unfinished post-cut parser
+  state survives; flush with the 128 MiB bound enforced before every
+  growth; deinit stream first, then terminal. The installer stays
+  alive while replay bytes remain; destruction order
+  stream → terminal → spool → installer.
+- Error mapping (frozen codes only): stream-7 wrong role →
+  unknown_role; malformed header, illegal PRESENT/body shape,
+  truncation, negotiated-limit excess, malformed snapshot,
+  continuation mismatch/excess, trailing bytes →
+  protocol_violation; allocation failure, terminal semantic
+  failure, replay-writer failure, replay-cap excess →
+  internal_error.
+
+Client FSM and transport integration — src/quic_client.zig only:
+
+- `std.Io` joins the INTERNAL ClientSession.init/initSilent; public
+  Client, C ABI, pump, pollOutput signatures unchanged. HELLO_ACK
+  validation stores the negotiated snapshot limit and PREPARES the
+  installer before any first RESIZE can be sent; preparation failure
+  fails closed with internal_error.
+- `installing_snapshot` plus a typed snapshot substate carried
+  through relevant live/draining variants: owned installer / replay
+  complete / peer reset awaiting matching terminal ERROR / aborted.
+  Coalesced resize uses `quic_wire.ResizeWire` (latest wins). First
+  RESIZE acceptance transfers the prepared installer; during
+  installation sendResize replaces the latest value and succeeds
+  while input, DETACH, and SNAPSHOT_REQUEST return error.NotActive.
+- `PendingKind.snapshot_installed`: SNAPSHOT_INSTALLED is sent only
+  after replay preparation — immediate acceptance activates once;
+  flow-control blocking retains the complete frame; retry acceptance
+  activates once; activation sends the latest coalesced resize
+  through the normal atomic path. The installer is NOT destroyed at
+  activation: active, detaching, and draining retain it until replay
+  is fully copied into the driver queue.
+- Stream processing: stream 7 is read BEFORE output after each
+  transport feed. ONE 64 KiB INSTALLATION byte budget is shared
+  across the entire public pump by stream-7 reads AND pre-replay
+  stream-3 application, snapshot serviced first (byte 65,537 waits
+  for the next public pump). Stream 7 before installing_snapshot is
+  rejected; later server-uni streams 11..31 are stream_cardinality.
+  Header reads take exactly the missing bytes; body reads at most
+  negotiated_limit − received + 1 so one excess byte is detectable
+  without allocating. At pump entry the pump remembers whether
+  history was already READY; currently readable post-cut output is
+  drained into the temporary stream BEFORE this pump's single
+  history page; a snapshot reaching READY during this pump cannot
+  advance history until the next pump. Before replay preparation,
+  output is consumed only after READY and applied to the temporary
+  stream, never returned separately; after it, pollOutput returns
+  replay bytes first and live stream-3 bytes only after replay
+  exhaustion. `outputSettled()` includes replay exhaustion — a
+  terminal event cannot overtake replay still owned by the
+  installer.
+- Terminal/reset behavior: a clean SESSION_END during a valid
+  installation uses the EXISTING driver deferTerminal path —
+  SESSION_END still COMPLETES a valid unfinished installation, the
+  installer preserved while snapshot/replay/output finish. Installer
+  failure calls ORDINARY failProtocol (the driver already consumed
+  the deferred SESSION_END, so the existing failure-replacement path
+  surfaces the installer's code/reason; NO special exception inside
+  failProtocol). FINAL ERROR ownership: BEFORE replay preparation —
+  abort decoding, never expose orphaned stream-3 bytes,
+  consume/discard only to settle FIN/close, never send
+  SNAPSHOT_INSTALLED; AFTER replay preparation — retain and drain
+  the valid replay before delivering the terminal event. A stream-7
+  reset carrying internal_error MAY precede the server's FINAL
+  ERROR: provisional until the matching terminal ERROR arrives; a
+  mismatched reset code, SESSION_END, or peer close without it is
+  protocol_violation. FINAL ERROR before the reset aborts
+  immediately; a later reset cannot replace that terminal event.
+  Once terminal draining begins, a newly prepared SNAPSHOT_INSTALLED
+  is never sent.
+
+Deterministic tests — installer/unit: minimal valid snapshot across
+every two-part split; PRESENT=0 immediate FIN / with body;
+PRESENT=1 with no body; truncated header/body; malformed records;
+trailing bytes; negotiated small-limit limit+1 rejected with NO
+allocation or capacity growth; no decoder call before FIN; READY
+once; stable addresses; continuation replay and verification once;
+one history page per pump and none during the READY pump; output
+applied between pages; final replay includes the CURRENT
+continuation, replay + later suffix matching an uninterrupted
+terminal; spool capacity reused with no second full-size
+allocation; allocation-failure iteration with correct teardown and
+no leaks. Session/driver: first RESIZE enters installation for
+immediate and parked paths; INSTALLED immediate and parked-retry
+activate exactly once, asserted through the GATEWAY PHASE (the
+daemon never sees this gateway-local control frame); two
+installation RESIZEs produce one daemon .Resize with the latest
+dims; input/DETACH/SNAPSHOT_REQUEST return exactly NotActive;
+populated snapshot replays first then live output; empty snapshot
+activates after FIN with no replay; stream-7 reset and FINAL ERROR
+in both arrival orders, plus FINAL ERROR before READY and after
+replay preparation; stream 7 before installing rejected and
+server-uni 11..31 cardinality; SESSION_END during installation
+waits and a later decoder failure replaces it exactly once; replay
+bigger than the 64 KiB driver queue drains before terminal
+delivery; the real 64 KiB budgets defer their next byte. Existing
+Q3 client tests are adapted through a shared real empty-snapshot
+dance; raw helpers (the src/serve.zig dance family near :1588 and
+:3351) remain ONLY for intentionally-raw gateway tests and never
+consume stream 7 from a real installer. Active SNAPSHOT_REQUEST
+re-proven as the nonterminal Q5 deferral with continued service;
+legacy local .Init successful output re-proven byte-identical. The
+three initial real-client scenarios run RED against 205e839 first,
+logs retained outside the repository.
+
+Landing: five atomic green commits — (1) this contract; (2)
+strict-writer serializer + bounded heap-stable installer + test-root
+import + installer unit tests; (3) COMPLETE session and driver
+integration PLUS the required existing-test/helper adaptations,
+full suite green; (4) the remaining regression matrix; (5) runtime
+documentation and factual completion evidence. Every runtime
+checkpoint: Debug + ReleaseSafe full suites, check, release then
+Debug rebuild, fmt/diff clean, frozen SLOC 467. Pre-push ahead
+range == exactly the planned commits; FF-push without force; bead
+updated factually; local/origin equality verified; stop for review.
+Stage 6 owns cross-layer qualification and performance measurement;
+full Bats stays deferred to final Q4 qualification.
+
 ## Phase Q5: reliable output epochs and remote attach
 
 Input uses one client unidirectional reliable stream. Raw terminal input is
